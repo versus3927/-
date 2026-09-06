@@ -1,0 +1,274 @@
+import io
+import json
+import logging
+import os
+from typing import Optional
+
+import aiohttp
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+from PIL import Image
+
+load_dotenv()
+
+DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+WATCH_CHANNEL_IDS = {
+    int(x.strip()) for x in os.getenv("WATCH_CHANNEL_IDS", "").split(",") if x.strip()
+}
+ALLOWED_USER_IDS = {
+    int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()
+}
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("faceit-reg")
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+def allowed(message: discord.Message) -> bool:
+    if message.author.bot:
+        return False
+    if WATCH_CHANNEL_IDS and message.channel.id not in WATCH_CHANNEL_IDS:
+        return False
+    if ALLOWED_USER_IDS and message.author.id not in ALLOWED_USER_IDS:
+        return False
+    return True
+
+
+def image_attachments(message: discord.Message) -> list[discord.Attachment]:
+    valid_ext = (".png", ".jpg", ".jpeg", ".webp")
+    return [
+        a for a in message.attachments
+        if (a.content_type or "").startswith("image/") or a.filename.lower().endswith(valid_ext)
+    ]
+
+
+async def download_image(attachment: discord.Attachment) -> bytes:
+    return await attachment.read()
+
+
+def prepare_image(raw: bytes) -> tuple[str, str]:
+    """Increase resolution while keeping the whole screenshot visible."""
+    import base64
+
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    longest = max(image.width, image.height)
+    if longest < 2400:
+        scale = min(3.0, 2400 / longest)
+        image = image.resize(
+            (int(image.width * scale), int(image.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=95, optimize=True)
+    return base64.b64encode(out.getvalue()).decode("ascii"), "image/jpeg"
+
+
+async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
+    player_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "nickname": {"type": "string"},
+            "kills": {"type": "integer", "minimum": 0, "maximum": 100},
+            "assists": {"type": "integer", "minimum": 0, "maximum": 100},
+            "deaths": {"type": "integer", "minimum": 0, "maximum": 100},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["id", "nickname", "kills", "assists", "deaths", "confidence"],
+        "additionalProperties": False,
+    }
+    schema = {
+        "name": "faceit_registration",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "is_match_result": {"type": "boolean"},
+                "match_id": {"type": ["integer", "null"]},
+                "score_a": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
+                "score_b": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
+                "team_a": {"type": "array", "items": player_schema, "maxItems": 5},
+                "team_b": {"type": "array", "items": player_schema, "maxItems": 5},
+                "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "notes": {"type": "string"},
+            },
+            "required": [
+                "is_match_result", "match_id", "score_a", "score_b",
+                "team_a", "team_b", "overall_confidence", "notes"
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+    prompt = """You receive one or more screenshots of the SAME FACEIT/CS2 match result.
+The Discord result card contains match number and two rosters: Team A and Team B, with numeric IDs like #37 and nicknames. The small CS2 scoreboard contains each nickname and columns K, A, D.
+
+Build a registration result:
+- match_id: number after 'Результат матча #'.
+- Team A must always be returned in team_a; Team B in team_b.
+- score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
+- For every roster player return the numeric ID from the Discord card and K/A/D from the scoreboard.
+- The scoreboard columns are usually: kills, assists, deaths, score/points, ping. Return ONLY kills, assists, deaths; never confuse points or ping with deaths.
+- Keep roster order exactly as shown in Team A and Team B.
+- If several screenshots are supplied, combine their information.
+- Do not invent unreadable values. Lower confidence and explain in notes.
+- is_match_result=false for unrelated images; then use null IDs/scores and empty teams.
+- A valid result has exactly five players in each team.
+"""
+    if message_text.strip():
+        prompt += f"\nOptional uploader text: {message_text[:1000]}"
+
+    parts = [{"text": prompt}]
+    for raw in images[:4]:
+        image_b64, mime = prepare_image(raw)
+        parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
+
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseJsonSchema": schema["schema"],
+        },
+    }
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload) as response:
+            body = await response.text()
+            if response.status >= 400:
+                if response.status == 429:
+                    raise RuntimeError("Бесплатный лимит Gemini временно исчерпан. Попробуйте позже.")
+                raise RuntimeError(f"Gemini API {response.status}: {body[:400]}")
+            data = json.loads(body)
+
+    try:
+        output_text: Optional[str] = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("Gemini не вернул результат распознавания")
+    if not output_text:
+        raise RuntimeError("Gemini вернул пустой результат")
+    return json.loads(output_text)
+
+
+def validation_issues(result: dict) -> list[str]:
+    issues = []
+    if not result.get("is_match_result"):
+        return ["На изображении не найден результат матча"]
+    if result.get("match_id") is None:
+        issues.append("Не прочитан номер матча")
+    if result.get("score_a") is None or result.get("score_b") is None:
+        issues.append("Не прочитан итоговый счёт")
+    if len(result.get("team_a", [])) != 5:
+        issues.append("В команде A распознано не 5 игроков")
+    if len(result.get("team_b", [])) != 5:
+        issues.append("В команде B распознано не 5 игроков")
+
+    all_players = result.get("team_a", []) + result.get("team_b", [])
+    ids = [p.get("id") for p in all_players]
+    if len(ids) != len(set(ids)):
+        issues.append("Есть повторяющиеся ID игроков")
+    if float(result.get("overall_confidence", 0)) < MIN_CONFIDENCE:
+        issues.append("Низкая общая уверенность распознавания")
+    for player in all_players:
+        if float(player.get("confidence", 0)) < MIN_CONFIDENCE:
+            issues.append(f"Проверьте статистику #{player.get('id')} {player.get('nickname', '')}")
+    return issues
+
+
+def format_registration(result: dict) -> str:
+    lines = [
+        f"=g {result['match_id']} {result['score_a']} {result['score_b']}",
+        "",
+        "CT",
+    ]
+    for player in result["team_a"]:
+        lines.append(
+            f"{player['id']} {player['kills']} {player['assists']} {player['deaths']}"
+        )
+    lines.extend(["", "T"])
+    for player in result["team_b"]:
+        lines.append(
+            f"{player['id']} {player['kills']} {player['assists']} {player['deaths']}"
+        )
+    return "\n".join(lines)
+
+
+async def process_upload(message: discord.Message) -> None:
+    attachments = image_attachments(message)
+    if not attachments:
+        return
+
+    status = await message.reply("🔎 Читаю скриншот и собираю регистрацию…", mention_author=False)
+    try:
+        raw_images = [await download_image(a) for a in attachments[:4]]
+        result = await recognize_match(raw_images, message.content)
+        issues = validation_issues(result)
+
+        fatal = (
+            not result.get("is_match_result")
+            or result.get("match_id") is None
+            or result.get("score_a") is None
+            or result.get("score_b") is None
+            or len(result.get("team_a", [])) != 5
+            or len(result.get("team_b", [])) != 5
+        )
+        if fatal:
+            details = "\n".join(f"• {issue}" for issue in issues)
+            notes = result.get("notes", "")
+            await status.edit(
+                content=f"❌ Не получилось собрать регистрацию.\n{details}\n{notes[:500]}"
+            )
+            return
+
+        command = format_registration(result)
+        if issues:
+            details = "\n".join(f"• {issue}" for issue in issues)
+            await status.edit(
+                content=f"⚠️ **Проверьте отмеченные значения**\n{details}\n```text\n{command}\n```"
+            )
+        else:
+            await status.edit(
+                content=f"✅ **Готовое сообщение для регистрации**\n```text\n{command}\n```"
+            )
+    except Exception as exc:
+        log.exception("Screenshot processing failed")
+        await status.edit(content=f"❌ Ошибка распознавания: {str(exc)[:350]}")
+
+
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if allowed(message):
+        await process_upload(message)
+    await bot.process_commands(message)
+
+
+@bot.command(name="reg")
+async def reg(ctx: commands.Context):
+    """Reply with !reg to a screenshot if automatic processing is restricted."""
+    if ALLOWED_USER_IDS and ctx.author.id not in ALLOWED_USER_IDS:
+        return
+    if not ctx.message.reference or not ctx.message.reference.message_id:
+        await ctx.reply("Ответьте `!reg` на сообщение со скриншотом матча.")
+        return
+    original = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+    await process_upload(original)
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
