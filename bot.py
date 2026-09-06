@@ -162,10 +162,14 @@ Build a registration result:
 - Team A must always be returned in team_a; Team B in team_b.
 - score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
 - For every roster player return the numeric ID from the Discord card and K/A/D from the scoreboard.
+- Fuzzy nickname matching is REQUIRED. Ignore case, spaces, punctuation, clan tags, decorative prefixes/suffixes and extra text. A roster nickname contained inside a scoreboard nickname is a match: for example `versus`, `versusproto`, `[TAG]versus` and `versus_123` refer to the same player when there is no conflicting roster nickname.
+- Match obvious Cyrillic/Latin phonetic spellings too. For example Latin `versus` may appear as Cyrillic `версус`. Use the scoreboard stats when the identity is reasonably clear from the nickname and roster context.
+- Never assign one scoreboard row to two roster players. Prefer the unique strongest nickname match across all ten roster players.
+- If a player is listed in the Discord roster but has NO matching row on the scoreboard, ALWAYS return that roster player with kills=0, assists=0, deaths=13. This is the required registration default, not an error. Keep confidence at least 0.90 when absence is clear.
 - The scoreboard columns are usually: kills, assists, deaths, score/points, ping. Return ONLY kills, assists, deaths; never confuse points or ping with deaths.
-- Keep roster order exactly as shown in Team A and Team B.
+- Keep all five roster players and their roster order exactly as shown in Team A and Team B.
 - If several screenshots are supplied, combine their information.
-- Do not invent unreadable values. Lower confidence and explain in notes.
+- If a matching row exists but an individual number is genuinely unreadable, lower confidence and explain in notes; do not use 0/0/13 unless the whole player row is absent.
 - is_match_result=false for unrelated images; then use null IDs/scores and empty teams.
 - A valid result has exactly five players in each team.
 """
@@ -246,7 +250,14 @@ def validation_issues(result: dict) -> list[str]:
     if float(result.get("overall_confidence", 0)) < MIN_CONFIDENCE:
         issues.append("Низкая общая уверенность распознавания")
     for player in all_players:
-        if float(player.get("confidence", 0)) < MIN_CONFIDENCE:
+        # 0/0/13 is the intentional default for a roster player absent from
+        # the scoreboard, so it must not be treated as a registration error.
+        is_absent_default = (
+            player.get("kills") == 0
+            and player.get("assists") == 0
+            and player.get("deaths") == 13
+        )
+        if not is_absent_default and float(player.get("confidence", 0)) < MIN_CONFIDENCE:
             issues.append(f"Проверьте статистику #{player.get('id')} {player.get('nickname', '')}")
     return issues
 
