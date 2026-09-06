@@ -14,7 +14,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 WATCH_CHANNEL_IDS = {
     int(x.strip()) for x in os.getenv("WATCH_CHANNEL_IDS", "").split(",") if x.strip()
 }
@@ -41,16 +41,60 @@ def allowed(message: discord.Message) -> bool:
     return True
 
 
-def image_attachments(message: discord.Message) -> list[discord.Attachment]:
+def message_parts(message: discord.Message) -> list[object]:
+    """Return the uploaded message and any Discord-forwarded snapshots."""
+    parts: list[object] = [message]
+    for snapshot in (getattr(message, "message_snapshots", None) or []):
+        # discord.py exposes snapshot fields directly; this fallback also supports
+        # wrappers that expose the forwarded payload under `.message`.
+        parts.append(getattr(snapshot, "message", snapshot))
+    return parts
+
+
+def message_context(message: discord.Message) -> str:
+    chunks: list[str] = []
+    for part in message_parts(message):
+        content = getattr(part, "content", "")
+        if content:
+            chunks.append(str(content))
+        for embed in (getattr(part, "embeds", None) or []):
+            if embed.title:
+                chunks.append(embed.title)
+            if embed.description:
+                chunks.append(embed.description)
+            for field in embed.fields:
+                chunks.append(f"{field.name}\n{field.value}")
+            if embed.footer and embed.footer.text:
+                chunks.append(embed.footer.text)
+    return "\n".join(chunks)
+
+
+def image_urls(message: discord.Message) -> list[str]:
+    """Collect images from uploads, embeds, and forwarded message snapshots."""
     valid_ext = (".png", ".jpg", ".jpeg", ".webp")
-    return [
-        a for a in message.attachments
-        if (a.content_type or "").startswith("image/") or a.filename.lower().endswith(valid_ext)
-    ]
+    urls: list[str] = []
+    for part in message_parts(message):
+        for attachment in (getattr(part, "attachments", None) or []):
+            filename = str(getattr(attachment, "filename", "")).lower()
+            content_type = str(getattr(attachment, "content_type", "") or "")
+            if content_type.startswith("image/") or filename.endswith(valid_ext):
+                url = getattr(attachment, "url", None)
+                if url:
+                    urls.append(str(url))
+        for embed in (getattr(part, "embeds", None) or []):
+            if embed.image and embed.image.url:
+                urls.append(str(embed.image.url))
+            if embed.thumbnail and embed.thumbnail.url:
+                urls.append(str(embed.thumbnail.url))
+    return list(dict.fromkeys(urls))
 
 
-async def download_image(attachment: discord.Attachment) -> bytes:
-    return await attachment.read()
+async def download_image(url: str) -> bytes:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            return await response.read()
 
 
 def prepare_image(raw: bytes) -> tuple[str, str]:
@@ -205,14 +249,15 @@ def format_registration(result: dict) -> str:
 
 
 async def process_upload(message: discord.Message) -> None:
-    attachments = image_attachments(message)
-    if not attachments:
+    urls = image_urls(message)
+    context = message_context(message)
+    if not urls:
         return
 
-    status = await message.reply("🔎 Читаю скриншот и собираю регистрацию…", mention_author=False)
+    status = await message.reply("🔎 Читаю пересланный матч и собираю регистрацию…", mention_author=False)
     try:
-        raw_images = [await download_image(a) for a in attachments[:4]]
-        result = await recognize_match(raw_images, message.content)
+        raw_images = [await download_image(url) for url in urls[:4]]
+        result = await recognize_match(raw_images, context)
         issues = validation_issues(result)
 
         fatal = (
@@ -243,7 +288,7 @@ async def process_upload(message: discord.Message) -> None:
             )
     except Exception as exc:
         log.exception("Screenshot processing failed")
-        await status.edit(content=f"❌ Ошибка распознавания: {str(exc)[:350]}")
+        await status.edit(content=f"��� Ошибка распознавания: {str(exc)[:350]}")
 
 
 @bot.event
