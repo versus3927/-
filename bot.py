@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import logging
@@ -15,6 +16,8 @@ load_dotenv()
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
 WATCH_CHANNEL_IDS = {
     int(x.strip()) for x in os.getenv("WATCH_CHANNEL_IDS", "").split(",") if x.strip()
 }
@@ -182,19 +185,37 @@ Build a registration result:
             "responseJsonSchema": schema["schema"],
         },
     }
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
     timeout = aiohttp.ClientTimeout(total=120)
+    retryable_statuses = {429, 500, 502, 503, 504}
+    models = list(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
+    data: Optional[dict] = None
+    last_error = ""
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload) as response:
-            body = await response.text()
-            if response.status >= 400:
-                if response.status == 429:
-                    raise RuntimeError("Бесплатный лимит Gemini временно исчерпан. Попробуйте позже.")
-                raise RuntimeError(f"Gemini API {response.status}: {body[:400]}")
-            data = json.loads(body)
+        for model in models:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
+            for attempt in range(GEMINI_MAX_RETRIES):
+                async with session.post(url, json=payload) as response:
+                    body = await response.text()
+                    if response.status < 400:
+                        data = json.loads(body)
+                        break
+                    last_error = f"Gemini {model}: HTTP {response.status}"
+                    if response.status not in retryable_statuses:
+                        raise RuntimeError(f"{last_error}: {body[:300]}")
+                if attempt + 1 < GEMINI_MAX_RETRIES:
+                    await asyncio.sleep(3 * (2 ** attempt))
+            if data is not None:
+                break
+
+    if data is None:
+        raise RuntimeError(
+            f"{last_error}. Gemini временно перегружен или исчерпан бесплатный лимит. "
+            "Бот уже повторил запрос и попробовал резервную модель; повторите позже."
+        )
 
     try:
         output_text: Optional[str] = data["candidates"][0]["content"]["parts"][0]["text"]
