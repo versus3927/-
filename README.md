@@ -17,6 +17,8 @@ Set these in **Variables**:
 - `SEND_DELAY` — delay before sending each result; default `0.25` seconds.
 - `DELETE_AFTER_REGISTRATION` — delete the temporary registration command after it is sent; default `true`.
 - `DELETE_DELAY` — seconds to wait before deleting the registration command; default `3.0`.
+- `STATS_FILE` — persistent registration history file; use `/data/registration_stats.json` with a Railway volume mounted at `/data`.
+- `STATS_TIMEZONE` — timezone used for today's count; default `Europe/Moscow`.
 - `GEMINI_MODEL` — legacy primary model setting.
 - `GEMINI_FALLBACK_MODEL` — legacy fallback model setting.
 - `GEMINI_MODELS` — comma-separated model pool. For AI STAR use available names such as `gemini-3.8-flash,gemini-3.7-flash`.
@@ -31,7 +33,8 @@ Set these in **Variables**:
 4. Railway uses the included `Procfile` to run `python bot.py` as a worker.
 5. Send `старт обычный`, `старт приоритет`, or `старт все` in Discord. The script scans the selected channels' history and then watches new messages there. Use `енд` to stop.
 6. Review cards and numeric-only mentions are matched against scoreboard nicknames and K/A/D. After registration, the temporary command is deleted; the permanent result remains in the log channel.
-7. Games are distributed across `GEMINI_MODELS` and `GEMINI_API_KEYS` in round-robin order. Each game is handled by exactly one assigned model and one assigned key; another model or key never processes the same game. Up to `PROCESS_CONCURRENCY` different games can run simultaneously.
+7. Games are distributed across the configured models and keys. Each game is handled by exactly one assigned model and key; different games can run simultaneously.
+8. A match ID is reserved before sending, so duplicate screenshots or repeated history scans do not register the same match twice. Send `стата`, `статистика`, or `stats` for totals: all time, today, 24 hours, 10 hours, 1 hour, and 30 minutes.
 
 Do not upload a real `.env` file or commit tokens.
 

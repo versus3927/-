@@ -4,7 +4,9 @@ import io
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -73,6 +75,8 @@ DELETE_AFTER_REGISTRATION = os.getenv("DELETE_AFTER_REGISTRATION", "true").lower
     "1", "true", "yes", "on"
 }
 DELETE_DELAY = float(os.getenv("DELETE_DELAY", "3.0"))
+STATS_FILE = os.getenv("STATS_FILE", "/data/registration_stats.json")
+STATS_TIMEZONE = ZoneInfo(os.getenv("STATS_TIMEZONE", "Europe/Moscow"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,6 +90,77 @@ active_channel_ids: set[int] = set()
 processed_message_ids: set[int] = set()
 gemini_assignment_index = 0
 processing_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
+stats_lock = asyncio.Lock()
+
+
+def load_registration_records() -> list[dict]:
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception:
+        log.exception("Не удалось прочитать файл статистики %s", STATS_FILE)
+        return []
+
+
+async def record_registration(match_id: int) -> bool:
+    """Reserve a match ID; return False when it was already registered."""
+    async with stats_lock:
+        records = load_registration_records()
+        if any(str(item.get("match_id")) == str(match_id) for item in records):
+            return False
+
+        records.append(
+            {
+                "match_id": int(match_id),
+                "registered_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        try:
+            directory = os.path.dirname(STATS_FILE)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            temporary_file = f"{STATS_FILE}.tmp"
+            with open(temporary_file, "w", encoding="utf-8") as file:
+                json.dump(records, file, ensure_ascii=False, indent=2)
+            os.replace(temporary_file, STATS_FILE)
+        except Exception:
+            log.exception("Не удалось сохранить статистику в %s", STATS_FILE)
+        return True
+
+
+def registration_stats_text() -> str:
+    now = datetime.now(timezone.utc)
+    parsed: list[datetime] = []
+    for item in load_registration_records():
+        try:
+            value = datetime.fromisoformat(str(item["registered_at"]))
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            parsed.append(value.astimezone(timezone.utc))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    local_now = now.astimezone(STATS_TIMEZONE)
+    today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start.astimezone(timezone.utc)
+
+    def since(delta: timedelta) -> int:
+        border = now - delta
+        return sum(moment >= border for moment in parsed)
+
+    today_count = sum(moment >= today_start_utc for moment in parsed)
+    return (
+        "📊 **Статистика регистраций**\n"
+        f"Всего: **{len(parsed)}**\n"
+        f"Сегодня: **{today_count}**\n"
+        f"За 24 часа: **{since(timedelta(hours=24))}**\n"
+        f"За 10 часов: **{since(timedelta(hours=10))}**\n"
+        f"За 1 час: **{since(timedelta(hours=1))}**\n"
+        f"За 30 минут: **{since(timedelta(minutes=30))}**"
+    )
 
 
 def next_gemini_assignment() -> tuple[str, str, int]:
@@ -441,6 +516,11 @@ async def process_upload(message: discord.Message) -> None:
                 )
                 return
 
+            match_id = int(result["match_id"])
+            if not await record_registration(match_id):
+                log.info("Матч #%s уже зарегистрирован — повтор пропущен", match_id)
+                return
+
             command_text = format_registration(result)
             await asyncio.sleep(SEND_DELAY)
             sent_registration = await message.channel.send(command_text)
@@ -542,6 +622,13 @@ async def on_message(message: discord.Message) -> None:
     global is_active
 
     command = message.content.strip().lower()
+
+    if command in ("стата", "статистика", "stats"):
+        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
+            return
+        await message.channel.send(registration_stats_text())
+        return
+
     if command == "енд" or command.startswith("старт"):
         if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
             return
