@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -247,7 +248,92 @@ def prepare_image(raw: bytes) -> tuple[str, str]:
     return base64.b64encode(out.getvalue()).decode("ascii"), "image/jpeg"
 
 
+def parse_review_card(message_text: str) -> Optional[dict]:
+    """Parse complete Discord 'на проверку' cards without an AI request."""
+    if "на проверку" not in message_text.lower():
+        return None
+
+    match = re.search(r"Результат\s+матча\s*#\s*(\d+)", message_text, re.I)
+    if not match:
+        return None
+
+    score_a_match = re.search(
+        r"Команда\s*A[^\n]*?\b(?:CT|T)\b\s*[-–—:]\s*(\d+)",
+        message_text,
+        re.I,
+    )
+    score_b_match = re.search(
+        r"Команда\s*B[^\n]*?\b(?:CT|T)\b\s*[-–—:]\s*(\d+)",
+        message_text,
+        re.I,
+    )
+    if not score_a_match or not score_b_match:
+        recognized_score = re.search(
+            r"Распознано\s+со\s+скриншота\s*:\s*(\d+)\s*[-:]\s*(\d+)",
+            message_text,
+            re.I,
+        )
+        if not recognized_score:
+            return None
+        score_a = int(recognized_score.group(1))
+        score_b = int(recognized_score.group(2))
+    else:
+        score_a = int(score_a_match.group(1))
+        score_b = int(score_b_match.group(1))
+
+    player_pattern = re.compile(
+        r"#\s*(\d{1,5})\s*\|\s*([^\n—–]+?)\s*[—–-]\s*"
+        r"(\d+)\s*/\s*(\d+)\s*/\s*(\d+)",
+        re.I,
+    )
+    players: list[dict] = []
+    seen_ids: set[int] = set()
+    for player_match in player_pattern.finditer(message_text):
+        player_id = int(player_match.group(1))
+        if player_id in seen_ids:
+            continue
+        seen_ids.add(player_id)
+        nickname = player_match.group(2).strip(" `*_.,")
+        kills = int(player_match.group(3))
+        assists = int(player_match.group(4))
+        deaths = int(player_match.group(5))
+        if kills == 0 and assists == 0 and deaths == 0:
+            deaths = 13
+        players.append(
+            {
+                "id": player_id,
+                "nickname": nickname,
+                "kills": kills,
+                "assists": assists,
+                "deaths": deaths,
+                "confidence": 0.99,
+            }
+        )
+
+    if len(players) != 10:
+        return None
+
+    return {
+        "is_match_result": True,
+        "match_id": int(match.group(1)),
+        "score_a": score_a,
+        "score_b": score_b,
+        "team_a": players[:5],
+        "team_b": players[5:10],
+        "overall_confidence": 0.99,
+        "notes": "Карточка «на проверку» разобрана напрямую по ID и K/A/D.",
+    }
+
+
 async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
+    direct_result = parse_review_card(message_text)
+    if direct_result is not None:
+        log.info(
+            "Матч #%s разобран напрямую без запроса к ИИ",
+            direct_result["match_id"],
+        )
+        return direct_result
+
     player_schema = {
         "type": "object",
         "properties": {
@@ -299,7 +385,9 @@ Build a registration result:
 - match_id: number after 'Результат матча #'.
 - Team A must always be returned in team_a; Team B in team_b.
 - score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
-- Cards titled 'на проверку' are valid match results and MUST be registered when match number, score and rosters can be recovered.
+- Cards titled 'на проверку' are valid match results and MUST be registered when match number, score and rosters can be recovered. These cards often already contain short # IDs and K/A/D next to every player; use those values directly even when the attached scoreboard is small or blurry.
+- In review cards, strings like `@#64 | kanei — 8/2/12` mean registration id=64, nickname=kanei, kills=8, assists=2, deaths=12. The @ formatting does not turn the short # number into a Discord user ID.
+- If a review card says a player was not found and shows 0/0/0, apply the required absent-row default 0/0/13 and still keep that player.
 - For every roster player return the SHORT registration ID printed with # immediately before the nickname/mention. It is usually 2, 3 or 4 digits (for example #37, #539, #1639). Use the complete short # number. NEVER use a long Discord mention/user ID such as 1524375653149966517.
 - Some roster names are Discord mentions or contain only digits. A numeric-only mention is NOT the nickname. Identify that player by the K/A/D printed beside or below the roster entry, then match those K/A/D values to the unique scoreboard row and recover the real nickname from the scoreboard.
 - When several numeric-only roster entries exist, solve them globally: compare all visible K/A/D values and all still-unmatched scoreboard rows, and never assign one scoreboard row twice. Use team membership, roster order and remaining unmatched rows as tie-breakers.
