@@ -195,7 +195,45 @@ def message_parts(message: discord.Message) -> list[object]:
     return parts
 
 
-def message_context(message: discord.Message) -> str:
+async def resolve_member_mentions(text: str, message: discord.Message) -> str:
+    """Replace raw Discord mention IDs with visible server display names."""
+    mention_ids = list(
+        dict.fromkeys(
+            int(value)
+            for value in re.findall(r"<@!?(\d{15,22})>", text)
+        )
+    )
+    if not mention_ids:
+        return text
+
+    known_members = {
+        int(member.id): member
+        for member in (getattr(message, "mentions", None) or [])
+    }
+    guild = getattr(message, "guild", None)
+    for member_id in mention_ids:
+        member = known_members.get(member_id)
+        if member is None and guild is not None:
+            member = guild.get_member(member_id)
+        if member is None and guild is not None:
+            try:
+                member = await guild.fetch_member(member_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+        if member is None:
+            continue
+
+        display_name = str(getattr(member, "display_name", "") or "").strip()
+        if display_name:
+            text = re.sub(
+                rf"<@!?{member_id}>",
+                f"@{display_name}",
+                text,
+            )
+    return text
+
+
+async def message_context(message: discord.Message) -> str:
     chunks: list[str] = []
     for part in message_parts(message):
         content = getattr(part, "content", "")
@@ -210,7 +248,7 @@ def message_context(message: discord.Message) -> str:
                 chunks.append(f"{field.name}\n{field.value}")
             if embed.footer and embed.footer.text:
                 chunks.append(embed.footer.text)
-    return "\n".join(chunks)
+    return await resolve_member_mentions("\n".join(chunks), message)
 
 
 def image_urls(message: discord.Message) -> list[str]:
@@ -264,7 +302,14 @@ def extract_short_player_ids(message_text: str, match_id: Optional[int]) -> list
 
     for area in search_areas:
         ids: list[int] = []
-        for value in re.findall(r"(?<!\d)#\s*(\d{1,5})(?!\d)", area):
+        values = re.findall(r"(?<!\d)#\s*(\d{1,5})(?!\d)", area)
+        if not values:
+            values = re.findall(
+                r"(?:^|\n|[@•]\s*)(\d{2,5})\s*\|",
+                area,
+                re.M,
+            )
+        for value in values:
             player_id = int(value)
             if match_id is not None and player_id == int(match_id):
                 continue
@@ -598,7 +643,7 @@ async def process_upload(message: discord.Message) -> None:
     if not urls:
         return
 
-    context = message_context(message)
+    context = await message_context(message)
     async with message.channel.typing():
         try:
             timeout = aiohttp.ClientTimeout(total=30)
@@ -761,7 +806,7 @@ async def backfill_one_channel(channel_id: int, before_time) -> int:
             )
             found += sum(bool(result) for result in results)
     except Exception:
-        log.exception("Не удалось прочитать историю канала %s", channel_id)
+        log.exception("Не удалось прочитать историю ��анала %s", channel_id)
     return found
 
 

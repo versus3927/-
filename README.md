@@ -36,7 +36,7 @@ Set these in **Variables**:
 5. Send `старт обычный`, `старт приоритет`, or `старт все` in Discord. The script scans the selected channels' history and then watches new messages there. Use `енд` to stop.
 6. Complete `на проверку` cards are parsed directly from their short # IDs, team scores, and K/A/D without calling AI. Entries shown as 0/0/0 are registered with the required 0/0/13 absence default. If direct parsing is incomplete, the configured AI is used. After successful registration, both the temporary command and any still-existing processed source card are deleted; the permanent result remains in the log channel.
 7. Games are distributed across the configured models and keys. Each game is handled by exactly one assigned model and key; different games can run simultaneously.
-8. A match ID is reserved before sending, so duplicate screenshots or repeated history scans do not register the same match twice. Short player IDs are extracted from the source card and override AI output; placeholder sequences such as 1–5 are rejected. Send `стата`, `статистика`, or `stats` for totals: all time, today, 24 hours, 10 hours, 1 hour, and 30 minutes.
+8. A match ID is reserved before sending, so duplicate screenshots or repeated history scans do not register the same match twice. Raw long Discord mentions are resolved to their visible server display names, allowing short prefixes such as `#89 | nickname` to be recovered and matched by K/A/D. Short player IDs override AI output; placeholder sequences such as 1–5 are rejected. Send `стата`, `статистика`, or `stats` for totals: all time, today, 24 hours, 10 hours, 1 hour, and 30 minutes.
 
 Do not upload a real `.env` file or commit tokens.
 
