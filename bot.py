@@ -247,15 +247,26 @@ Build a registration result:
                     if response.status < 400:
                         data = json.loads(body)
                         break
+                    log.warning(
+                        "Gemini %s вернул HTTP %s: %s",
+                        model,
+                        response.status,
+                        body[:300],
+                    )
                     if response.status not in retryable_statuses:
-                        raise RuntimeError(f"HTTP {response.status}: {body[:300]}")
+                        raise RuntimeError(
+                            f"Gemini {model}: HTTP {response.status}: {body[:300]}"
+                        )
                 if attempt + 1 < GEMINI_MAX_RETRIES:
                     await asyncio.sleep(3 * (2**attempt))
             if data is not None:
                 break
 
     if data is None:
-        raise RuntimeError("Gemini API недоступен или исчерпан лимит.")
+        raise RuntimeError(
+            f"Gemini {assigned_model} недоступен или исчерпан лимит после "
+            f"{GEMINI_MAX_RETRIES} попыток."
+        )
 
     try:
         output_text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -357,13 +368,16 @@ async def process_upload(message: discord.Message) -> None:
                 await asyncio.sleep(DELETE_DELAY)
                 try:
                     await sent_registration.delete()
+                except discord.NotFound:
+                    # Регистрационный бот уже успел удалить команду — это нормально.
+                    pass
                 except Exception:
                     log.exception(
                         "Не удалось удалить сообщение регистрации матча #%s",
                         result.get("match_id"),
                     )
             log.info(
-                "Матч #%s успешно отправлен в канал %s",
+                "Матч #%s ��спешно отправлен в канал %s",
                 result["match_id"],
                 message.channel.id,
             )
