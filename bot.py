@@ -24,6 +24,7 @@ GEMINI_API_KEYS = [
 if not GEMINI_API_KEYS:
     raise RuntimeError("Укажите GEMINI_API_KEYS или GEMINI_API_KEY в Railway.")
 
+AI_API_STYLE = os.getenv("AI_API_STYLE", "gemini").strip().lower()
 GEMINI_BASE_URL = os.getenv(
     "GEMINI_BASE_URL",
     os.getenv("GOOGLE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"),
@@ -233,7 +234,7 @@ Build a registration result:
         image_b64, mime = prepare_image(raw)
         parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
 
-    payload = {
+    gemini_payload = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0,
@@ -241,6 +242,25 @@ Build a registration result:
             "responseJsonSchema": response_schema,
         },
     }
+
+    openai_content: list[dict] = [
+        {
+            "type": "text",
+            "text": prompt
+            + "\nReturn ONLY valid JSON matching this schema:\n"
+            + json.dumps(response_schema, ensure_ascii=False),
+        }
+    ]
+    for image_part in parts[1:]:
+        inline = image_part["inline_data"]
+        openai_content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{inline['mime_type']};base64,{inline['data']}"
+                },
+            }
+        )
 
     timeout = aiohttp.ClientTimeout(total=120)
     retryable_statuses = {429, 500, 502, 503, 504}
@@ -256,13 +276,30 @@ Build a registration result:
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for model in models:
-            url = (
-                f"{GEMINI_BASE_URL}/v1beta/models/"
-                f"{model}:generateContent"
-            )
-            headers = {"x-goog-api-key": assigned_api_key}
+            if AI_API_STYLE == "openai":
+                url = f"{GEMINI_BASE_URL}/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {assigned_api_key}",
+                    "Content-Type": "application/json",
+                }
+                request_payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": openai_content}],
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                }
+            else:
+                url = (
+                    f"{GEMINI_BASE_URL}/v1beta/models/"
+                    f"{model}:generateContent"
+                )
+                headers = {"x-goog-api-key": assigned_api_key}
+                request_payload = gemini_payload
+
             for attempt in range(GEMINI_MAX_RETRIES):
-                async with session.post(url, json=payload, headers=headers) as response:
+                async with session.post(
+                    url, json=request_payload, headers=headers
+                ) as response:
                     body = await response.text()
                     if response.status < 400:
                         data = json.loads(body)
@@ -289,9 +326,21 @@ Build a registration result:
         )
 
     try:
-        output_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        if AI_API_STYLE == "openai":
+            output_text = data["choices"][0]["message"]["content"]
+        else:
+            output_text = data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError("Gemini не вернул результат распознавания") from exc
+        raise RuntimeError("ИИ не вернул результат распознавания") from exc
+
+    if isinstance(output_text, list):
+        output_text = "".join(
+            item.get("text", "") for item in output_text if isinstance(item, dict)
+        )
+    output_text = str(output_text).strip()
+    if output_text.startswith("```"):
+        output_text = output_text.split("\n", 1)[1]
+        output_text = output_text.rsplit("```", 1)[0].strip()
     return json.loads(output_text)
 
 
