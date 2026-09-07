@@ -8,6 +8,7 @@ Set these in **Variables**:
 - `GEMINI_API_KEY` — Google Gemini API key.
 - `NORMAL_CHANNEL_IDS` — comma-separated IDs of ordinary-game channels.
 - `PRIORITY_CHANNEL_IDS` — comma-separated IDs of priority-game channels.
+- `LOG_CHANNEL_ID` — ID of the channel that receives every successful registration, including match number, score, source, and full command.
 - `MY_ACCOUNT_ID` — your Discord account ID; recommended so only you can use `старт` and `енд`.
 - `MIN_CONFIDENCE` — default `0.82`.
 - `BACKFILL_LIMIT` — how many previous messages to inspect in each selected channel; default `500`.

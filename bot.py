@@ -30,6 +30,7 @@ def parse_channel_ids(variable_name: str) -> set[int]:
 
 NORMAL_CHANNEL_IDS = parse_channel_ids("NORMAL_CHANNEL_IDS")
 PRIORITY_CHANNEL_IDS = parse_channel_ids("PRIORITY_CHANNEL_IDS")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 MY_ACCOUNT_ID = int(os.getenv("MY_ACCOUNT_ID", "0"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
@@ -252,6 +253,34 @@ def format_registration(result: dict) -> str:
     return "\n".join(lines)
 
 
+async def send_registration_log(
+    result: dict,
+    source_message: discord.Message,
+    command_text: str,
+) -> None:
+    """Send every successful registration to the configured log channel."""
+    if not LOG_CHANNEL_ID:
+        return
+
+    try:
+        log_channel = client.get_channel(LOG_CHANNEL_ID)
+        if log_channel is None:
+            log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
+
+        await log_channel.send(
+            f"✅ Зарегистрирована игра #{result['match_id']}\n"
+            f"Счёт: {result['score_a']}:{result['score_b']}\n"
+            f"Источник: <#{source_message.channel.id}>\n"
+            f"```text\n{command_text}\n```"
+        )
+    except Exception:
+        log.exception(
+            "Не удалось отправить лог матча #%s в канал %s",
+            result.get("match_id"),
+            LOG_CHANNEL_ID,
+        )
+
+
 async def process_upload(message: discord.Message) -> None:
     urls = image_urls(message)
     if not urls:
@@ -291,8 +320,10 @@ async def process_upload(message: discord.Message) -> None:
                 )
                 return
 
+            command_text = format_registration(result)
             await asyncio.sleep(SEND_DELAY)
-            await message.channel.send(format_registration(result))
+            await message.channel.send(command_text)
+            await send_registration_log(result, message, command_text)
             log.info(
                 "Матч #%s успешно отправлен в канал %s",
                 result["match_id"],
