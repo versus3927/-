@@ -5,7 +5,7 @@
 Set these in **Variables**:
 
 - `DISCORD_USER_TOKEN` — Discord account token.
-- `GEMINI_API_KEYS` — comma-separated Gemini-compatible API keys. Consecutive games rotate across keys; keys are never printed in logs. A single `GEMINI_API_KEY` is also supported.
+- `GEMINI_API_KEY_1`, `GEMINI_API_KEY_2`, etc. — separate Gemini-compatible API keys. Up to 10 numbered keys are supported and consecutive games rotate across them. Keys are never printed in logs. Legacy `GEMINI_API_KEYS` and `GEMINI_API_KEY` are also accepted.
 - `AI_API_STYLE` — use `openai` for AI STAR's general API, or `gemini` for the native Google protocol.
 - `GEMINI_BASE_URL` — provider base URL. For AI STAR OpenAI-compatible requests use `https://ai.starimg.ru/v1`; for official Google omit it.
 - `NORMAL_CHANNEL_IDS` — comma-separated IDs of ordinary-game channels.

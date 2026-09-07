@@ -15,14 +15,26 @@ load_dotenv()
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
-_single_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_API_KEYS = [
+_key_candidates: list[str] = []
+for key_number in range(1, 11):
+    value = os.getenv(f"GEMINI_API_KEY_{key_number}", "").strip()
+    if value:
+        _key_candidates.append(value)
+
+_key_candidates.extend(
     key.strip()
-    for key in os.getenv("GEMINI_API_KEYS", _single_gemini_key).split(",")
+    for key in os.getenv("GEMINI_API_KEYS", "").split(",")
     if key.strip()
-]
+)
+_single_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+if _single_gemini_key:
+    _key_candidates.append(_single_gemini_key)
+
+GEMINI_API_KEYS = list(dict.fromkeys(_key_candidates))
 if not GEMINI_API_KEYS:
-    raise RuntimeError("Укажите GEMINI_API_KEYS или GEMINI_API_KEY в Railway.")
+    raise RuntimeError(
+        "Укажите GEMINI_API_KEY_1, GEMINI_API_KEY_2 или GEMINI_API_KEY в Railway."
+    )
 
 AI_API_STYLE = os.getenv("AI_API_STYLE", "gemini").strip().lower()
 GEMINI_BASE_URL = os.getenv(
