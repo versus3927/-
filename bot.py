@@ -20,14 +20,20 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
 
-WATCH_CHANNEL_IDS = {
-    int(x.strip())
-    for x in os.getenv("WATCH_CHANNEL_IDS", "").split(",")
-    if x.strip()
-}
+def parse_channel_ids(variable_name: str) -> set[int]:
+    return {
+        int(x.strip())
+        for x in os.getenv(variable_name, "").split(",")
+        if x.strip()
+    }
+
+
+NORMAL_CHANNEL_IDS = parse_channel_ids("NORMAL_CHANNEL_IDS")
+PRIORITY_CHANNEL_IDS = parse_channel_ids("PRIORITY_CHANNEL_IDS")
 MY_ACCOUNT_ID = int(os.getenv("MY_ACCOUNT_ID", "0"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
+SEND_DELAY = float(os.getenv("SEND_DELAY", "0.25"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +43,7 @@ log = logging.getLogger("faceit-reg-self")
 
 client = discord.Client()
 is_active = False
+active_channel_ids: set[int] = set()
 processed_message_ids: set[int] = set()
 
 
@@ -44,7 +51,7 @@ def allowed_for_parsing(message: discord.Message) -> bool:
     """Return True if this message may be parsed automatically."""
     if client.user and message.author.id == client.user.id:
         return False
-    if WATCH_CHANNEL_IDS and message.channel.id not in WATCH_CHANNEL_IDS:
+    if not active_channel_ids or message.channel.id not in active_channel_ids:
         return False
     return True
 
@@ -284,7 +291,7 @@ async def process_upload(message: discord.Message) -> None:
                 )
                 return
 
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(SEND_DELAY)
             await message.channel.send(format_registration(result))
             log.info(
                 "Матч #%s успешно отправлен в канал %s",
@@ -307,36 +314,39 @@ async def process_message_once(message: discord.Message) -> bool:
     return True
 
 
-async def backfill_channels(before_time) -> int:
-    """Read older image messages from all configured watch channels."""
-    if not WATCH_CHANNEL_IDS:
-        log.warning("История не прочитана: WATCH_CHANNEL_IDS не заполнен.")
-        return 0
-
+async def backfill_one_channel(channel_id: int, before_time) -> int:
+    """Read old image messages from one channel in chronological order."""
     found = 0
-    for channel_id in sorted(WATCH_CHANNEL_IDS):
-        try:
-            channel = client.get_channel(channel_id)
-            if channel is None:
-                channel = await client.fetch_channel(channel_id)
+    try:
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            channel = await client.fetch_channel(channel_id)
 
-            log.info(
-                "Читаю до %s старых сообщений из канала %s",
-                BACKFILL_LIMIT,
-                channel_id,
-            )
-            async for old_message in channel.history(
-                limit=BACKFILL_LIMIT,
-                before=before_time,
-                oldest_first=True,
-            ):
-                if await process_message_once(old_message):
-                    found += 1
-                    await asyncio.sleep(1.0)
-        except Exception:
-            log.exception("Не удалось прочитать историю канала %s", channel_id)
-
+        log.info(
+            "Читаю до %s старых сообщений из канала %s",
+            BACKFILL_LIMIT,
+            channel_id,
+        )
+        async for old_message in channel.history(
+            limit=BACKFILL_LIMIT,
+            before=before_time,
+            oldest_first=True,
+        ):
+            if await process_message_once(old_message):
+                found += 1
+    except Exception:
+        log.exception("Не удалось прочитать историю канала %s", channel_id)
     return found
+
+
+async def backfill_channels(channel_ids: set[int], before_time) -> int:
+    """Scan selected channels concurrently while preserving order per channel."""
+    if not channel_ids:
+        return 0
+    counts = await asyncio.gather(
+        *(backfill_one_channel(channel_id, before_time) for channel_id in channel_ids)
+    )
+    return sum(counts)
 
 
 @client.event
@@ -349,21 +359,45 @@ async def on_message(message: discord.Message) -> None:
     global is_active
 
     command = message.content.strip().lower()
-    if command in ("старт", "енд"):
+    if command == "енд" or command.startswith("старт"):
         if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
             return
-        if command == "старт":
-            is_active = True
-            await message.channel.send(
-                "✅ Авторег запущен. Сначала читаю старые игры, затем новые."
-            )
-            count = await backfill_channels(message.created_at)
-            await message.channel.send(
-                f"✅ Архив каналов проверен. Найдено сообщений с изображениями: {count}."
-            )
-        else:
+
+        if command == "енд":
             is_active = False
+            active_channel_ids.clear()
             await message.channel.send("🛑 Авторег остановлен.")
+            return
+
+        mode = command.removeprefix("старт").strip()
+        modes = {
+            "обычный": ("обычный", NORMAL_CHANNEL_IDS),
+            "приоритет": ("приоритет", PRIORITY_CHANNEL_IDS),
+            "все": ("обычный + приоритет", NORMAL_CHANNEL_IDS | PRIORITY_CHANNEL_IDS),
+        }
+        if mode not in modes:
+            await message.channel.send(
+                "Выберите режим: `старт обычный`, `старт приоритет` или `старт все`."
+            )
+            return
+
+        mode_name, selected_ids = modes[mode]
+        if not selected_ids:
+            await message.channel.send(
+                f"❌ Для режима «{mode_name}» не указаны ID каналов в Railway."
+            )
+            return
+
+        active_channel_ids.clear()
+        active_channel_ids.update(selected_ids)
+        is_active = True
+        await message.channel.send(
+            f"✅ Запущен режим «{mode_name}». Читаю старые игры, затем новые."
+        )
+        count = await backfill_channels(active_channel_ids, message.created_at)
+        await message.channel.send(
+            f"✅ Архив режима «{mode_name}» проверен. Найдено изображений: {count}."
+        )
         return
 
     if is_active:

@@ -6,10 +6,12 @@ Set these in **Variables**:
 
 - `DISCORD_USER_TOKEN` — Discord account token.
 - `GEMINI_API_KEY` — Google Gemini API key.
-- `WATCH_CHANNEL_IDS` — comma-separated Discord channel IDs; empty means all accessible channels.
+- `NORMAL_CHANNEL_IDS` — comma-separated IDs of ordinary-game channels.
+- `PRIORITY_CHANNEL_IDS` — comma-separated IDs of priority-game channels.
 - `MY_ACCOUNT_ID` — your Discord account ID; recommended so only you can use `старт` and `енд`.
 - `MIN_CONFIDENCE` — default `0.82`.
-- `BACKFILL_LIMIT` — how many previous messages to inspect in each watched channel when `старт` is sent; default `500`.
+- `BACKFILL_LIMIT` — how many previous messages to inspect in each selected channel; default `500`.
+- `SEND_DELAY` — delay before sending each result; default `0.25` seconds.
 - `GEMINI_MODEL` — primary model name.
 - `GEMINI_FALLBACK_MODEL` — fallback model name.
 - `GEMINI_MAX_RETRIES` — default `3`.
@@ -20,7 +22,7 @@ Set these in **Variables**:
 2. Create a Railway project and deploy the repository.
 3. Add the variables above.
 4. Railway uses the included `Procfile` to run `python bot.py` as a worker.
-5. Send `старт` in Discord. The script first scans older messages in every `WATCH_CHANNEL_IDS` channel, then watches new messages.
+5. Send `старт обычный`, `старт приоритет`, or `старт все` in Discord. The script scans the selected channels' history and then watches new messages there. Use `енд` to stop.
 
 Do not upload a real `.env` file or commit tokens.
 
