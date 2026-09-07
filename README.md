@@ -13,6 +13,8 @@ Set these in **Variables**:
 - `MIN_CONFIDENCE` — default `0.82`.
 - `BACKFILL_LIMIT` — how many previous messages to inspect in each selected channel; default `500`.
 - `SEND_DELAY` — delay before sending each result; default `0.25` seconds.
+- `DELETE_AFTER_REGISTRATION` — delete the temporary registration command after it is sent; default `true`.
+- `DELETE_DELAY` — seconds to wait before deleting the registration command; default `3.0`.
 - `GEMINI_MODEL` — primary model name.
 - `GEMINI_FALLBACK_MODEL` — fallback model name.
 - `GEMINI_MAX_RETRIES` — default `3`.
@@ -24,6 +26,7 @@ Set these in **Variables**:
 3. Add the variables above.
 4. Railway uses the included `Procfile` to run `python bot.py` as a worker.
 5. Send `старт обычный`, `старт приоритет`, or `старт все` in Discord. The script scans the selected channels' history and then watches new messages there. Use `енд` to stop.
+6. Review cards and numeric-only mentions are matched against scoreboard nicknames and K/A/D. After registration, the temporary command is deleted; the permanent result remains in the log channel.
 
 Do not upload a real `.env` file or commit tokens.
 

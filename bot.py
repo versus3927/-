@@ -35,6 +35,10 @@ MY_ACCOUNT_ID = int(os.getenv("MY_ACCOUNT_ID", "0"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
 SEND_DELAY = float(os.getenv("SEND_DELAY", "0.25"))
+DELETE_AFTER_REGISTRATION = os.getenv("DELETE_AFTER_REGISTRATION", "true").lower() in {
+    "1", "true", "yes", "on"
+}
+DELETE_DELAY = float(os.getenv("DELETE_DELAY", "3.0"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -173,7 +177,10 @@ Build a registration result:
 - match_id: number after 'Результат матча #'.
 - Team A must always be returned in team_a; Team B in team_b.
 - score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
-- For every roster player return the numeric ID from the Discord card and K/A/D from the scoreboard.
+- Cards titled 'на проверку' are valid match results and MUST be registered when match number, score and rosters can be recovered.
+- For every roster player return the SHORT registration ID printed with # immediately before the nickname/mention. It is usually 2, 3 or 4 digits (for example #37, #539, #1639). Use the complete short # number. NEVER use a long Discord mention/user ID such as 1524375653149966517.
+- Some roster names are Discord mentions or contain only digits. A numeric-only mention is NOT the nickname. Identify that player by the K/A/D printed beside or below the roster entry, then match those K/A/D values to the unique scoreboard row and recover the real nickname from the scoreboard.
+- When several numeric-only roster entries exist, solve them globally: compare all visible K/A/D values and all still-unmatched scoreboard rows, and never assign one scoreboard row twice. Use team membership, roster order and remaining unmatched rows as tie-breakers.
 - Fuzzy nickname matching is REQUIRED. Ignore case, spaces, punctuation, clan tags, decorative prefixes/suffixes and extra text. A roster nickname contained inside a scoreboard nickname is a match: for example `versus`, `versusproto`, `[TAG]versus` and `versus_123` refer to the same player when there is no conflicting roster nickname.
 - Match obvious Cyrillic/Latin phonetic spellings too. For example Latin `versus` may appear as Cyrillic `версус`.
 - Never assign one scoreboard row to two roster players. Prefer the unique strongest nickname match across all ten roster players.
@@ -322,8 +329,17 @@ async def process_upload(message: discord.Message) -> None:
 
             command_text = format_registration(result)
             await asyncio.sleep(SEND_DELAY)
-            await message.channel.send(command_text)
+            sent_registration = await message.channel.send(command_text)
             await send_registration_log(result, message, command_text)
+            if DELETE_AFTER_REGISTRATION:
+                await asyncio.sleep(DELETE_DELAY)
+                try:
+                    await sent_registration.delete()
+                except Exception:
+                    log.exception(
+                        "Не удалось удалить сообщение регистрации матча #%s",
+                        result.get("match_id"),
+                    )
             log.info(
                 "Матч #%s успешно отправлен в канал %s",
                 result["match_id"],
