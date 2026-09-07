@@ -1,107 +1,25 @@
-# Бесплатный FACEIT AI-регистратор для Discord
+# FACEIT autor eg for Railway
 
-Вы пересылаете на личный Discord-сервер сообщение с результатом матча. Бот читает текст, embed и изображение внутри Discord-пересылки, бесплатно распознаёт их через Gemini API Free Tier и возвращает готовое сообщение для копирования на сервер регистрации.
+## Railway variables
 
-```text
-=g 2190 13 6
+Set these in **Variables**:
 
-CT
-37 10 4 16
-585 21 2 14
-...
+- `DISCORD_USER_TOKEN` — Discord account token.
+- `GEMINI_API_KEY` — Google Gemini API key.
+- `WATCH_CHANNEL_IDS` — comma-separated Discord channel IDs; empty means all accessible channels.
+- `MY_ACCOUNT_ID` — your Discord account ID; recommended so only you can use `старт` and `енд`.
+- `MIN_CONFIDENCE` — default `0.82`.
+- `GEMINI_MODEL` — primary model name.
+- `GEMINI_FALLBACK_MODEL` — fallback model name.
+- `GEMINI_MAX_RETRIES` — default `3`.
 
-T
-160 15 1 17
-161 14 4 16
-...
-```
+## Deploy
 
-Бота не нужно добавлять на сервер регистрации.
+1. Unzip the archive and upload the files to a GitHub repository, or use Railway's supported source upload flow.
+2. Create a Railway project and deploy the repository.
+3. Add the variables above.
+4. Railway uses the included `Procfile` to run `python main.py` as a worker.
 
-## Правила сопоставления игроков
+Do not upload a real `.env` file or commit tokens.
 
-- Если игрок указан в составе, но отсутствует в игровом табло, бот ставит `0 0 13`.
-- Регистр, пробелы, знаки, clan-теги и дополнительные приписки игнорируются.
-- Например, `versus`, `versusproto`, `[TAG]versus` и кириллическое `версус` могут быть сопоставлены с одним игроком, если среди остальных игроков нет конфликта.
-- Одна строка игрового табло не назначается двум разным игрокам.
-- При нечитаемых числах существующей строки бот предупреждает о необходимости проверки; `0 0 13` используется именно при отсутствии игрока в табло.
-
-## Что используется бесплатно
-
-- Google Gemini API Free Tier для распознавания изображений.
-- Бесплатный кредит Railway — пока сервис укладывается в его лимит.
-- OpenAI API не используется.
-
-Бесплатные квоты сервисов могут меняться. При временных ошибках 429/500/502/503/504 бот автоматически повторяет запрос до трёх раз, а затем переключается на резервную бесплатную модель. Если обе модели недоступны, нужно немного подождать.
-
-## 1. Получение бесплатного Gemini API Key
-
-1. Откройте https://aistudio.google.com/app/apikey
-2. Войдите в Google-аккаунт.
-3. Нажмите **Create API key**.
-4. Скопируйте ключ. Не отправляйте его другим людям.
-
-## 2. Создание Discord-бота
-
-1. Откройте https://discord.com/developers/applications
-2. Создайте приложение и перейдите в **Bot**.
-3. Создайте/сбросьте токен бота.
-4. Включите **Message Content Intent**.
-5. Пригласите бота на личный сервер с правами View Channels, Read Message History и Send Messages.
-
-## 3. Переменные Railway
-
-В Railway откройте Service → Variables и добавьте:
-
-```env
-DISCORD_TOKEN=ваш_токен_бота
-GEMINI_API_KEY=ваш_ключ_из_Google_AI_Studio
-GEMINI_MODEL=gemini-3.6-flash
-GEMINI_FALLBACK_MODEL=gemini-3.5-flash-lite
-GEMINI_MAX_RETRIES=3
-WATCH_CHANNEL_IDS=ID_КАНАЛА_СО_СКРИНШОТАМИ
-ALLOWED_USER_IDS=ВАШ_DISCORD_USER_ID
-MIN_CONFIDENCE=0.82
-```
-
-`WATCH_CHANNEL_IDS` и `ALLOWED_USER_IDS` можно не добавлять, но лучше указать их, чтобы посторонние не расходовали бесплатную квоту.
-
-Чтобы получить ID, включите Discord → Настройки → Расширенные → Режим разработчика. Затем нажмите правой кнопкой на канал или профиль и выберите «Копировать ID».
-
-Переменная `PORT` не нужна: это Discord-бот, а не веб-сервер.
-
-## 4. Деплой на Railway
-
-Загрузите папку в GitHub и создайте Railway-сервис из репозитория. Dockerfile уже находится в проекте, поэтому отдельная команда запуска не нужна. После добавления Variables выполните Redeploy.
-
-В логах должна появиться строка:
-
-```text
-Logged in as ИМЯ_БОТА (...)
-```
-
-## Использование
-
-Перешлите сообщение ELITE FPL с результатом в указанный канал через функцию Discord «Переслать». Обычная загрузка изображений также поддерживается. Можно приложить до четырёх изображений одного матча одним сообщением. Например:
-
-1. полный скрин карточки матча;
-2. увеличенный игровой scoreboard.
-
-При плохой читаемости бот выдаст предупреждение. Для повторной обработки можно ответить на сообщение командой `!reg`.
-
-## Локальный запуск
-
-```bash
-python -m venv .venv
-# Windows
-.venv\\Scripts\\activate
-# Linux/macOS
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Скопируйте `.env.example` в `.env`, заполните переменные и выполните:
-
-```bash
-python bot.py
-```
+> Note: automated user accounts/self-bots can violate Discord's Terms of Service and may lead to account restrictions. A normal Discord bot token is the safer supported option.
