@@ -258,10 +258,11 @@ Build a registration result:
         for model in models:
             url = (
                 f"{GEMINI_BASE_URL}/v1beta/models/"
-                f"{model}:generateContent?key={assigned_api_key}"
+                f"{model}:generateContent"
             )
+            headers = {"x-goog-api-key": assigned_api_key}
             for attempt in range(GEMINI_MAX_RETRIES):
-                async with session.post(url, json=payload) as response:
+                async with session.post(url, json=payload, headers=headers) as response:
                     body = await response.text()
                     if response.status < 400:
                         data = json.loads(body)
