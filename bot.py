@@ -15,9 +15,21 @@ load_dotenv()
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
+_single_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEYS = [
+    key.strip()
+    for key in os.getenv("GEMINI_API_KEYS", _single_gemini_key).split(",")
+    if key.strip()
+]
+if not GEMINI_API_KEYS:
+    raise RuntimeError("Укажите GEMINI_API_KEYS или GEMINI_API_KEY в Railway.")
+
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL",
+    os.getenv("GOOGLE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"),
+).rstrip("/")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.7-flash")
 GEMINI_MODELS = [
     model.strip()
     for model in os.getenv(
@@ -59,16 +71,19 @@ client = discord.Client()
 is_active = False
 active_channel_ids: set[int] = set()
 processed_message_ids: set[int] = set()
-model_rotation_index = 0
+gemini_assignment_index = 0
 processing_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 
 
-def next_gemini_model() -> str:
-    """Assign consecutive games to models in round-robin order."""
-    global model_rotation_index
-    model = GEMINI_MODELS[model_rotation_index % len(GEMINI_MODELS)]
-    model_rotation_index += 1
-    return model
+def next_gemini_assignment() -> tuple[str, str, int]:
+    """Assign exactly one model and one API key to each consecutive game."""
+    global gemini_assignment_index
+    index = gemini_assignment_index
+    gemini_assignment_index += 1
+    model = GEMINI_MODELS[index % len(GEMINI_MODELS)]
+    key_index = index % len(GEMINI_API_KEYS)
+    api_key = GEMINI_API_KEYS[key_index]
+    return model, api_key, key_index + 1
 
 
 def allowed_for_parsing(message: discord.Message) -> bool:
@@ -229,17 +244,21 @@ Build a registration result:
 
     timeout = aiohttp.ClientTimeout(total=120)
     retryable_statuses = {429, 500, 502, 503, 504}
-    assigned_model = next_gemini_model()
-    # Одна игра всегда обрабатывается только одной назначенной моделью.
+    assigned_model, assigned_api_key, assigned_key_number = next_gemini_assignment()
+    # Одна игра всегда обрабатывается только одной моделью и одним ключом.
     models = [assigned_model]
-    log.info("Игра назначена только модели %s", assigned_model)
+    log.info(
+        "Игра назначена только модели %s и ключу #%s",
+        assigned_model,
+        assigned_key_number,
+    )
     data: Optional[dict] = None
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for model in models:
             url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={GEMINI_API_KEY}"
+                f"{GEMINI_BASE_URL}/v1beta/models/"
+                f"{model}:generateContent?key={assigned_api_key}"
             )
             for attempt in range(GEMINI_MAX_RETRIES):
                 async with session.post(url, json=payload) as response:
