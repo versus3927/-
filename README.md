@@ -15,8 +15,10 @@ Set these in **Variables**:
 - `SEND_DELAY` — delay before sending each result; default `0.25` seconds.
 - `DELETE_AFTER_REGISTRATION` — delete the temporary registration command after it is sent; default `true`.
 - `DELETE_DELAY` — seconds to wait before deleting the registration command; default `3.0`.
-- `GEMINI_MODEL` — primary model name.
-- `GEMINI_FALLBACK_MODEL` — fallback model name.
+- `GEMINI_MODEL` — legacy primary model setting.
+- `GEMINI_FALLBACK_MODEL` — legacy fallback model setting.
+- `GEMINI_MODELS` — comma-separated model pool. Consecutive games are assigned round-robin, for example game 1 to `gemini-3.6-flash`, game 2 to `gemini-3.1-flash-lite`.
+- `PROCESS_CONCURRENCY` — maximum games recognized at the same time; use `2` for two models.
 - `GEMINI_MAX_RETRIES` — default `3`.
 
 ## Deploy
@@ -27,6 +29,7 @@ Set these in **Variables**:
 4. Railway uses the included `Procfile` to run `python bot.py` as a worker.
 5. Send `старт обычный`, `старт приоритет`, or `старт все` in Discord. The script scans the selected channels' history and then watches new messages there. Use `енд` to stop.
 6. Review cards and numeric-only mentions are matched against scoreboard nicknames and K/A/D. After registration, the temporary command is deleted; the permanent result remains in the log channel.
+7. Games are distributed across `GEMINI_MODELS` in round-robin order. Each game is handled by exactly one assigned model; a second model never processes the same game. Up to `PROCESS_CONCURRENCY` different games can run simultaneously.
 
 Do not upload a real `.env` file or commit tokens.
 

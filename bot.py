@@ -17,8 +17,17 @@ load_dotenv()
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_MODELS",
+        f"{GEMINI_MODEL},{GEMINI_FALLBACK_MODEL}",
+    ).split(",")
+    if model.strip()
+]
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+PROCESS_CONCURRENCY = max(1, int(os.getenv("PROCESS_CONCURRENCY", "2")))
 
 def parse_channel_ids(variable_name: str) -> set[int]:
     return {
@@ -50,6 +59,16 @@ client = discord.Client()
 is_active = False
 active_channel_ids: set[int] = set()
 processed_message_ids: set[int] = set()
+model_rotation_index = 0
+processing_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
+
+
+def next_gemini_model() -> str:
+    """Assign consecutive games to models in round-robin order."""
+    global model_rotation_index
+    model = GEMINI_MODELS[model_rotation_index % len(GEMINI_MODELS)]
+    model_rotation_index += 1
+    return model
 
 
 def allowed_for_parsing(message: discord.Message) -> bool:
@@ -210,7 +229,10 @@ Build a registration result:
 
     timeout = aiohttp.ClientTimeout(total=120)
     retryable_statuses = {429, 500, 502, 503, 504}
-    models = list(dict.fromkeys([GEMINI_MODEL, GEMINI_FALLBACK_MODEL]))
+    assigned_model = next_gemini_model()
+    # Одна игра всегда обрабатывается только одной назначенной моделью.
+    models = [assigned_model]
+    log.info("Игра назначена только модели %s", assigned_model)
     data: Optional[dict] = None
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -357,7 +379,8 @@ async def process_message_once(message: discord.Message) -> bool:
         return False
 
     processed_message_ids.add(message.id)
-    await process_upload(message)
+    async with processing_semaphore:
+        await process_upload(message)
     return True
 
 
@@ -374,13 +397,31 @@ async def backfill_one_channel(channel_id: int, before_time) -> int:
             BACKFILL_LIMIT,
             channel_id,
         )
+        batch: list[discord.Message] = []
         async for old_message in channel.history(
             limit=BACKFILL_LIMIT,
             before=before_time,
             oldest_first=True,
         ):
-            if await process_message_once(old_message):
-                found += 1
+            if (
+                old_message.id not in processed_message_ids
+                and allowed_for_parsing(old_message)
+                and image_urls(old_message)
+            ):
+                batch.append(old_message)
+
+            if len(batch) >= PROCESS_CONCURRENCY:
+                results = await asyncio.gather(
+                    *(process_message_once(item) for item in batch)
+                )
+                found += sum(bool(result) for result in results)
+                batch.clear()
+
+        if batch:
+            results = await asyncio.gather(
+                *(process_message_once(item) for item in batch)
+            )
+            found += sum(bool(result) for result in results)
     except Exception:
         log.exception("Не удалось прочитать историю канала %s", channel_id)
     return found
