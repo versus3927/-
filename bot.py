@@ -76,6 +76,10 @@ DELETE_AFTER_REGISTRATION = os.getenv("DELETE_AFTER_REGISTRATION", "true").lower
     "1", "true", "yes", "on"
 }
 DELETE_DELAY = float(os.getenv("DELETE_DELAY", "3.0"))
+DELETE_SOURCE_AFTER_REGISTRATION = os.getenv(
+    "DELETE_SOURCE_AFTER_REGISTRATION", "true"
+).lower() in {"1", "true", "yes", "on"}
+SOURCE_DELETE_DELAY = float(os.getenv("SOURCE_DELETE_DELAY", "1.0"))
 STATS_FILE = os.getenv("STATS_FILE", "/data/registration_stats.json")
 STATS_TIMEZONE = ZoneInfo(os.getenv("STATS_TIMEZONE", "Europe/Moscow"))
 
@@ -248,6 +252,29 @@ def prepare_image(raw: bytes) -> tuple[str, str]:
     return base64.b64encode(out.getvalue()).decode("ascii"), "image/jpeg"
 
 
+def extract_short_player_ids(message_text: str, match_id: Optional[int]) -> list[int]:
+    """Extract ten short registration IDs in roster order from Discord text."""
+    missing_stats = re.search(
+        r"Нет\s+статистики\s+для\s+игроков\s*:\s*([^\n]+)",
+        message_text,
+        re.I,
+    )
+    search_areas = [missing_stats.group(1)] if missing_stats else []
+    search_areas.append(message_text)
+
+    for area in search_areas:
+        ids: list[int] = []
+        for value in re.findall(r"(?<!\d)#\s*(\d{1,5})(?!\d)", area):
+            player_id = int(value)
+            if match_id is not None and player_id == int(match_id):
+                continue
+            if player_id not in ids:
+                ids.append(player_id)
+        if len(ids) == 10:
+            return ids
+    return []
+
+
 def parse_review_card(message_text: str) -> Optional[dict]:
     """Parse complete Discord 'на проверку' cards without an AI request."""
     if "на проверку" not in message_text.lower():
@@ -389,6 +416,7 @@ Build a registration result:
 - In review cards, strings like `@#64 | kanei — 8/2/12` mean registration id=64, nickname=kanei, kills=8, assists=2, deaths=12. The @ formatting does not turn the short # number into a Discord user ID.
 - If a review card says a player was not found and shows 0/0/0, apply the required absent-row default 0/0/13 and still keep that player.
 - For every roster player return the SHORT registration ID printed with # immediately before the nickname/mention. It is usually 2, 3 or 4 digits (for example #37, #539, #1639). Use the complete short # number. NEVER use a long Discord mention/user ID such as 1524375653149966517.
+- NEVER invent positional IDs such as 1,2,3,4,5 or 5,4,3,2,1. Array position is not a player ID. If the card contains a line like `Нет статистики для игроков: #89, #124, ...`, those ten short # numbers are the roster IDs in displayed order and must be returned exactly.
 - Some roster names are Discord mentions or contain only digits. A numeric-only mention is NOT the nickname. Identify that player by the K/A/D printed beside or below the roster entry, then match those K/A/D values to the unique scoreboard row and recover the real nickname from the scoreboard.
 - When several numeric-only roster entries exist, solve them globally: compare all visible K/A/D values and all still-unmatched scoreboard rows, and never assign one scoreboard row twice. Use team membership, roster order and remaining unmatched rows as tie-breakers.
 - Fuzzy nickname matching is REQUIRED. Ignore case, spaces, punctuation, clan tags, decorative prefixes/suffixes and extra text. A roster nickname contained inside a scoreboard nickname is a match: for example `versus`, `versusproto`, `[TAG]versus` and `versus_123` refer to the same player when there is no conflicting roster nickname.
@@ -580,6 +608,34 @@ async def process_upload(message: discord.Message) -> None:
                 )
 
             result = await recognize_match(raw_images, context)
+
+            expected_ids = extract_short_player_ids(context, result.get("match_id"))
+            returned_players = [
+                *result.get("team_a", []),
+                *result.get("team_b", []),
+            ]
+            if len(expected_ids) == 10 and len(returned_players) == 10:
+                for player, correct_id in zip(returned_players, expected_ids):
+                    player["id"] = correct_id
+                log.info(
+                    "ID матча #%s принудительно сверены с карточкой: %s",
+                    result.get("match_id"),
+                    expected_ids,
+                )
+            else:
+                returned_ids = [player.get("id") for player in returned_players]
+                positional_ids = [1, 2, 3, 4, 5, 5, 4, 3, 2, 1]
+                if returned_ids == positional_ids or (
+                    len(returned_ids) == 10
+                    and all(isinstance(value, int) and 1 <= value <= 5 for value in returned_ids)
+                ):
+                    log.error(
+                        "Матч #%s пропущен: модель выдумала позиционные ID %s",
+                        result.get("match_id"),
+                        returned_ids,
+                    )
+                    return
+
             fatal = (
                 not result.get("is_match_result")
                 or result.get("match_id") is None
@@ -623,6 +679,25 @@ async def process_upload(message: discord.Message) -> None:
                 except Exception:
                     log.exception(
                         "Не удалось удалить сообщение регистрации матча #%s",
+                        result.get("match_id"),
+                    )
+
+            if DELETE_SOURCE_AFTER_REGISTRATION:
+                await asyncio.sleep(SOURCE_DELETE_DELAY)
+                try:
+                    await message.delete()
+                except discord.NotFound:
+                    # Исходная карточка уже удалена автоматически.
+                    pass
+                except discord.Forbidden:
+                    log.warning(
+                        "Нет права удалить исходное сообщение %s в канале %s",
+                        message.id,
+                        message.channel.id,
+                    )
+                except Exception:
+                    log.exception(
+                        "Не удалось удалить исходное сообщение матча #%s",
                         result.get("match_id"),
                     )
             log.info(
