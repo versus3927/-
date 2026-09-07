@@ -27,6 +27,7 @@ WATCH_CHANNEL_IDS = {
 }
 MY_ACCOUNT_ID = int(os.getenv("MY_ACCOUNT_ID", "0"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
+BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +37,7 @@ log = logging.getLogger("faceit-reg-self")
 
 client = discord.Client()
 is_active = False
+processed_message_ids: set[int] = set()
 
 
 def allowed_for_parsing(message: discord.Message) -> bool:
@@ -293,6 +295,50 @@ async def process_upload(message: discord.Message) -> None:
             log.exception("Ошибка обработки файла в process_upload")
 
 
+async def process_message_once(message: discord.Message) -> bool:
+    """Process an image message once during the current bot session."""
+    if message.id in processed_message_ids:
+        return False
+    if not allowed_for_parsing(message) or not image_urls(message):
+        return False
+
+    processed_message_ids.add(message.id)
+    await process_upload(message)
+    return True
+
+
+async def backfill_channels(before_time) -> int:
+    """Read older image messages from all configured watch channels."""
+    if not WATCH_CHANNEL_IDS:
+        log.warning("История не прочитана: WATCH_CHANNEL_IDS не заполнен.")
+        return 0
+
+    found = 0
+    for channel_id in sorted(WATCH_CHANNEL_IDS):
+        try:
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(channel_id)
+
+            log.info(
+                "Читаю до %s старых сообщений из канала %s",
+                BACKFILL_LIMIT,
+                channel_id,
+            )
+            async for old_message in channel.history(
+                limit=BACKFILL_LIMIT,
+                before=before_time,
+                oldest_first=True,
+            ):
+                if await process_message_once(old_message):
+                    found += 1
+                    await asyncio.sleep(1.0)
+        except Exception:
+            log.exception("Не удалось прочитать историю канала %s", channel_id)
+
+    return found
+
+
 @client.event
 async def on_ready() -> None:
     log.info("Селф-бот успешно авторизован: %s", client.user)
@@ -309,15 +355,19 @@ async def on_message(message: discord.Message) -> None:
         if command == "старт":
             is_active = True
             await message.channel.send(
-                "✅ Авторег запущен. Начинаю парсинг приходящих матчей."
+                "✅ Авторег запущен. Сначала читаю старые игры, затем новые."
+            )
+            count = await backfill_channels(message.created_at)
+            await message.channel.send(
+                f"✅ Архив каналов проверен. Найдено сообщений с изображениями: {count}."
             )
         else:
             is_active = False
             await message.channel.send("🛑 Авторег остановлен.")
         return
 
-    if is_active and allowed_for_parsing(message) and image_urls(message):
-        await process_upload(message)
+    if is_active:
+        await process_message_once(message)
 
 
 if __name__ == "__main__":

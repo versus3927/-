@@ -9,6 +9,7 @@ Set these in **Variables**:
 - `WATCH_CHANNEL_IDS` — comma-separated Discord channel IDs; empty means all accessible channels.
 - `MY_ACCOUNT_ID` — your Discord account ID; recommended so only you can use `старт` and `енд`.
 - `MIN_CONFIDENCE` — default `0.82`.
+- `BACKFILL_LIMIT` — how many previous messages to inspect in each watched channel when `старт` is sent; default `500`.
 - `GEMINI_MODEL` — primary model name.
 - `GEMINI_FALLBACK_MODEL` — fallback model name.
 - `GEMINI_MAX_RETRIES` — default `3`.
@@ -18,7 +19,8 @@ Set these in **Variables**:
 1. Unzip the archive and upload the files to a GitHub repository, or use Railway's supported source upload flow.
 2. Create a Railway project and deploy the repository.
 3. Add the variables above.
-4. Railway uses the included `Procfile` to run `python main.py` as a worker.
+4. Railway uses the included `Procfile` to run `python bot.py` as a worker.
+5. Send `старт` in Discord. The script first scans older messages in every `WATCH_CHANNEL_IDS` channel, then watches new messages.
 
 Do not upload a real `.env` file or commit tokens.
 
