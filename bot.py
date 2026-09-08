@@ -6,8 +6,11 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from itertools import permutations
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -377,12 +380,28 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
         source_match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", await message_context(message), re.I)
         expected_match_id = int(source_match.group(1)) if source_match else None
 
+        def modal_matches_expected(text: Optional[str]) -> bool:
+            if not text:
+                return False
+            if expected_match_id is None:
+                return True
+            return bool(re.search(rf"=g\s+{expected_match_id}\b", text, re.I))
+
         def interaction_check(interaction: object) -> bool:
             interaction_custom_id = str(
                 getattr(interaction, "custom_id", "")
                 or (getattr(interaction, "data", {}) or {}).get("custom_id", "")
             )
-            return not custom_id or not interaction_custom_id or interaction_custom_id == custom_id
+            if custom_id and interaction_custom_id and interaction_custom_id != custom_id:
+                return False
+            # When the library exposes the source message, never accept an
+            # interaction belonging to a different result card.
+            interaction_message = getattr(interaction, "message", None)
+            interaction_message_id = getattr(interaction_message, "id", None)
+            if interaction_message_id is not None and interaction_message_id != message.id:
+                return False
+            interaction_text = extract_player_modal_text(interaction)
+            return not interaction_text or modal_matches_expected(interaction_text)
 
         # discord.py-self dispatches `interaction_finish` after the private
         # component response has been finalized and Interaction.successful
@@ -392,11 +411,7 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
             if getattr(getattr(candidate, "channel", None), "id", None) != message.channel.id:
                 return False
             text = extract_player_modal_text(candidate)
-            if not text:
-                return False
-            if expected_match_id is None:
-                return True
-            return bool(re.search(rf"=g\s+{expected_match_id}\b", text, re.I))
+            return modal_matches_expected(text)
 
         waiters = [
             asyncio.create_task(client.wait_for("message", check=helper_message_check)),
@@ -406,7 +421,7 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
         try:
             click_result = await button.click()
             direct_text = extract_player_modal_text(click_result)
-            if direct_text:
+            if modal_matches_expected(direct_text):
                 return direct_text, extract_interaction_image_urls(click_result)
 
             deadline = asyncio.get_running_loop().time() + PLAYER_MODAL_TIMEOUT
@@ -425,7 +440,7 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
                 for completed in done:
                     with contextlib.suppress(Exception):
                         response_text = extract_player_modal_text(completed.result())
-                        if response_text:
+                        if modal_matches_expected(response_text):
                             return (
                                 response_text,
                                 extract_interaction_image_urls(completed.result()),
@@ -548,6 +563,158 @@ def result_from_players_modal(
         "team_b": parsed["T"],
         "overall_confidence": 1.0,
         "notes": "ID и стартовые стороны взяты из окна «Получить игроков»; результат сверен с карточкой.",
+    }
+
+
+def result_from_visual_audit(
+    message_text: str,
+    modal_text: str,
+    audit: dict,
+) -> Optional[dict]:
+    """Accept a review card only when its modal exactly matches the screenshot."""
+    parsed = parse_players_modal(modal_text)
+    match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
+    if parsed is None or match is None or not audit.get("is_scoreboard"):
+        return None
+
+    try:
+        confidence = float(audit.get("overall_confidence", 0) or 0)
+        score_left = int(audit["score_left"])
+        score_right = int(audit["score_right"])
+        left_players = audit["left_players"]
+        right_players = audit["right_players"]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if (
+        confidence < 0.90
+        or not (0 <= score_left <= 99 and 0 <= score_right <= 99)
+        or len(left_players) != 5
+        or len(right_players) != 5
+    ):
+        return None
+
+    def nickname_key(value: object) -> str:
+        text = unicodedata.normalize("NFKD", str(value)).casefold()
+        return "".join(character for character in text if character.isalnum())
+
+    def nickname_score(first: object, second: object) -> float:
+        left = nickname_key(first)
+        right = nickname_key(second)
+        if not left or not right or left.isdigit() or right.isdigit():
+            return 0.0
+        if left == right:
+            return 1.0
+        if min(len(left), len(right)) >= 3 and (left in right or right in left):
+            return 0.92 + 0.08 * min(len(left), len(right)) / max(len(left), len(right))
+        return SequenceMatcher(None, left, right).ratio()
+
+    def kad(player: dict) -> Optional[tuple[int, int, int]]:
+        try:
+            values = (
+                int(player["kills"]),
+                int(player["assists"]),
+                int(player["deaths"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(value < 0 or value > 100 for value in values):
+            return None
+        return (0, 0, 13) if values == (0, 0, 0) else values
+
+    if any(kad(player) is None for player in [*left_players, *right_players]):
+        return None
+
+    def best_alignment(
+        modal_players: list[dict], visual_players: list[dict]
+    ) -> tuple[tuple[int, ...], float, float]:
+        best_order: tuple[int, ...] = tuple(range(5))
+        best_average = -1.0
+        best_minimum = -1.0
+        for order in permutations(range(5)):
+            scores: list[float] = []
+            for modal_player, visual_index in zip(modal_players, order):
+                visual_player = visual_players[visual_index]
+                name_match = nickname_score(
+                    modal_player.get("nickname", ""),
+                    visual_player.get("nickname", ""),
+                )
+                # Exact K/A/D is useful for mentions or decorated nicknames,
+                # but a name match remains authoritative when modal stats are
+                # one round stale.
+                stat_match = 0.88 if kad(modal_player) == kad(visual_player) else 0.0
+                scores.append(max(name_match, stat_match))
+            average = sum(scores) / 5
+            minimum = min(scores)
+            if (average, minimum) > (best_average, best_minimum):
+                best_order = tuple(order)
+                best_average = average
+                best_minimum = minimum
+        return best_order, best_average, best_minimum
+
+    direct_ct = best_alignment(parsed["CT"], left_players)
+    direct_t = best_alignment(parsed["T"], right_players)
+    swapped_ct = best_alignment(parsed["CT"], right_players)
+    swapped_t = best_alignment(parsed["T"], left_players)
+    direct_score = direct_ct[1] + direct_t[1]
+    swapped_score = swapped_ct[1] + swapped_t[1]
+
+    if direct_score >= swapped_score:
+        chosen_score, other_score = direct_score, swapped_score
+        ct_alignment, t_alignment = direct_ct, direct_t
+        visual_ct, visual_t = left_players, right_players
+        score_a, score_b = score_left, score_right
+    else:
+        chosen_score, other_score = swapped_score, direct_score
+        ct_alignment, t_alignment = swapped_ct, swapped_t
+        visual_ct, visual_t = right_players, left_players
+        score_a, score_b = score_right, score_left
+
+    if (
+        chosen_score / 2 < 0.78
+        or min(ct_alignment[2], t_alignment[2]) < 0.55
+        or chosen_score - other_score < 0.08
+    ):
+        log.error(
+            "Матч #%s: не удалось однозначно сопоставить игроков скриншота с окном игроков (direct=%.3f swapped=%.3f).",
+            match.group(1),
+            direct_score,
+            swapped_score,
+        )
+        return None
+
+    def merge_audited_stats(
+        modal_players: list[dict],
+        visual_players: list[dict],
+        order: tuple[int, ...],
+    ) -> list[dict]:
+        merged: list[dict] = []
+        for modal_player, visual_index in zip(modal_players, order):
+            visual_player = visual_players[visual_index]
+            merged.append(
+                {
+                    "id": int(modal_player["id"]),
+                    "nickname": str(visual_player.get("nickname") or modal_player["nickname"]),
+                    "kills": int(visual_player["kills"]),
+                    "assists": int(visual_player["assists"]),
+                    "deaths": int(visual_player["deaths"]),
+                }
+            )
+        return merged
+
+    audited_ct = merge_audited_stats(parsed["CT"], visual_ct, ct_alignment[0])
+    audited_t = merge_audited_stats(parsed["T"], visual_t, t_alignment[0])
+
+    return {
+        "is_match_result": True,
+        "match_id": int(match.group(1)),
+        "score_a": score_a,
+        "score_b": score_b,
+        "ct_team": "A",
+        "team_a": audited_ct,
+        "team_b": audited_t,
+        "overall_confidence": confidence,
+        "notes": "ID взяты из окна игроков; счёт и K/A/D взяты только из исходного скриншота и сопоставлены по никам.",
     }
 
 
@@ -831,8 +998,11 @@ async def recognize_match(
     images: list[bytes],
     message_text: str = "",
     score_only: bool = False,
+    visual_audit: bool = False,
 ) -> dict:
-    card_result = None if score_only else parse_complete_card(message_text)
+    if score_only and visual_audit:
+        raise ValueError("score_only и visual_audit нельзя включать одновременно")
+    card_result = None if (score_only or visual_audit) else parse_complete_card(message_text)
     if card_result is not None and card_result.get("ct_team") in ("A", "B"):
         log.info(
             "Матч #%s разобран напрямую без запроса к ИИ",
@@ -887,7 +1057,43 @@ async def recognize_match(
         "additionalProperties": False,
     }
 
-    if score_only:
+    if visual_audit:
+        visual_player_schema = {
+            "type": "object",
+            "properties": {
+                "nickname": {"type": "string"},
+                "kills": {"type": "integer", "minimum": 0, "maximum": 100},
+                "assists": {"type": "integer", "minimum": 0, "maximum": 100},
+                "deaths": {"type": "integer", "minimum": 0, "maximum": 100},
+            },
+            "required": ["nickname", "kills", "assists", "deaths"],
+            "additionalProperties": False,
+        }
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "is_scoreboard": {"type": "boolean"},
+                "score_left": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
+                "score_right": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
+                "side_left": {"type": ["string", "null"], "enum": ["CT", "T", None]},
+                "side_right": {"type": ["string", "null"], "enum": ["CT", "T", None]},
+                "left_players": {"type": "array", "items": visual_player_schema, "minItems": 5, "maxItems": 5},
+                "right_players": {"type": "array", "items": visual_player_schema, "minItems": 5, "maxItems": 5},
+                "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "notes": {"type": "string"},
+            },
+            "required": ["is_scoreboard", "score_left", "score_right", "side_left", "side_right", "left_players", "right_players", "overall_confidence", "notes"],
+            "additionalProperties": False,
+        }
+
+    if visual_audit:
+        prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
+Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
+Return side_left and side_right as CT or T. Transcribe exactly five players per side, top to bottom.
+Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
+Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
+Set confidence below 0.90 if any score or K/A/D digit is unclear. Return only valid JSON."""
+    elif score_only:
         prompt = """Read ONLY the final score of this FACEIT/CS2 match from the attached result screenshot.
 The Discord card text identifies Team A and Team B. Return score_a and score_b as rounds won by those exact teams, mapping the scoreboard sides to A/B by player nicknames when needed.
 Ignore any helper template containing `<счёт A> <счёт B>`: those are placeholders, not a score.
@@ -1039,7 +1245,7 @@ Build a registration result:
         output_text = output_text.split("\n", 1)[1]
         output_text = output_text.rsplit("```", 1)[0].strip()
     result = json.loads(output_text)
-    if score_only:
+    if score_only or visual_audit:
         return result
     explicit_ct_team = explicit_ct_team_from_card(message_text)
     if explicit_ct_team in ("A", "B"):
@@ -1194,64 +1400,21 @@ async def process_upload(message: discord.Message) -> None:
                         "Карточка на проверку пропущена: не удалось открыть/прочитать «Получить игроков»."
                     )
                     return
-                result = result_from_players_modal(context, modal_text)
-                if result is None and not re.search(
-                    r"(?<!\d)\d{1,2}\s*:\s*\d{1,2}(?!\d)", context
-                ):
-                    # `Получить игроков` deliberately returns
-                    # `=g <match> <счёт A> <счёт B>`. Read the real final
-                    # score from the attached result screenshot, then insert
-                    # it into our own registration command.
-                    score_image_urls = helper_image_urls or urls
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in score_image_urls[:4])
-                        )
-                    score_result = await recognize_match(
-                        raw_images,
-                        context,
-                        score_only=True,
+                # Проверяем только исходный игровой скриншот. Картинки из
+                # ответа кнопки могут быть устаревшими или от другого матча.
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    raw_images = await asyncio.gather(
+                        *(download_image(session, url) for url in urls[:4])
                     )
-                    expected_match = re.search(
-                        r"(?:матч|матча)\s*#\s*(\d+)", context, re.I
-                    )
-                    recognized_match = score_result.get("match_id")
-                    score_a = score_result.get("score_a")
-                    score_b = score_result.get("score_b")
-                    score_confidence = float(
-                        score_result.get("overall_confidence", 0) or 0
-                    )
-                    score_is_valid = (
-                        score_result.get("is_match_result")
-                        and isinstance(score_a, int)
-                        and isinstance(score_b, int)
-                        and 0 <= score_a <= 99
-                        and 0 <= score_b <= 99
-                        and score_confidence >= 0.70
-                        and (
-                            not expected_match
-                            or recognized_match is None
-                            or int(recognized_match) == int(expected_match.group(1))
-                        )
-                    )
-                    if score_is_valid:
-                        log.info(
-                            "Матч #%s: со скриншота прочитан счёт %s:%s (%.2f)",
-                            expected_match.group(1) if expected_match else "?",
-                            score_a,
-                            score_b,
-                            score_confidence,
-                        )
-                        result = result_from_players_modal(
-                            context,
-                            modal_text,
-                            score_override=(score_a, score_b),
-                            visual_verified=True,
-                        )
+                visual_result = await recognize_match(
+                    raw_images,
+                    visual_audit=True,
+                )
+                result = result_from_visual_audit(context, modal_text, visual_result)
                 if result is None:
                     log.error(
-                        "Карточка на проверку пропущена: не удалось надёжно собрать ID, стороны и реальный счёт."
+                        "Карточка на проверку пропущена: исходный скриншот не подтвердил счёт и игроков."
                     )
                     return
             else:
