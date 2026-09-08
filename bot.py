@@ -316,7 +316,7 @@ def extract_player_modal_text(root: object) -> Optional[str]:
         for attribute in (
             "value", "default", "text", "content", "data", "modal",
             "interaction", "message", "response", "response_message",
-            "messages", "components", "children", "items",
+            "successful", "result", "messages", "components", "children", "items",
         ):
             with contextlib.suppress(Exception):
                 child = getattr(value, attribute)
@@ -327,31 +327,61 @@ def extract_player_modal_text(root: object) -> Optional[str]:
 
 
 async def get_players_modal_text(message: discord.Message) -> Optional[str]:
-    """Click `Получить игроков` and read the modal without submitting it."""
+    """Click `Получить игроков` and read its finalized private response."""
     button = find_get_players_button(message)
     if button is None:
         return None
 
     async with player_modal_lock:
-        modal_waiter = asyncio.create_task(
-            client.wait_for("modal", timeout=PLAYER_MODAL_TIMEOUT)
-        )
+        custom_id = str(getattr(button, "custom_id", "") or "")
+
+        def interaction_check(interaction: object) -> bool:
+            interaction_custom_id = str(
+                getattr(interaction, "custom_id", "")
+                or (getattr(interaction, "data", {}) or {}).get("custom_id", "")
+            )
+            return not custom_id or not interaction_custom_id or interaction_custom_id == custom_id
+
+        # discord.py-self dispatches `interaction_finish` after the private
+        # component response has been finalized and Interaction.successful
+        # has been populated. `interaction` is retained as a compatibility
+        # fallback for builds that only expose the first event.
+        waiters = [
+            asyncio.create_task(client.wait_for("interaction_finish", check=interaction_check)),
+            asyncio.create_task(client.wait_for("interaction", check=interaction_check)),
+        ]
         try:
             click_result = await button.click()
             direct_text = extract_player_modal_text(click_result)
             if direct_text:
                 return direct_text
 
-            try:
-                modal_event = await modal_waiter
-            except asyncio.TimeoutError:
-                return None
-            return extract_player_modal_text(modal_event)
+            deadline = asyncio.get_running_loop().time() + PLAYER_MODAL_TIMEOUT
+            pending = set(waiters)
+            while pending:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return None
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    return None
+                for completed in done:
+                    with contextlib.suppress(Exception):
+                        response_text = extract_player_modal_text(completed.result())
+                        if response_text:
+                            return response_text
+            return None
         finally:
-            if not modal_waiter.done():
-                modal_waiter.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await modal_waiter
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            for waiter in waiters:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiter
 
 
 def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
@@ -710,8 +740,12 @@ def parse_complete_card(message_text: str) -> Optional[dict]:
     }
 
 
-async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
-    card_result = parse_complete_card(message_text)
+async def recognize_match(
+    images: list[bytes],
+    message_text: str = "",
+    score_only: bool = False,
+) -> dict:
+    card_result = None if score_only else parse_complete_card(message_text)
     if card_result is not None and card_result.get("ct_team") in ("A", "B"):
         log.info(
             "Матч #%s разобран напрямую без запроса к ИИ",
@@ -766,7 +800,15 @@ async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
         "additionalProperties": False,
     }
 
-    prompt = """You receive one or more screenshots of the SAME FACEIT/CS2 match result.
+    if score_only:
+        prompt = """Read ONLY the final score of this FACEIT/CS2 match from the attached result screenshot.
+The Discord card text identifies Team A and Team B. Return score_a and score_b as rounds won by those exact teams, mapping the scoreboard sides to A/B by player nicknames when needed.
+Ignore any helper template containing `<счёт A> <счёт B>`: those are placeholders, not a score.
+Read the large final scoreboard/result score from the image. Typical valid results are 13:0 through overtime scores.
+Set is_match_result=true when a final match scoreboard is visible. Return the visible match number when available, otherwise null.
+For this score-only request return team_a=[] and team_b=[], ct_team=null. overall_confidence describes confidence in the two score numbers. Explain briefly in notes."""
+    else:
+        prompt = """You receive one or more screenshots of the SAME FACEIT/CS2 match result.
 The Discord result card contains match number and two rosters: Team A and Team B, with numeric IDs like #37 and nicknames. The small CS2 scoreboard contains each nickname and columns K, A, D.
 Build a registration result:
 - match_id: number after 'Результ����т матча #'.
@@ -910,6 +952,8 @@ Build a registration result:
         output_text = output_text.split("\n", 1)[1]
         output_text = output_text.rsplit("```", 1)[0].strip()
     result = json.loads(output_text)
+    if score_only:
+        return result
     explicit_ct_team = explicit_ct_team_from_card(message_text)
     if explicit_ct_team in ("A", "B"):
         result["ct_team"] = explicit_ct_team
@@ -1060,19 +1104,27 @@ async def process_upload(message: discord.Message) -> None:
                         raw_images = await asyncio.gather(
                             *(download_image(session, url) for url in urls[:4])
                         )
-                    score_result = await recognize_match(raw_images, context)
+                    score_result = await recognize_match(
+                        raw_images,
+                        context,
+                        score_only=True,
+                    )
                     expected_match = re.search(
                         r"(?:матч|матча)\s*#\s*(\d+)", context, re.I
                     )
                     recognized_match = score_result.get("match_id")
                     score_a = score_result.get("score_a")
                     score_b = score_result.get("score_b")
+                    score_confidence = float(
+                        score_result.get("overall_confidence", 0) or 0
+                    )
                     score_is_valid = (
                         score_result.get("is_match_result")
                         and isinstance(score_a, int)
                         and isinstance(score_b, int)
                         and 0 <= score_a <= 99
                         and 0 <= score_b <= 99
+                        and score_confidence >= 0.70
                         and (
                             not expected_match
                             or recognized_match is None
@@ -1080,6 +1132,13 @@ async def process_upload(message: discord.Message) -> None:
                         )
                     )
                     if score_is_valid:
+                        log.info(
+                            "Матч #%s: со скриншота прочитан счёт %s:%s (%.2f)",
+                            expected_match.group(1) if expected_match else "?",
+                            score_a,
+                            score_b,
+                            score_confidence,
+                        )
                         result = result_from_players_modal(
                             context,
                             modal_text,
