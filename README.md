@@ -20,6 +20,7 @@ Set these in **Variables**:
 - `DELETE_SOURCE_AFTER_REGISTRATION` — delete the processed source card if it still exists after successful registration; default `true`.
 - `SOURCE_DELETE_DELAY` — delay before trying to delete the source card; default `1.0` second.
 - `REGISTRATION_CONFIRM_TIMEOUT` — seconds to wait for the game bot's `Готово` or `Не вышло` response; default `25.0`.
+- `PLAYER_MODAL_TIMEOUT` — seconds to wait for the `Получить игроков` modal; default `12.0`.
 - `STATS_FILE` — persistent registration history file; use `/data/registration_stats.json` with a Railway volume mounted at `/data`.
 - `STATS_TIMEZONE` — timezone used for today's count; default `Europe/Moscow`.
 - `GEMINI_MODEL` — legacy primary model setting.
@@ -35,7 +36,7 @@ Set these in **Variables**:
 3. Add the variables above.
 4. Railway uses the included `Procfile` to run `python bot.py` as a worker.
 5. Send `старт обычный`, `старт приоритет`, or `старт все` in Discord. The script scans the selected channels' history and then watches new messages there. Use `енд` to stop.
-6. Every complete result card (`внесён` or `на проверку`) is parsed deterministically: IDs, Team A/B membership, roster order, score and K/A/D are copied from the card and can no longer be rearranged by AI. AI is used only to identify which card team is CT/DEFENSE from the scoreboard; if that side cannot be identified reliably, the match is skipped rather than registered incorrectly. The source card is deleted and counted only after the game bot replies `Готово`. On `Не вышло` or timeout, the source card remains available for retry and the match is removed from the duplicate registry.
+6. For every `на проверку` card the bot first clicks `Получить игроков`, reads the authoritative short IDs and starting `# CT`/`# T` groups from the prefilled modal, then checks all ten K/A/D rows and the final score against the result card. It does not submit the modal. If anything is missing or inconsistent, the match is skipped instead of guessed. Complete `внесён` cards keep the deterministic/AI fallback flow. The source card is deleted and counted only after the registration bot replies `Готово`; on `Не вышло` or timeout it is preserved for retry.
 7. Games are distributed across the configured models and keys. Each game is handled by exactly one assigned model and key; different games can run simultaneously.
 8. For raw long numeric Discord mentions, the bot keeps the roster slot's K/A/D from the card and matches it only to an unused scoreboard player on the same team with exactly the same K/A/D. It then restores the short 2–5 digit registration ID and preserves roster order. Ambiguous matches are skipped instead of guessed. Duplicate matches and placeholder IDs are rejected. Send `стата`, `статистика`, or `stats` for totals.
 

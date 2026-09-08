@@ -1,10 +1,12 @@
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
 import os
 import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -83,6 +85,7 @@ SOURCE_DELETE_DELAY = float(os.getenv("SOURCE_DELETE_DELAY", "1.0"))
 REGISTRATION_CONFIRM_TIMEOUT = float(
     os.getenv("REGISTRATION_CONFIRM_TIMEOUT", "25.0")
 )
+PLAYER_MODAL_TIMEOUT = float(os.getenv("PLAYER_MODAL_TIMEOUT", "12.0"))
 STATS_FILE = os.getenv("STATS_FILE", "/data/registration_stats.json")
 STATS_TIMEZONE = ZoneInfo(os.getenv("STATS_TIMEZONE", "Europe/Moscow"))
 
@@ -99,6 +102,7 @@ processed_message_ids: set[int] = set()
 gemini_assignment_index = 0
 processing_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 stats_lock = asyncio.Lock()
+player_modal_lock = asyncio.Lock()
 
 
 def load_registration_records() -> list[dict]:
@@ -253,6 +257,192 @@ async def message_context(message: discord.Message) -> str:
             if embed.footer and embed.footer.text:
                 chunks.append(embed.footer.text)
     return await resolve_member_mentions("\n".join(chunks), message)
+
+
+def find_get_players_button(message: discord.Message):
+    """Find the existing `Получить игроков` component on a result card."""
+    stack: list[object] = []
+    for part in message_parts(message):
+        stack.extend(getattr(part, "components", None) or [])
+
+    visited: set[int] = set()
+    while stack:
+        component = stack.pop(0)
+        identity = id(component)
+        if identity in visited:
+            continue
+        visited.add(identity)
+
+        label = str(getattr(component, "label", "") or "").strip().lower()
+        if "получить игроков" in label and callable(getattr(component, "click", None)):
+            return component
+
+        stack.extend(getattr(component, "children", None) or [])
+        stack.extend(getattr(component, "components", None) or [])
+    return None
+
+
+def extract_player_modal_text(root: object) -> Optional[str]:
+    """Read the prefilled text area from a modal returned by discord.py-self."""
+    queue: list[tuple[object, int]] = [(root, 0)]
+    visited: set[int] = set()
+    candidates: list[str] = []
+
+    while queue:
+        value, depth = queue.pop(0)
+        if value is None or depth > 7:
+            continue
+        if isinstance(value, str):
+            if "# CT" in value.upper() and "# T" in value.upper():
+                candidates.append(value)
+            continue
+        if isinstance(value, (bytes, bytearray, int, float, bool)):
+            continue
+
+        identity = id(value)
+        if identity in visited:
+            continue
+        visited.add(identity)
+
+        if isinstance(value, dict):
+            queue.extend((item, depth + 1) for item in value.values())
+            continue
+        if isinstance(value, (list, tuple, set)):
+            queue.extend((item, depth + 1) for item in value)
+            continue
+
+        # discord.py-self versions expose modal fields through slightly
+        # different wrappers. Only inspect the known, bounded attributes.
+        for attribute in (
+            "value", "default", "text", "data", "modal", "interaction",
+            "components", "children", "items",
+        ):
+            with contextlib.suppress(Exception):
+                child = getattr(value, attribute)
+                if child is not value:
+                    queue.append((child, depth + 1))
+
+    return max(candidates, key=len) if candidates else None
+
+
+async def get_players_modal_text(message: discord.Message) -> Optional[str]:
+    """Click `Получить игроков` and read the modal without submitting it."""
+    button = find_get_players_button(message)
+    if button is None:
+        return None
+
+    async with player_modal_lock:
+        modal_waiter = asyncio.create_task(
+            client.wait_for("modal", timeout=PLAYER_MODAL_TIMEOUT)
+        )
+        try:
+            click_result = await button.click()
+            direct_text = extract_player_modal_text(click_result)
+            if direct_text:
+                return direct_text
+
+            try:
+                modal_event = await modal_waiter
+            except asyncio.TimeoutError:
+                return None
+            return extract_player_modal_text(modal_event)
+        finally:
+            if not modal_waiter.done():
+                modal_waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await modal_waiter
+
+
+def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
+    """Parse authoritative starting-side groups from the player modal."""
+    sides: dict[str, list[dict]] = {"CT": [], "T": []}
+    current_side: Optional[str] = None
+    line_pattern = re.compile(
+        r"^\s*(\d{1,5})\s+(.+?)\s*=\s*(\d+)\s+(\d+)\s+(\d+)\s*$"
+    )
+
+    for raw_line in modal_text.splitlines():
+        line = raw_line.strip()
+        header = re.fullmatch(r"#?\s*(CT|T)\s*", line, re.I)
+        if header:
+            current_side = header.group(1).upper()
+            continue
+        if current_side is None:
+            continue
+        found = line_pattern.fullmatch(line)
+        if not found:
+            continue
+        player_id = int(found.group(1))
+        kills, assists, deaths = map(int, found.group(3, 4, 5))
+        # Preserve the existing absent-player rule used by registration.
+        if kills == assists == deaths == 0:
+            deaths = 13
+        sides[current_side].append({
+            "id": player_id,
+            "nickname": found.group(2).strip(),
+            "kills": kills,
+            "assists": assists,
+            "deaths": deaths,
+        })
+
+    players = [*sides["CT"], *sides["T"]]
+    player_ids = [player["id"] for player in players]
+    if (
+        len(sides["CT"]) != 5
+        or len(sides["T"]) != 5
+        or any(player_id <= 0 for player_id in player_ids)
+        or len(set(player_ids)) != 10
+    ):
+        return None
+    return sides
+
+
+def result_from_players_modal(message_text: str, modal_text: str) -> Optional[dict]:
+    """Build a registration only after checking the modal against the card."""
+    parsed = parse_players_modal(modal_text)
+    if parsed is None:
+        return None
+
+    match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
+    score = re.search(r"(?<!\d)(\d{1,2})\s*:\s*(\d{1,2})(?!\d)", message_text)
+    if not match or not score:
+        return None
+
+    # The visible result card must contain the same ten K/A/D rows. We compare
+    # a multiset because the modal uses starting CT/T while the card may show
+    # the teams after a side swap.
+    card_slots = parse_card_roster_slots(message_text)
+    if card_slots is None:
+        return None
+    card_kad = Counter(
+        (player["kills"], player["assists"], player["deaths"])
+        for team in card_slots.values() for player in team
+    )
+    modal_kad = Counter(
+        (player["kills"], player["assists"], player["deaths"])
+        for player in [*parsed["CT"], *parsed["T"]]
+    )
+    # A missing player is displayed as 0/0/0 in the modal but registered as
+    # 0/0/13. Normalize the card the same way for comparison.
+    normalized_card_kad = Counter()
+    for kad, count in card_kad.items():
+        normalized_card_kad[(0, 0, 13) if kad == (0, 0, 0) else kad] += count
+    if normalized_card_kad != modal_kad:
+        return None
+
+    return {
+        "is_match_result": True,
+        "match_id": int(match.group(1)),
+        "score_a": int(score.group(1)),
+        "score_b": int(score.group(2)),
+        # Modal groups are authoritative starting sides. Store them directly
+        # as A=CT and B=T so format_registration cannot invert them.
+        "ct_team": "A",
+        "team_a": parsed["CT"],
+        "team_b": parsed["T"],
+        "overall_confidence": 1.0,
+        "notes": "ID и стартовые стороны взяты из окна «Получить игроков»; результат сверен с карточкой.",
+    }
 
 
 def image_urls(message: discord.Message) -> list[str]:
@@ -835,13 +1025,28 @@ async def process_upload(message: discord.Message) -> None:
     context = await message_context(message)
     async with message.channel.typing():
         try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                raw_images = await asyncio.gather(
-                    *(download_image(session, url) for url in urls[:4])
-                )
+            review_card = "на проверку" in context.lower()
+            if review_card:
+                modal_text = await get_players_modal_text(message)
+                if not modal_text:
+                    log.error(
+                        "Карточка на проверку пропущена: не удалось открыть/прочитать «Получить игроков»."
+                    )
+                    return
+                result = result_from_players_modal(context, modal_text)
+                if result is None:
+                    log.error(
+                        "Карточка на проверку пропущена: ID/стороны из окна не совпали с результатом игры."
+                    )
+                    return
+            else:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    raw_images = await asyncio.gather(
+                        *(download_image(session, url) for url in urls[:4])
+                    )
 
-            result = await recognize_match(raw_images, context)
+                result = await recognize_match(raw_images, context)
 
             expected_ids = extract_short_player_ids(context, result.get("match_id"))
             returned_players = [
