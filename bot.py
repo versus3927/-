@@ -103,6 +103,8 @@ gemini_assignment_index = 0
 processing_semaphore = asyncio.Semaphore(PROCESS_CONCURRENCY)
 stats_lock = asyncio.Lock()
 player_modal_lock = asyncio.Lock()
+processing_match_lock = asyncio.Lock()
+processing_match_ids: set[int] = set()
 
 
 def load_registration_records() -> list[dict]:
@@ -326,14 +328,54 @@ def extract_player_modal_text(root: object) -> Optional[str]:
     return max(candidates, key=len) if candidates else None
 
 
-async def get_players_modal_text(message: discord.Message) -> Optional[str]:
-    """Click `Получить игроков` and read its finalized private response."""
+def extract_interaction_image_urls(root: object) -> list[str]:
+    """Collect image attachments from a private interaction response."""
+    queue: list[tuple[object, int]] = [(root, 0)]
+    visited: set[int] = set()
+    found: list[str] = []
+    while queue:
+        value, depth = queue.pop(0)
+        if value is None or depth > 7:
+            continue
+        if isinstance(value, str):
+            lowered = value.lower().split("?", 1)[0]
+            if value.startswith("http") and lowered.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                found.append(value)
+            continue
+        if isinstance(value, (bytes, bytearray, int, float, bool)):
+            continue
+        identity = id(value)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(value, dict):
+            queue.extend((item, depth + 1) for item in value.values())
+            continue
+        if isinstance(value, (list, tuple, set)):
+            queue.extend((item, depth + 1) for item in value)
+            continue
+        for attribute in (
+            "url", "proxy_url", "attachments", "embeds", "image", "thumbnail",
+            "data", "message", "response", "response_message", "successful",
+            "result", "messages", "components", "children", "items",
+        ):
+            with contextlib.suppress(Exception):
+                child = getattr(value, attribute)
+                if child is not value:
+                    queue.append((child, depth + 1))
+    return list(dict.fromkeys(found))
+
+
+async def get_players_response(message: discord.Message) -> tuple[Optional[str], list[str]]:
+    """Click `Получить игроков` and capture its private helper message."""
     button = find_get_players_button(message)
     if button is None:
-        return None
+        return None, []
 
     async with player_modal_lock:
         custom_id = str(getattr(button, "custom_id", "") or "")
+        source_match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", await message_context(message), re.I)
+        expected_match_id = int(source_match.group(1)) if source_match else None
 
         def interaction_check(interaction: object) -> bool:
             interaction_custom_id = str(
@@ -346,7 +388,18 @@ async def get_players_modal_text(message: discord.Message) -> Optional[str]:
         # component response has been finalized and Interaction.successful
         # has been populated. `interaction` is retained as a compatibility
         # fallback for builds that only expose the first event.
+        def helper_message_check(candidate: object) -> bool:
+            if getattr(getattr(candidate, "channel", None), "id", None) != message.channel.id:
+                return False
+            text = extract_player_modal_text(candidate)
+            if not text:
+                return False
+            if expected_match_id is None:
+                return True
+            return bool(re.search(rf"=g\s+{expected_match_id}\b", text, re.I))
+
         waiters = [
+            asyncio.create_task(client.wait_for("message", check=helper_message_check)),
             asyncio.create_task(client.wait_for("interaction_finish", check=interaction_check)),
             asyncio.create_task(client.wait_for("interaction", check=interaction_check)),
         ]
@@ -354,7 +407,7 @@ async def get_players_modal_text(message: discord.Message) -> Optional[str]:
             click_result = await button.click()
             direct_text = extract_player_modal_text(click_result)
             if direct_text:
-                return direct_text
+                return direct_text, extract_interaction_image_urls(click_result)
 
             deadline = asyncio.get_running_loop().time() + PLAYER_MODAL_TIMEOUT
             pending = set(waiters)
@@ -373,8 +426,11 @@ async def get_players_modal_text(message: discord.Message) -> Optional[str]:
                     with contextlib.suppress(Exception):
                         response_text = extract_player_modal_text(completed.result())
                         if response_text:
-                            return response_text
-            return None
+                            return (
+                                response_text,
+                                extract_interaction_image_urls(completed.result()),
+                            )
+            return None, []
         finally:
             for waiter in waiters:
                 if not waiter.done():
@@ -382,6 +438,12 @@ async def get_players_modal_text(message: discord.Message) -> Optional[str]:
             for waiter in waiters:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await waiter
+
+
+async def get_players_modal_text(message: discord.Message) -> Optional[str]:
+    """Backward-compatible wrapper used by older tests/integrations."""
+    text, _ = await get_players_response(message)
+    return text
 
 
 def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
@@ -1081,11 +1143,23 @@ async def process_upload(message: discord.Message) -> None:
         return
 
     context = await message_context(message)
+    context_match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", context, re.I)
+    reserved_match_id = int(context_match.group(1)) if context_match else None
+    if reserved_match_id is not None:
+        async with processing_match_lock:
+            if reserved_match_id in processing_match_ids:
+                log.info(
+                    "Матч #%s уже обрабатывается — повторная карточка пропущена",
+                    reserved_match_id,
+                )
+                return
+            processing_match_ids.add(reserved_match_id)
+
     async with message.channel.typing():
         try:
             review_card = "на проверку" in context.lower()
             if review_card:
-                modal_text = await get_players_modal_text(message)
+                modal_text, helper_image_urls = await get_players_response(message)
                 if not modal_text:
                     log.error(
                         "Карточка на проверку пропущена: не удалось открыть/прочитать «Получить игроков»."
@@ -1099,10 +1173,11 @@ async def process_upload(message: discord.Message) -> None:
                     # `=g <match> <счёт A> <счёт B>`. Read the real final
                     # score from the attached result screenshot, then insert
                     # it into our own registration command.
+                    score_image_urls = helper_image_urls or urls
                     timeout = aiohttp.ClientTimeout(total=30)
                     async with aiohttp.ClientSession(timeout=timeout) as session:
                         raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in urls[:4])
+                            *(download_image(session, url) for url in score_image_urls[:4])
                         )
                     score_result = await recognize_match(
                         raw_images,
@@ -1294,6 +1369,10 @@ async def process_upload(message: discord.Message) -> None:
             )
         except Exception:
             log.exception("Ошибка обработки файла в process_upload")
+        finally:
+            if reserved_match_id is not None:
+                async with processing_match_lock:
+                    processing_match_ids.discard(reserved_match_id)
 
 
 async def process_message_once(message: discord.Message) -> bool:
