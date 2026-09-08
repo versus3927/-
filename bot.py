@@ -80,6 +80,9 @@ DELETE_SOURCE_AFTER_REGISTRATION = os.getenv(
     "DELETE_SOURCE_AFTER_REGISTRATION", "true"
 ).lower() in {"1", "true", "yes", "on"}
 SOURCE_DELETE_DELAY = float(os.getenv("SOURCE_DELETE_DELAY", "1.0"))
+REGISTRATION_CONFIRM_TIMEOUT = float(
+    os.getenv("REGISTRATION_CONFIRM_TIMEOUT", "25.0")
+)
 STATS_FILE = os.getenv("STATS_FILE", "/data/registration_stats.json")
 STATS_TIMEZONE = ZoneInfo(os.getenv("STATS_TIMEZONE", "Europe/Moscow"))
 
@@ -134,6 +137,25 @@ async def record_registration(match_id: int) -> bool:
         except Exception:
             log.exception("Не удалось сохранить статистику в %s", STATS_FILE)
         return True
+
+
+async def forget_registration(match_id: int) -> None:
+    """Remove a failed reservation so the source match can be retried."""
+    async with stats_lock:
+        records = load_registration_records()
+        remaining = [
+            item for item in records
+            if str(item.get("match_id")) != str(match_id)
+        ]
+        if len(remaining) == len(records):
+            return
+        directory = os.path.dirname(STATS_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary_file = f"{STATS_FILE}.tmp"
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            json.dump(remaining, file, ensure_ascii=False, indent=2)
+        os.replace(temporary_file, STATS_FILE)
 
 
 def registration_stats_text() -> str:
@@ -311,6 +333,103 @@ def explicit_ct_team_from_card(message_text: str) -> Optional[str]:
     if side_b and side_b.group(1).upper() == "CT":
         return "B"
     return None
+
+
+def parse_card_roster_slots(message_text: str) -> Optional[dict[str, list[dict]]]:
+    """Read ten roster slots and K/A/D even when a slot is a long mention."""
+    header_a = re.search(r"Команда\s*A[^\n]*", message_text, re.I)
+    header_b = re.search(r"Команда\s*B[^\n]*", message_text, re.I)
+    if not header_a or not header_b or header_b.start() <= header_a.start():
+        return None
+
+    line_pattern = re.compile(
+        r"^\s*[•·-]?\s*(.*?)\s*[—–]\s*(\d+)\s*/\s*(\d+)\s*/\s*(\d+)",
+        re.M,
+    )
+
+    def parse_section(section: str) -> list[dict]:
+        slots: list[dict] = []
+        for found in line_pattern.finditer(section):
+            label = found.group(1).strip()
+            short_id_match = re.search(r"(?<!\d)#\s*(\d{1,5})(?!\d)", label)
+            short_id = int(short_id_match.group(1)) if short_id_match else None
+            nickname = re.sub(r"<@!?\d{15,22}>", "", label)
+            nickname = re.sub(r"(?<!\d)#\s*\d{1,5}(?!\d)", "", nickname)
+            nickname = nickname.strip(" @|`*_.,")
+            slots.append({
+                "id": short_id,
+                "nickname": nickname,
+                "kills": int(found.group(2)),
+                "assists": int(found.group(3)),
+                "deaths": int(found.group(4)),
+            })
+            if len(slots) == 5:
+                break
+        return slots
+
+    team_a = parse_section(message_text[header_a.end():header_b.start()])
+    team_b = parse_section(message_text[header_b.end():])
+    if len(team_a) != 5 or len(team_b) != 5:
+        return None
+    return {"team_a": team_a, "team_b": team_b}
+
+
+def reconcile_numeric_mentions(result: dict, message_text: str) -> bool:
+    """Match long numeric mentions to scoreboard players by exact K/A/D."""
+    slots_by_team = parse_card_roster_slots(message_text)
+    if slots_by_team is None:
+        return True
+
+    for team_key in ("team_a", "team_b"):
+        slots = slots_by_team[team_key]
+        candidates = result.get(team_key, [])
+        if len(candidates) != 5:
+            return False
+        unused = set(range(5))
+        reconciled: list[dict] = []
+
+        for slot in slots:
+            exact = [
+                index for index in unused
+                if candidates[index].get("kills") == slot["kills"]
+                and candidates[index].get("assists") == slot["assists"]
+                and candidates[index].get("deaths") == slot["deaths"]
+            ]
+            chosen: Optional[int] = None
+            recovered_id = slot["id"]
+
+            if recovered_id is not None:
+                same_id = [
+                    index for index in unused
+                    if candidates[index].get("id") == recovered_id
+                ]
+                chosen = same_id[0] if same_id else (exact[0] if len(exact) == 1 else None)
+            elif len(exact) == 1:
+                chosen = exact[0]
+                candidate = candidates[chosen]
+                nickname_id = re.search(
+                    r"(?:^|\[|#)(\d{2,5})(?:\]|\s|\|)",
+                    str(candidate.get("nickname", "")),
+                )
+                recovered_id = int(nickname_id.group(1)) if nickname_id else candidate.get("id")
+
+            if chosen is None or not isinstance(recovered_id, int) or recovered_id <= 0:
+                return False
+
+            unused.remove(chosen)
+            player = dict(candidates[chosen])
+            player.update({
+                "id": recovered_id,
+                "kills": slot["kills"],
+                "assists": slot["assists"],
+                "deaths": slot["deaths"],
+            })
+            if slot["nickname"] and not player.get("nickname"):
+                player["nickname"] = slot["nickname"]
+            reconciled.append(player)
+
+        result[team_key] = reconciled
+    return True
 
 
 def parse_complete_card(message_text: str) -> Optional[dict]:
@@ -590,6 +709,12 @@ Build a registration result:
     explicit_ct_team = explicit_ct_team_from_card(message_text)
     if explicit_ct_team in ("A", "B"):
         result["ct_team"] = explicit_ct_team
+    if not reconcile_numeric_mentions(result, message_text):
+        result["overall_confidence"] = 0.0
+        result["notes"] = (
+            "Не удалось однозначно сопоставить цифровые упоминания "
+            "со строками таблицы по K/A/D; команда не будет отправлена."
+        )
     if card_result is not None:
         ct_team = explicit_ct_team or result.get("ct_team")
         if ct_team not in ("A", "B"):
@@ -651,6 +776,55 @@ async def send_registration_log(
             result.get("match_id"),
             LOG_CHANNEL_ID,
         )
+
+
+def plain_message_text(message: discord.Message) -> str:
+    chunks: list[str] = []
+    for part in message_parts(message):
+        content = getattr(part, "content", "")
+        if content:
+            chunks.append(str(content))
+        for embed in getattr(part, "embeds", None) or []:
+            if embed.title:
+                chunks.append(str(embed.title))
+            if embed.description:
+                chunks.append(str(embed.description))
+            for field in embed.fields:
+                chunks.append(f"{field.name}\n{field.value}")
+    return "\n".join(chunks)
+
+
+async def wait_for_registration_confirmation(
+    sent_registration: discord.Message,
+    match_id: int,
+) -> tuple[bool, str]:
+    """Wait for the game bot's reply before deleting/counting the source card."""
+    def check(candidate: discord.Message) -> bool:
+        if candidate.channel.id != sent_registration.channel.id:
+            return False
+        if client.user and candidate.author.id == client.user.id:
+            return False
+        text = plain_message_text(candidate).lower()
+        if "готово" not in text and "не вышло" not in text:
+            return False
+        reference = getattr(candidate, "reference", None)
+        references_command = bool(
+            reference and reference.message_id == sent_registration.id
+        )
+        names_match = f"#{match_id}" in text
+        return references_command or names_match
+
+    try:
+        response = await client.wait_for(
+            "message",
+            check=check,
+            timeout=REGISTRATION_CONFIRM_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return False, "тайм-аут ожидания ответа регистрационного бота"
+
+    response_text = plain_message_text(response)
+    return "готово" in response_text.lower(), response_text[:500]
 
 
 async def process_upload(message: discord.Message) -> None:
@@ -721,6 +895,20 @@ async def process_upload(message: discord.Message) -> None:
                 )
                 return
 
+            all_players = [*result["team_a"], *result["team_b"]]
+            player_ids = [player.get("id") for player in all_players]
+            if (
+                len(player_ids) != 10
+                or any(not isinstance(value, int) or value <= 0 for value in player_ids)
+                or len(set(player_ids)) != 10
+            ):
+                log.error(
+                    "Матч #%s не отправлен: недопустимые или повторяющиеся ID %s",
+                    result.get("match_id"),
+                    player_ids,
+                )
+                return
+
             command_text = format_registration(result)
             match_id = int(result["match_id"])
             if not await record_registration(match_id):
@@ -729,6 +917,28 @@ async def process_upload(message: discord.Message) -> None:
 
             await asyncio.sleep(SEND_DELAY)
             sent_registration = await message.channel.send(command_text)
+            confirmed, confirmation_text = await wait_for_registration_confirmation(
+                sent_registration,
+                match_id,
+            )
+            if not confirmed:
+                await forget_registration(match_id)
+                log.warning(
+                    "Матч #%s не подтверждён; исходная карточка сохранена. Ответ: %s",
+                    match_id,
+                    confirmation_text,
+                )
+                try:
+                    await sent_registration.delete()
+                except discord.NotFound:
+                    pass
+                except Exception:
+                    log.exception(
+                        "Не удалось удалить отклонённую команду матча #%s",
+                        match_id,
+                    )
+                return
+
             await send_registration_log(result, message, command_text)
             if DELETE_AFTER_REGISTRATION:
                 await asyncio.sleep(DELETE_DELAY)
