@@ -196,40 +196,22 @@ def message_parts(message: discord.Message) -> list[object]:
 
 
 async def resolve_member_mentions(text: str, message: discord.Message) -> str:
-    """Replace raw Discord mention IDs with visible server display names."""
-    mention_ids = list(
-        dict.fromkeys(
-            int(value)
-            for value in re.findall(r"<@!?(\d{15,22})>", text)
-        )
-    )
-    if not mention_ids:
-        return text
-
-    known_members = {
-        int(member.id): member
-        for member in (getattr(message, "mentions", None) or [])
-    }
+    """Replace long raw mentions with visible server display names."""
+    mention_ids = list(dict.fromkeys(
+        int(value) for value in re.findall(r"<@!?(\d{15,22})>", text)
+    ))
     guild = getattr(message, "guild", None)
+    known = {int(member.id): member for member in (message.mentions or [])}
     for member_id in mention_ids:
-        member = known_members.get(member_id)
-        if member is None and guild is not None:
-            member = guild.get_member(member_id)
+        member = known.get(member_id) or (guild.get_member(member_id) if guild else None)
         if member is None and guild is not None:
             try:
                 member = await guild.fetch_member(member_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 member = None
-        if member is None:
-            continue
-
         display_name = str(getattr(member, "display_name", "") or "").strip()
         if display_name:
-            text = re.sub(
-                rf"<@!?{member_id}>",
-                f"@{display_name}",
-                text,
-            )
+            text = re.sub(rf"<@!?{member_id}>", f"@{display_name}", text)
     return text
 
 
@@ -304,11 +286,7 @@ def extract_short_player_ids(message_text: str, match_id: Optional[int]) -> list
         ids: list[int] = []
         values = re.findall(r"(?<!\d)#\s*(\d{1,5})(?!\d)", area)
         if not values:
-            values = re.findall(
-                r"(?:^|\n|[@•]\s*)(\d{2,5})\s*\|",
-                area,
-                re.M,
-            )
+            values = re.findall(r"(?:^|\n|[@•]\s*)(\d{2,5})\s*\|", area, re.M)
         for value in values:
             player_id = int(value)
             if match_id is not None and player_id == int(match_id):
@@ -320,91 +298,94 @@ def extract_short_player_ids(message_text: str, match_id: Optional[int]) -> list
     return []
 
 
-def parse_review_card(message_text: str) -> Optional[dict]:
-    """Parse complete Discord 'на проверку' cards without an AI request."""
-    if "на проверку" not in message_text.lower():
-        return None
-
+def parse_complete_card(message_text: str) -> Optional[dict]:
+    """Read exact IDs/KAD from any complete result card; AI only selects CT/T."""
     match = re.search(r"Результат\s+матча\s*#\s*(\d+)", message_text, re.I)
-    if not match:
+    header_a = re.search(r"Команда\s*A[^\n]*", message_text, re.I)
+    header_b = re.search(r"Команда\s*B[^\n]*", message_text, re.I)
+    if not match or not header_a or not header_b or header_b.start() <= header_a.start():
         return None
 
-    score_a_match = re.search(
-        r"Команда\s*A[^\n]*?\b(?:CT|T)\b\s*[-–—:]\s*(\d+)",
-        message_text,
-        re.I,
-    )
-    score_b_match = re.search(
-        r"Команда\s*B[^\n]*?\b(?:CT|T)\b\s*[-–—:]\s*(\d+)",
-        message_text,
-        re.I,
-    )
-    if not score_a_match or not score_b_match:
-        recognized_score = re.search(
+    def header_score(header: str) -> Optional[int]:
+        found = re.search(
+            r"(?:CT|T)?\s*[·•:|\-–—]\s*(\d+)\s*[·•:|\-–—]\s*K[/\\]A[/\\][CD]",
+            header,
+            re.I,
+        )
+        return int(found.group(1)) if found else None
+
+    score_a = header_score(header_a.group(0))
+    score_b = header_score(header_b.group(0))
+    if score_a is None or score_b is None:
+        recognized = re.search(
             r"Распознано\s+со\s+скриншота\s*:\s*(\d+)\s*[-:]\s*(\d+)",
             message_text,
             re.I,
         )
-        if not recognized_score:
+        if not recognized:
             return None
-        score_a = int(recognized_score.group(1))
-        score_b = int(recognized_score.group(2))
-    else:
-        score_a = int(score_a_match.group(1))
-        score_b = int(score_b_match.group(1))
+        score_a, score_b = int(recognized.group(1)), int(recognized.group(2))
 
     player_pattern = re.compile(
-        r"#\s*(\d{1,5})\s*\|\s*([^\n—–]+?)\s*[—–-]\s*"
+        r"#\s*(\d{1,5})\s*(?:\|\s*)?([^\n—–]+?)\s*[—–-]\s*"
         r"(\d+)\s*/\s*(\d+)\s*/\s*(\d+)",
         re.I,
     )
-    players: list[dict] = []
-    seen_ids: set[int] = set()
-    for player_match in player_pattern.finditer(message_text):
-        player_id = int(player_match.group(1))
-        if player_id in seen_ids:
-            continue
-        seen_ids.add(player_id)
-        nickname = player_match.group(2).strip(" `*_.,")
-        kills = int(player_match.group(3))
-        assists = int(player_match.group(4))
-        deaths = int(player_match.group(5))
-        if kills == 0 and assists == 0 and deaths == 0:
-            deaths = 13
-        players.append(
-            {
-                "id": player_id,
-                "nickname": nickname,
-                "kills": kills,
-                "assists": assists,
-                "deaths": deaths,
-                "confidence": 0.99,
-            }
-        )
 
-    if len(players) != 10:
+    def parse_team(section: str) -> list[dict]:
+        team: list[dict] = []
+        for found in player_pattern.finditer(section):
+            kills, assists, deaths = map(int, found.group(3, 4, 5))
+            if kills == 0 and assists == 0 and deaths == 0:
+                deaths = 13
+            team.append(
+                {
+                    "id": int(found.group(1)),
+                    "nickname": found.group(2).strip(" `*_.,"),
+                    "kills": kills,
+                    "assists": assists,
+                    "deaths": deaths,
+                    "confidence": 0.99,
+                }
+            )
+            if len(team) == 5:
+                break
+        return team
+
+    team_a = parse_team(message_text[header_a.end():header_b.start()])
+    team_b = parse_team(message_text[header_b.end():])
+    if len(team_a) != 5 or len(team_b) != 5:
         return None
+
+    a_side = re.search(r"\b(CT|T)\b", header_a.group(0), re.I)
+    b_side = re.search(r"\b(CT|T)\b", header_b.group(0), re.I)
+    ct_team: Optional[str] = None
+    if a_side and a_side.group(1).upper() == "CT":
+        ct_team = "A"
+    elif b_side and b_side.group(1).upper() == "CT":
+        ct_team = "B"
 
     return {
         "is_match_result": True,
         "match_id": int(match.group(1)),
         "score_a": score_a,
         "score_b": score_b,
-        "team_a": players[:5],
-        "team_b": players[5:10],
+        "ct_team": ct_team,
+        "team_a": team_a,
+        "team_b": team_b,
         "overall_confidence": 0.99,
-        "notes": "Карточка «на проверку» разобрана напрямую по ID и K/A/D.",
+        "notes": "ID, команды и K/A/D взяты напрямую из карточки.",
     }
 
 
 async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
-    direct_result = parse_review_card(message_text)
-    if direct_result is not None:
+    card_result = parse_complete_card(message_text)
+    if card_result is not None and card_result.get("ct_team") in ("A", "B"):
         log.info(
             "Матч #%s разобран напрямую без запроса к ИИ",
-            direct_result["match_id"],
+            card_result["match_id"],
         )
-        return direct_result
+        return card_result
 
     player_schema = {
         "type": "object",
@@ -433,6 +414,7 @@ async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
             "match_id": {"type": ["integer", "null"]},
             "score_a": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
             "score_b": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
+            "ct_team": {"type": ["string", "null"], "enum": ["A", "B", None]},
             "team_a": {"type": "array", "items": player_schema, "maxItems": 5},
             "team_b": {"type": "array", "items": player_schema, "maxItems": 5},
             "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -443,6 +425,7 @@ async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
             "match_id",
             "score_a",
             "score_b",
+            "ct_team",
             "team_a",
             "team_b",
             "overall_confidence",
@@ -454,9 +437,10 @@ async def recognize_match(images: list[bytes], message_text: str = "") -> dict:
     prompt = """You receive one or more screenshots of the SAME FACEIT/CS2 match result.
 The Discord result card contains match number and two rosters: Team A and Team B, with numeric IDs like #37 and nicknames. The small CS2 scoreboard contains each nickname and columns K, A, D.
 Build a registration result:
-- match_id: number after 'Результат матча #'.
+- match_id: number after 'Результ����т матча #'.
 - Team A must always be returned in team_a; Team B in team_b.
 - score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
+- ct_team MUST be `A` when Team A is on the CT/DEFENSE side of the screenshot, or `B` when Team B is on CT/DEFENSE. Never assume Team A is CT. Determine it by matching roster nicknames and scores to the CT/DEFENSE half of the scoreboard.
 - Cards titled 'на проверку' are valid match results and MUST be registered when match number, score and rosters can be recovered. These cards often already contain short # IDs and K/A/D next to every player; use those values directly even when the attached scoreboard is small or blurry.
 - In review cards, strings like `@#64 | kanei — 8/2/12` mean registration id=64, nickname=kanei, kills=8, assists=2, deaths=12. The @ formatting does not turn the short # number into a Discord user ID.
 - If a review card says a player was not found and shows 0/0/0, apply the required absent-row default 0/0/13 and still keep that player.
@@ -589,21 +573,36 @@ Build a registration result:
     if output_text.startswith("```"):
         output_text = output_text.split("\n", 1)[1]
         output_text = output_text.rsplit("```", 1)[0].strip()
-    return json.loads(output_text)
+    result = json.loads(output_text)
+    if card_result is not None:
+        ct_team = result.get("ct_team")
+        if ct_team not in ("A", "B"):
+            card_result["overall_confidence"] = 0.0
+            card_result["notes"] = "Не удалось надёжно определить сторону CT."
+        else:
+            card_result["ct_team"] = ct_team
+            card_result["notes"] += f" CT определена как команда {ct_team}."
+        return card_result
+    return result
 
 
 def format_registration(result: dict) -> str:
+    ct_team = result.get("ct_team")
+    if ct_team not in ("A", "B"):
+        raise ValueError("Не определена команда, игравшая за CT")
+    ct_players = result["team_a"] if ct_team == "A" else result["team_b"]
+    t_players = result["team_b"] if ct_team == "A" else result["team_a"]
     lines = [
         f"=g {result['match_id']} {result['score_a']} {result['score_b']}",
         "",
         "CT",
     ]
-    for player in result["team_a"]:
+    for player in ct_players:
         lines.append(
             f"{player['id']} {player['kills']} {player['assists']} {player['deaths']}"
         )
     lines.extend(["", "T"])
-    for player in result["team_b"]:
+    for player in t_players:
         lines.append(
             f"{player['id']} {player['kills']} {player['assists']} {player['deaths']}"
         )
@@ -659,33 +658,34 @@ async def process_upload(message: discord.Message) -> None:
                 *result.get("team_a", []),
                 *result.get("team_b", []),
             ]
-            if len(expected_ids) == 10 and len(returned_players) == 10:
-                for player, correct_id in zip(returned_players, expected_ids):
-                    player["id"] = correct_id
-                log.info(
-                    "ID матча #%s принудительно сверены с карточкой: %s",
-                    result.get("match_id"),
-                    expected_ids,
-                )
-            else:
-                returned_ids = [player.get("id") for player in returned_players]
-                positional_ids = [1, 2, 3, 4, 5, 5, 4, 3, 2, 1]
-                if returned_ids == positional_ids or (
-                    len(returned_ids) == 10
-                    and all(isinstance(value, int) and 1 <= value <= 5 for value in returned_ids)
-                ):
+            returned_ids = [player.get("id") for player in returned_players]
+            if len(expected_ids) == 10 and len(returned_ids) == 10:
+                if set(returned_ids) != set(expected_ids):
                     log.error(
-                        "Матч #%s пропущен: модель выдумала позиционные ID %s",
+                        "Матч #%s пропущен: ID модели %s не совпали с карточкой %s",
                         result.get("match_id"),
                         returned_ids,
+                        expected_ids,
                     )
                     return
+            positional_ids = [1, 2, 3, 4, 5, 5, 4, 3, 2, 1]
+            if returned_ids == positional_ids or (
+                len(returned_ids) == 10
+                and all(isinstance(value, int) and 1 <= value <= 5 for value in returned_ids)
+            ):
+                log.error(
+                    "Матч #%s пропущен: модель выдумала позиционные ID %s",
+                    result.get("match_id"),
+                    returned_ids,
+                )
+                return
 
             fatal = (
                 not result.get("is_match_result")
                 or result.get("match_id") is None
                 or result.get("score_a") is None
                 or result.get("score_b") is None
+                or result.get("ct_team") not in ("A", "B")
                 or len(result.get("team_a", [])) != 5
                 or len(result.get("team_b", [])) != 5
             )
@@ -705,12 +705,12 @@ async def process_upload(message: discord.Message) -> None:
                 )
                 return
 
+            command_text = format_registration(result)
             match_id = int(result["match_id"])
             if not await record_registration(match_id):
                 log.info("Матч #%s уже зарегистрирован — повтор пропущен", match_id)
                 return
 
-            command_text = format_registration(result)
             await asyncio.sleep(SEND_DELAY)
             sent_registration = await message.channel.send(command_text)
             await send_registration_log(result, message, command_text)
@@ -806,7 +806,7 @@ async def backfill_one_channel(channel_id: int, before_time) -> int:
             )
             found += sum(bool(result) for result in results)
     except Exception:
-        log.exception("Не удалось прочитать историю ��анала %s", channel_id)
+        log.exception("Не удалось прочитать историю канала %s", channel_id)
     return found
 
 
