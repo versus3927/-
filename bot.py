@@ -802,6 +802,31 @@ def parse_complete_card(message_text: str) -> Optional[dict]:
     }
 
 
+def is_review_result_card(message_text: str) -> bool:
+    """Detect only an explicit review status on the current result card.
+
+    Do not trigger on an incidental phrase like `на проверку` in instructions,
+    history, replies, or other embedded text.
+    """
+    explicit_title = re.search(
+        r"^\s*Результат\s+матча\s*#\s*\d+[^\n]*\bна\s+проверку\b",
+        message_text,
+        re.I | re.M,
+    )
+    if explicit_title:
+        return True
+
+    lines = [line.strip() for line in message_text.splitlines() if line.strip()]
+    for line in lines[:12]:
+        if re.fullmatch(
+            r"(?:⚠️\s*)?(?:статус\s*[:—–-]\s*)?на\s+проверку[.!]?",
+            line,
+            re.I,
+        ):
+            return True
+    return False
+
+
 async def recognize_match(
     images: list[bytes],
     message_text: str = "",
@@ -1157,7 +1182,11 @@ async def process_upload(message: discord.Message) -> None:
 
     async with message.channel.typing():
         try:
-            review_card = "на проверку" in context.lower()
+            # The button workflow is reserved strictly for cards whose own
+            # title/status says `на проверку`. Ordinary matches must go
+            # directly through the normal registration path even if the
+            # phrase appears elsewhere in the message context.
+            review_card = is_review_result_card(context)
             if review_card:
                 modal_text, helper_image_urls = await get_players_response(message)
                 if not modal_text:
