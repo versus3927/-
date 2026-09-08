@@ -314,8 +314,9 @@ def extract_player_modal_text(root: object) -> Optional[str]:
         # discord.py-self versions expose modal fields through slightly
         # different wrappers. Only inspect the known, bounded attributes.
         for attribute in (
-            "value", "default", "text", "data", "modal", "interaction",
-            "components", "children", "items",
+            "value", "default", "text", "content", "data", "modal",
+            "interaction", "message", "response", "response_message",
+            "messages", "components", "children", "items",
         ):
             with contextlib.suppress(Exception):
                 child = getattr(value, attribute)
@@ -397,7 +398,12 @@ def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
     return sides
 
 
-def result_from_players_modal(message_text: str, modal_text: str) -> Optional[dict]:
+def result_from_players_modal(
+    message_text: str,
+    modal_text: str,
+    score_override: Optional[tuple[int, int]] = None,
+    visual_verified: bool = False,
+) -> Optional[dict]:
     """Build a registration only after checking the modal against the card."""
     parsed = parse_players_modal(modal_text)
     if parsed is None:
@@ -405,18 +411,25 @@ def result_from_players_modal(message_text: str, modal_text: str) -> Optional[di
 
     match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
     score = re.search(r"(?<!\d)(\d{1,2})\s*:\s*(\d{1,2})(?!\d)", message_text)
-    if not match or not score:
+    if not match or (score is None and score_override is None):
+        return None
+
+    if score_override is not None:
+        score_a, score_b = score_override
+    else:
+        score_a, score_b = int(score.group(1)), int(score.group(2))
+    if not (0 <= score_a <= 99 and 0 <= score_b <= 99):
         return None
 
     # The visible result card must contain the same ten K/A/D rows. We compare
     # a multiset because the modal uses starting CT/T while the card may show
     # the teams after a side swap.
     card_slots = parse_card_roster_slots(message_text)
-    if card_slots is None:
+    if card_slots is None and not visual_verified:
         return None
     card_kad = Counter(
         (player["kills"], player["assists"], player["deaths"])
-        for team in card_slots.values() for player in team
+        for team in (card_slots or {}).values() for player in team
     )
     modal_kad = Counter(
         (player["kills"], player["assists"], player["deaths"])
@@ -424,17 +437,18 @@ def result_from_players_modal(message_text: str, modal_text: str) -> Optional[di
     )
     # A missing player is displayed as 0/0/0 in the modal but registered as
     # 0/0/13. Normalize the card the same way for comparison.
-    normalized_card_kad = Counter()
-    for kad, count in card_kad.items():
-        normalized_card_kad[(0, 0, 13) if kad == (0, 0, 0) else kad] += count
-    if normalized_card_kad != modal_kad:
-        return None
+    if card_slots is not None:
+        normalized_card_kad = Counter()
+        for kad, count in card_kad.items():
+            normalized_card_kad[(0, 0, 13) if kad == (0, 0, 0) else kad] += count
+        if normalized_card_kad != modal_kad:
+            return None
 
     return {
         "is_match_result": True,
         "match_id": int(match.group(1)),
-        "score_a": int(score.group(1)),
-        "score_b": int(score.group(2)),
+        "score_a": score_a,
+        "score_b": score_b,
         # Modal groups are authoritative starting sides. Store them directly
         # as A=CT and B=T so format_registration cannot invert them.
         "ct_team": "A",
@@ -1034,9 +1048,47 @@ async def process_upload(message: discord.Message) -> None:
                     )
                     return
                 result = result_from_players_modal(context, modal_text)
+                if result is None and not re.search(
+                    r"(?<!\d)\d{1,2}\s*:\s*\d{1,2}(?!\d)", context
+                ):
+                    # `Получить игроков` deliberately returns
+                    # `=g <match> <счёт A> <счёт B>`. Read the real final
+                    # score from the attached result screenshot, then insert
+                    # it into our own registration command.
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        raw_images = await asyncio.gather(
+                            *(download_image(session, url) for url in urls[:4])
+                        )
+                    score_result = await recognize_match(raw_images, context)
+                    expected_match = re.search(
+                        r"(?:матч|матча)\s*#\s*(\d+)", context, re.I
+                    )
+                    recognized_match = score_result.get("match_id")
+                    score_a = score_result.get("score_a")
+                    score_b = score_result.get("score_b")
+                    score_is_valid = (
+                        score_result.get("is_match_result")
+                        and isinstance(score_a, int)
+                        and isinstance(score_b, int)
+                        and 0 <= score_a <= 99
+                        and 0 <= score_b <= 99
+                        and (
+                            not expected_match
+                            or recognized_match is None
+                            or int(recognized_match) == int(expected_match.group(1))
+                        )
+                    )
+                    if score_is_valid:
+                        result = result_from_players_modal(
+                            context,
+                            modal_text,
+                            score_override=(score_a, score_b),
+                            visual_verified=True,
+                        )
                 if result is None:
                     log.error(
-                        "Карточка на проверку пропущена: ID/стороны из окна не совпали с результатом игры."
+                        "Карточка на проверку пропущена: не удалось надёжно собрать ID, стороны и реальный счёт."
                     )
                     return
             else:
