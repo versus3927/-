@@ -1644,6 +1644,47 @@ async def on_message(message: discord.Message) -> None:
 
     command = message.content.strip().lower()
 
+    forget_match = re.fullmatch(r"забыть\s+#?(\d+)", command, re.I)
+    if forget_match:
+        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
+            return
+
+        match_id = int(forget_match.group(1))
+        async with processing_match_lock:
+            if match_id in processing_match_ids:
+                await message.channel.send(
+                    f"⏳ Игра #{match_id} сейчас обрабатывается. Повтори команду чуть позже."
+                )
+                return
+
+            existed = any(
+                str(item.get("match_id")) == str(match_id)
+                for item in load_registration_records()
+            )
+            if not existed:
+                await message.channel.send(
+                    f"ℹ️ Игры #{match_id} нет в памяти — забывать нечего."
+                )
+                return
+
+            await forget_registration(match_id)
+            processing_match_ids.discard(match_id)
+            # Разрешаем следующему `старт ...` снова проверить старую карточку
+            # в рамках текущего запуска бота. Остальные игры от повторной
+            # регистрации всё равно защищены registration_stats.json.
+            processed_message_ids.clear()
+
+        await message.channel.send(
+            f"✅ Игра #{match_id} забыта. Теперь её можно зарегистрировать заново."
+        )
+        return
+
+    if command.startswith("забыть"):
+        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
+            return
+        await message.channel.send("Формат команды: `забыть 2548`")
+        return
+
     if command in ("стата", "статистика", "stats"):
         if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
             return
