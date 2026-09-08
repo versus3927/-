@@ -298,6 +298,21 @@ def extract_short_player_ids(message_text: str, match_id: Optional[int]) -> list
     return []
 
 
+def explicit_ct_team_from_card(message_text: str) -> Optional[str]:
+    """Trust explicit Team A/B CT/T labels in review cards."""
+    header_a = re.search(r"Команда\s*A[^\n]*", message_text, re.I)
+    header_b = re.search(r"Команда\s*B[^\n]*", message_text, re.I)
+    if not header_a or not header_b:
+        return None
+    side_a = re.search(r"\b(CT|T)\b", header_a.group(0), re.I)
+    side_b = re.search(r"\b(CT|T)\b", header_b.group(0), re.I)
+    if side_a and side_a.group(1).upper() == "CT":
+        return "A"
+    if side_b and side_b.group(1).upper() == "CT":
+        return "B"
+    return None
+
+
 def parse_complete_card(message_text: str) -> Optional[dict]:
     """Read exact IDs/KAD from any complete result card; AI only selects CT/T."""
     match = re.search(r"Результат\s+матча\s*#\s*(\d+)", message_text, re.I)
@@ -357,13 +372,7 @@ def parse_complete_card(message_text: str) -> Optional[dict]:
     if len(team_a) != 5 or len(team_b) != 5:
         return None
 
-    a_side = re.search(r"\b(CT|T)\b", header_a.group(0), re.I)
-    b_side = re.search(r"\b(CT|T)\b", header_b.group(0), re.I)
-    ct_team: Optional[str] = None
-    if a_side and a_side.group(1).upper() == "CT":
-        ct_team = "A"
-    elif b_side and b_side.group(1).upper() == "CT":
-        ct_team = "B"
+    ct_team = explicit_ct_team_from_card(message_text)
 
     return {
         "is_match_result": True,
@@ -447,6 +456,10 @@ Build a registration result:
 - For every roster player return the SHORT registration ID printed with # immediately before the nickname/mention. It is usually 2, 3 or 4 digits (for example #37, #539, #1639). Use the complete short # number. NEVER use a long Discord mention/user ID such as 1524375653149966517.
 - NEVER invent positional IDs such as 1,2,3,4,5 or 5,4,3,2,1. Array position is not a player ID. If the card contains a line like `Нет статистики для игроков: #89, #124, ...`, those ten short # numbers are the roster IDs in displayed order and must be returned exactly.
 - Some roster names are Discord mentions or contain only digits. A numeric-only mention is NOT the nickname. Identify that player by the K/A/D printed beside or below the roster entry, then match those K/A/D values to the unique scoreboard row and recover the real nickname from the scoreboard.
+- Review cards can mix normal entries and raw mentions, for example `<@1277880356242067460> — 17/1/10`. The 17/1/10 belongs to that exact roster slot. Match it only against a scoreboard row on the same team/side with the same K/A/D.
+- After matching a raw numeric mention to its scoreboard row, read the complete leading 2-, 3-, or 4-digit registration number immediately before the nickname (often displayed as `#89 Nick`, `[89] Nick`, or `89 | Nick`). Use that number as id. Never use the row number 1-5 and never take digits from the long Discord mention.
+- Explicit side labels in the card are authoritative. `Команда A - T` and `Команда B - CT` means ct_team=B; `Команда A - CT` means ct_team=A. Never reverse explicit labels based on assumptions.
+- K/A/D printed in a review card is authoritative. Copy it exactly for every roster slot; use the image only to recover the nickname and short ID for numeric mentions.
 - When several numeric-only roster entries exist, solve them globally: compare all visible K/A/D values and all still-unmatched scoreboard rows, and never assign one scoreboard row twice. Use team membership, roster order and remaining unmatched rows as tie-breakers.
 - Fuzzy nickname matching is REQUIRED. Ignore case, spaces, punctuation, clan tags, decorative prefixes/suffixes and extra text. A roster nickname contained inside a scoreboard nickname is a match: for example `versus`, `versusproto`, `[TAG]versus` and `versus_123` refer to the same player when there is no conflicting roster nickname.
 - Match obvious Cyrillic/Latin phonetic spellings too. For example Latin `versus` may appear as Cyrillic `версус`.
@@ -459,7 +472,7 @@ Build a registration result:
 - is_match_result=false for unrelated images; then use null IDs/scores and empty teams.
 - A valid result has exactly five players in each team."""
     if message_text.strip():
-        prompt += f"\nOptional uploader text: {message_text[:1000]}"
+        prompt += f"\nAuthoritative Discord card text:\n{message_text[:6000]}"
 
     parts: list[dict] = [{"text": prompt}]
     for raw in images[:4]:
@@ -574,8 +587,11 @@ Build a registration result:
         output_text = output_text.split("\n", 1)[1]
         output_text = output_text.rsplit("```", 1)[0].strip()
     result = json.loads(output_text)
+    explicit_ct_team = explicit_ct_team_from_card(message_text)
+    if explicit_ct_team in ("A", "B"):
+        result["ct_team"] = explicit_ct_team
     if card_result is not None:
-        ct_team = result.get("ct_team")
+        ct_team = explicit_ct_team or result.get("ct_team")
         if ct_team not in ("A", "B"):
             card_result["overall_confidence"] = 0.0
             card_result["notes"] = "Не удалось надёжно определить сторону CT."
