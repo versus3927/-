@@ -4,6 +4,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 ROOT=Path(__file__).resolve().parent
 W=1080
+LEAGUE_DISPLAY_NAMES={"Default":"Default League","Qualifications":"Dominion Rise","Division":"Dominion Ascend","Pro":"Pro League","PC":"PC"}
 LEAGUE_COLORS={
  "Default":((100,116,139),(56,189,248)),
  "Qualifications":((250,204,21),(34,197,94)),
@@ -14,7 +15,7 @@ LEAGUE_COLORS={
 
 
 def font(size,bold=False):
- path=ROOT/'assets'/'fonts'/('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf')
+ path=ROOT/'assets'/'fonts'/('Arial-Bold.ttf' if bold else 'Arial.ttf')
  return ImageFont.truetype(str(path),size)
 
 
@@ -54,7 +55,7 @@ def build_matches_card(matches,title='ПОСЛЕДНИЕ МАТЧИ',subtitle='�
   d.rounded_rectangle((42,y,1038,y+86),radius=22,fill=(19,21,34,240),outline=(*accent,150),width=2)
   d.rounded_rectangle((42,y,54,y+86),radius=8,fill=(*accent,255))
   d.text((78,y+18),f"МАТЧ #{match.get('id','?')}",font=font(24,True),fill=(245,246,250,255))
-  d.text((78,y+53),f"{league} · {match.get('map') or 'карта не выбрана'}",font=font(19),fill=(166,170,190,255))
+  d.text((78,y+53),f"{LEAGUE_DISPLAY_NAMES.get(league,league)} · {match.get('map') or 'карта не выбрана'}",font=font(19),fill=(166,170,190,255))
   a,b=match.get('score_a'),match.get('score_b')
   if a is None or b is None:
    status_text,status_color='ИДЁТ',(250,204,21)

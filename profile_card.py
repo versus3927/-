@@ -1,206 +1,80 @@
-import asyncio
-import io
-import math
+import asyncio, io, math
 from pathlib import Path
-
 import requests
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
-
 from elo_levels import elo_bounds, elo_level
 
 ROOT=Path(__file__).resolve().parent
-W,H=1800,1400
-BG=(3,3,10); PANEL=(13,12,24); PANEL_2=(22,20,36)
-PURPLE=(126,70,238); VIOLET=(181,119,255); CYAN=(76,200,232)
-WHITE=(244,242,250); MUTED=(159,153,178); GREEN=(62,210,137); RED=(240,74,116); GOLD=(244,190,72)
-LEAGUE_COLORS={"Default":(184,188,205),"Qualifications":(54,211,139),"Division":(164,83,246),"Pro":(244,68,96)}
-MAP_NAMES=("Sandstone","Province","Rust","Dune","Hanami","Breeze","Prison")
+W=H=1600
+BG=(3,2,10); PANEL=(14,8,31); CARD=(28,14,53); PURPLE=(172,59,255); PINK=(236,62,183); CYAN=(92,205,245); WHITE=(248,246,252); MUTED=(174,154,194); GREEN=(57,218,142); RED=(242,72,126)
+MAPS=('Sandstone','Rust','Province','Prison','Hanami','Dune','Breeze')
+LEAGUE_NAMES={'Default':'Default League','Qualifications':'Dominion Rise','Division':'Dominion Ascend','Pro':'Pro League'}
 
+def font(n,b=False):
+ p=ROOT/'assets'/'fonts'/('Arial-Bold.ttf' if b else 'Arial.ttf'); return ImageFont.truetype(str(p),n)
+def txt(d,xy,s,n,c=WHITE,b=False,a=None): d.text(xy,str(s),font=font(n,b),fill=(*c,255),anchor=a)
+def box(d,b,r=24,fill=PANEL,outline=(84,33,126),w=2):
+ x1,y1,x2,y2=b; d.rounded_rectangle((x1+8,y1+9,x2+8,y2+9),r,fill=(0,0,0,105)); d.rounded_rectangle(b,r,fill=(*fill,246),outline=(*outline,225),width=w)
+def avatar(url,size):
+ try:
+  q=requests.get(str(url),timeout=8); q.raise_for_status(); return ImageOps.fit(Image.open(io.BytesIO(q.content)).convert('RGB'),(size,size),Image.Resampling.LANCZOS)
+ except Exception:
+  im=Image.new('RGB',(size,size),(19,10,35)); z=ImageDraw.Draw(im); z.ellipse((size*.28,size*.13,size*.72,size*.57),fill=(92,52,121)); z.rounded_rectangle((size*.17,size*.56,size*.83,size*.96),int(size*.2),fill=(92,52,121)); return im
+def paste_round(im,pic,b,r):
+ x1,y1,x2,y2=b; pic=ImageOps.fit(pic,(x2-x1,y2-y1),Image.Resampling.LANCZOS); m=Image.new('L',pic.size); ImageDraw.Draw(m).rounded_rectangle((0,0,pic.width-1,pic.height-1),r,fill=255); im.paste(pic,(x1,y1),m)
+def league(points): return 'Pro' if points>=1600 else 'Division' if points>=1350 else 'Qualifications' if points>=1150 else 'Default'
+def result(m,uid):
+ if m.get('score_a') is None or m.get('score_b') is None:return None
+ ina=str(uid) in str(m.get('team_a','')).split(','); wa=int(m['score_a'])>int(m['score_b']); return 'W' if ina==wa else 'L'
+def map_rows(recent,uid):
+ out={m:[0,0] for m in MAPS}
+ for row in recent:
+  name=str(row.get('map') or ''); r=result(row,uid)
+  if name in out and r: out[name][0 if r=='W' else 1]+=1
+ used=[(m,*v) for m,v in out.items() if sum(v)]; empty=[(m,0,0) for m,v in out.items() if not sum(v)]; return (used+empty)[:6]
+def donut(d,c,r,ratio,value,label):
+ x,y=c; d.arc((x-r,y-r,x+r,y+r),-90,270,fill=(59,35,82),width=17); d.arc((x-r,y-r,x+r,y+r),-90,-90+360*max(0,min(1,ratio)),fill=PURPLE,width=17); txt(d,(x,y-5),value,36,WHITE,True,'mm'); txt(d,(x,y+34),label,13,MUTED,True,'mm')
+def hexagon(d,c,r,value):
+ x,y=c; pts=[(x+r*math.cos(math.radians(i*60-30)),y+r*math.sin(math.radians(i*60-30))) for i in range(6)]; d.polygon(pts,fill=(18,7,37),outline=(*PURPLE,255)); pts2=[(x+(r-10)*math.cos(math.radians(i*60-30)),y+(r-10)*math.sin(math.radians(i*60-30))) for i in range(6)]; d.line(pts2+[pts2[0]],fill=(*PINK,255),width=4); txt(d,(x,y),value,39,WHITE,True,'mm')
 
-def font(size,bold=False):
-    local=ROOT/'assets'/'fonts'/('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf')
-    system=Path('/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf')
-    path=local if local.exists() else system
-    return ImageFont.truetype(str(path),size) if path.exists() else ImageFont.load_default()
+def build_profile_card_sync(player,name,avatar_url,recent,meta=None):
+ meta=meta or {}; points=max(0,int(player.get('points',0))); lvl=elo_level(points); lg=meta.get('league') or league(points)
+ games=int(player.get('games',0)); wins=int(player.get('wins',0)); losses=int(player.get('losses',max(0,games-wins))); kills=int(player.get('kills',0)); deaths=int(player.get('deaths',0)); assists=int(player.get('assists',0)); mvp=int(player.get('mvp',0))
+ kd=kills/max(1,deaths); wr=wins/max(1,games)*100; avg=kills/max(1,games); rounds=max(1,games*20); kpr=kills/rounds; apr=assists/rounds; rating=kd*.55+wr/100*.45; impact=max(0,2.13*kpr+.42*apr-.41); svr=max(0,min(100,(1-deaths/rounds)*100))
+ im=Image.new('RGBA',(W,H),(*BG,255)); d=ImageDraw.Draw(im,'RGBA')
+ glow=Image.new('RGBA',(W,H)); g=ImageDraw.Draw(glow); g.ellipse((-380,-250,920,760),fill=(*PURPLE,72)); g.ellipse((900,650,1900,1700),fill=(*PINK,35)); im.alpha_composite(glow.filter(ImageFilter.GaussianBlur(160))); d=ImageDraw.Draw(im,'RGBA')
+ # Header exactly follows the supplied dashboard composition.
+ box(d,(25,25,1575,220),26,fill=(18,6,39),outline=PURPLE,w=3); paste_round(im,avatar(avatar_url,150),(52,48,202,198),25); d.rounded_rectangle((48,44,206,202),27,outline=(*PURPLE,255),width=4)
+ txt(d,(235,63),'#'+str(player['user_id'])[-5:],18,PURPLE,True); txt(d,(235,92),name[:24],41,WHITE,True); txt(d,(235,149),f"ID: {player.get('game_id') or '—'}",18,MUTED,True); txt(d,(1515,73),'DOMINION FACEIT',22,PURPLE,True,'ra')
+ # Main statistics.
+ box(d,(25,250,985,900),28); txt(d,(62,285),'STATISTIC',24,WHITE,True)
+ d.rounded_rectangle((55,340,475,565),22,fill=(*CARD,255)); donut(d,(180,452),88,min(1,kd/2),f'{kd:.2f}','K / D'); txt(d,(295,402),'KILL / DEATHS',16,MUTED,True); txt(d,(295,448),f'K = {kills}',22,CYAN,True); txt(d,(295,486),f'D = {deaths}',22,PINK,True)
+ d.rounded_rectangle((500,340,950,565),22,fill=(*CARD,255)); txt(d,(535,378),'ELO',16,MUTED,True); hexagon(d,(862,418),64,lvl); lo,hi,nxt,ratio=elo_bounds(points); txt(d,(535,423),points,35,WHITE,True); d.rounded_rectangle((535,490,915,506),8,fill=(70,42,92)); d.rounded_rectangle((535,490,535+int(380*ratio),506),8,fill=(*PURPLE,255)); txt(d,(535,520),lo,13,MUTED,True); txt(d,(915,520),nxt or 'MAX',13,MUTED,True,'ra')
+ metrics=[('RATING',f'{rating:.2f}'),('AVG',f'{avg:.2f}'),('IMPACT',f'{impact:.2f}'),('KPR',f'{kpr:.2f}'),('ASSISTS',assists),('SVR',f'{svr:.0f}%')]
+ for i,(lab,val) in enumerate(metrics):
+  col=i%3; row=i//3; x=55+col*300; y=595+row*137; d.rounded_rectangle((x,y,x+275,y+112),20,fill=(*CARD,255),outline=(98,35,139,180),width=1); txt(d,(x+20,y+20),lab,14,MUTED,True); txt(d,(x+250,y+22),val,25,WHITE,True,'ra'); d.rounded_rectangle((x+20,y+70,x+250,y+80),5,fill=(64,38,81)); d.rounded_rectangle((x+20,y+70,x+105,y+80),5,fill=(*PURPLE,255)); txt(d,(x+20,y+89),'DOMINION',11,PURPLE,True)
+ # Right mini form and player information.
+ box(d,(1015,250,1575,385),24); forms=[result(x,player['user_id']) for x in recent[:6]]
+ for i in range(6):
+  r=forms[i] if i<len(forms) and forms[i] else ''; c=GREEN if r=='W' else RED if r=='L' else PURPLE; x=1047+i*85; fill=(*c,40) if r else (*CARD,255); d.rounded_rectangle((x,283,x+66,351),16,fill=fill,outline=(*c,230),width=2); txt(d,(x+33,317),r,20,WHITE,True,'mm')
+ box(d,(1015,410,1575,650),25); play=f'{games*20//60}h'; joined=meta.get('joined_date') or '—'; infos=[('PLAYTIME',play),('JOIN DATE',joined),('GAMES',games),('MVP',mvp)]
+ for i,(lab,val) in enumerate(infos):
+  x=1055+(i%2)*260; y=450+(i//2)*95; txt(d,(x,y),lab,14,MUTED,True); txt(d,(x,y+32),val,28,WHITE,True)
+ # League/places block.
+ box(d,(1015,675,1575,1090),25); txt(d,(1055,715),'LEAGUE',15,MUTED,True); txt(d,(1055,748),LEAGUE_NAMES[lg],31,PURPLE,True); txt(d,(1055,800),'PLACES',16,WHITE,True)
+ tops=meta.get('league_top') or []
+ for i in range(3):
+  y=850+i*62; txt(d,(1055,y+25),f'#{i+1}',18,WHITE,True); item=tops[i] if i<len(tops) else {}; paste_round(im,avatar(item.get('avatar_url',''),42),(1110,y+5,1152,y+47),11); txt(d,(1170,y+25),item.get('name','—')[:20],18,WHITE,True,'lm')
+ d.line((1055,1038,1528,1038),fill=(*MUTED,100),width=2); txt(d,(1055,1062),f"#{meta.get('position','—')}",18,PURPLE,True); txt(d,(1170,1062),name[:20],18,WHITE,True)
+ # Map section.
+ box(d,(25,925,985,1570),28); txt(d,(62,960),'MAP STATISTIC',24,WHITE,True); rows=map_rows(recent,player['user_id']); best=max(rows,key=lambda z:(z[1]/max(1,z[1]+z[2]),z[1]))
+ donut(d,(175,1115),92,best[1]/max(1,best[1]+best[2]),f'{best[1]/max(1,best[1]+best[2])*100:.0f}%','WIN RATE'); txt(d,(305,1062),best[0],25,WHITE,True); txt(d,(305,1110),f'W = {best[1]}   L = {best[2]}',19,MUTED,True)
+ for i,(mn,mw,ml) in enumerate(rows):
+  col=i%3; row=i//3; x=55+col*300; y=1240+row*137; d.rounded_rectangle((x,y,x+275,y+115),19,fill=(*CARD,255),outline=(91,34,130,180),width=1); d.rounded_rectangle((x+15,y+15,x+82,y+82),14,outline=(*PURPLE,240),width=3); txt(d,(x+48,y+49),mn[:2].upper(),17,PURPLE,True,'mm'); txt(d,(x+98,y+20),mn,17,WHITE,True); txt(d,(x+98,y+49),f'W {mw}   L {ml}',14,MUTED,True); txt(d,(x+18,y+94),f'K/D {kd:.2f}',13,WHITE,True); txt(d,(x+250,y+94),f'W/R {mw/max(1,mw+ml)*100:.0f}%',13,CYAN,True,'ra')
+ # Recent match grid.
+ box(d,(1015,1115,1575,1570),25); txt(d,(1055,1150),'RECENT MATCHES',23,WHITE,True); rr=[result(x,player['user_id']) for x in recent[:28]]; rr=[x for x in rr if x]
+ for i in range(28):
+  col=i%7; row=i//7; x=1055+col*69; y=1210+row*73; r=rr[i] if i<len(rr) else ''; c=GREEN if r=='W' else RED if r=='L' else PURPLE; fill=(*c,25) if r else (*CARD,255); d.rounded_rectangle((x,y,x+54,y+54),13,fill=fill,outline=(*c,220),width=2); txt(d,(x+27,y+27),r,17,WHITE,True,'mm')
+ out=io.BytesIO(); im.convert('RGB').save(out,'PNG',quality=96); out.seek(0); return out
 
-
-def text(draw,xy,value,size,color=WHITE,bold=False,anchor=None):
-    draw.text(xy,str(value),font=font(size,bold),fill=(*color,255),anchor=anchor)
-
-
-def panel(draw,box,radius=28,fill=PANEL,outline=(58,46,89),width=2):
-    x1,y1,x2,y2=box
-    draw.rounded_rectangle((x1+8,y1+10,x2+8,y2+10),radius=radius,fill=(0,0,0,100))
-    draw.rounded_rectangle(box,radius=radius,fill=(*fill,242),outline=(*outline,205),width=width)
-
-
-def line_progress(draw,box,ratio,color=PURPLE):
-    x1,y1,x2,y2=box; ratio=max(0.0,min(1.0,float(ratio)))
-    draw.rounded_rectangle(box,radius=9,fill=(48,44,65,255))
-    if ratio>0:
-        end=max(x1+14,int(x1+(x2-x1)*ratio))
-        draw.rounded_rectangle((x1,y1,end,y2),radius=9,fill=(*color,255))
-        draw.ellipse((end-8,y1-4,end+8,y2+4),fill=(*CYAN,255))
-
-
-def fetch_avatar(url,size):
-    try:
-        response=requests.get(str(url),timeout=10); response.raise_for_status()
-        image=Image.open(io.BytesIO(response.content)).convert('RGB')
-        return ImageOps.fit(image,(size,size),Image.Resampling.LANCZOS)
-    except Exception:
-        image=Image.new('RGB',(size,size),(10,9,20)); d=ImageDraw.Draw(image)
-        d.ellipse((size*.27,size*.15,size*.73,size*.60),fill=(70,63,91))
-        d.rounded_rectangle((size*.17,size*.58,size*.83,size*.95),radius=int(size*.2),fill=(70,63,91))
-        return image
-
-
-def paste_round(canvas,image,box,radius):
-    x1,y1,x2,y2=box
-    image=ImageOps.fit(image,(x2-x1,y2-y1),Image.Resampling.LANCZOS)
-    mask=Image.new('L',image.size); ImageDraw.Draw(mask).rounded_rectangle((0,0,image.width-1,image.height-1),radius=radius,fill=255)
-    canvas.paste(image,(x1,y1),mask)
-
-
-def league_for(points):
-    if points>=1600: return "Pro"
-    if points>=1350: return "Division"
-    if points>=1150: return "Qualifications"
-    return "Default"
-
-
-def match_result(match,user_id):
-    if match.get('score_a') is None or match.get('score_b') is None: return None
-    team_a=str(user_id) in str(match.get('team_a','')).split(',')
-    won_a=int(match['score_a'])>int(match['score_b'])
-    return 'W' if team_a==won_a else 'L'
-
-
-def map_records(recent,user_id):
-    rows={name:[0,0] for name in MAP_NAMES}
-    for match in recent:
-        name=str(match.get('map') or '')
-        result=match_result(match,user_id)
-        if name in rows and result:
-            rows[name][0 if result=='W' else 1]+=1
-    used=[(name,*record) for name,record in rows.items() if sum(record)>0]
-    empty=[(name,0,0) for name in MAP_NAMES if sum(rows[name])==0]
-    return (used+empty)[:6]
-
-
-def draw_brand_mark(draw,x,y,size=72):
-    # Original vector crown/shield mark; no supplied reference image is embedded.
-    c=VIOLET
-    draw.polygon([(x,y+20),(x+18,y+39),(x+36,y+6),(x+54,y+39),(x+72,y+20),(x+63,y+55),(x+9,y+55)],fill=(*c,235),outline=(*WHITE,170))
-    draw.polygon([(x+14,y+64),(x+58,y+64),(x+52,y+104),(x+36,y+120),(x+20,y+104)],outline=(*CYAN,220),fill=(*PURPLE,85),width=4)
-    text(draw,(x+36,y+89),'D',28,WHITE,True,'mm')
-
-
-def draw_level_badge(draw,cx,cy,level,accent):
-    for radius,color,alpha,width in [(82,PURPLE,55,2),(69,accent,225,3),(56,(8,7,18),255,2)]:
-        pts=[(cx+radius*math.cos(math.radians(60*i-30)),cy+radius*math.sin(math.radians(60*i-30))) for i in range(6)]
-        draw.polygon(pts,fill=(*color,alpha),outline=(*CYAN,180),width=width)
-    text(draw,(cx,cy-8),level,50,WHITE,True,'mm'); text(draw,(cx,cy+36),'LEVEL',14,MUTED,True,'mm')
-
-
-def draw_donut(draw,center,radius,ratio,primary,secondary,label,value):
-    cx,cy=center; box=(cx-radius,cy-radius,cx+radius,cy+radius)
-    draw.arc(box,-90,270,fill=(55,51,73),width=18)
-    draw.arc(box,-90,-90+360*max(0,min(1,ratio)),fill=primary,width=18)
-    if ratio<1: draw.arc(box,-90+360*ratio,270,fill=secondary,width=18)
-    text(draw,(cx,cy-8),value,38,WHITE,True,'mm'); text(draw,(cx,cy+31),label,14,MUTED,True,'mm')
-
-
-def build_profile_card_sync(player,display_name,avatar_url,recent):
-    points=max(0,int(player.get('points',0))); level=elo_level(points); league=league_for(points); accent=LEAGUE_COLORS[league]
-    games=int(player.get('games',0)); wins=int(player.get('wins',0)); losses=int(player.get('losses',max(0,games-wins)))
-    kills=int(player.get('kills',0)); deaths=int(player.get('deaths',0)); assists=int(player.get('assists',0)); mvp=int(player.get('mvp',0))
-    kd=kills/max(1,deaths); winrate=wins/max(1,games)*100; avg=kills/max(1,games)
-
-    canvas=Image.new('RGBA',(W,H),(*BG,255)); draw=ImageDraw.Draw(canvas,'RGBA')
-    # Dark Dominion background with restrained violet geometry.
-    for yy in range(H):
-        t=yy/H; draw.line((0,yy,W,yy),fill=(3+int(5*t),3+int(3*t),10+int(12*t),255))
-    glow=Image.new('RGBA',(W,H),(0,0,0,0)); gd=ImageDraw.Draw(glow)
-    gd.ellipse((-420,-360,950,700),fill=(*PURPLE,54)); gd.ellipse((1180,700,2300,1750),fill=(*CYAN,20))
-    canvas.alpha_composite(glow.filter(ImageFilter.GaussianBlur(180))); draw=ImageDraw.Draw(canvas,'RGBA')
-    for x in range(-180,1900,260): draw.polygon([(x,0),(x+80,0),(x-120,230),(x-190,230)],fill=(*VIOLET,12))
-
-    # Header / identity.
-    panel(draw,(44,40,1756,306),34,fill=(9,8,20),outline=PURPLE,width=3)
-    draw_brand_mark(draw,76,84,72)
-    text(draw,(178,80),'DOMINION FACEIT',31,WHITE,True)
-    text(draw,(178,121),'PLAYER NETWORK',15,VIOLET,True)
-    avatar=fetch_avatar(avatar_url,210); paste_round(canvas,avatar,(390,68,600,278),35)
-    draw.rounded_rectangle((384,62,606,284),radius=41,outline=(*accent,255),width=5)
-    text(draw,(640,83),'PLAYER PROFILE',17,VIOLET,True)
-    text(draw,(640,120),display_name[:23],48,WHITE,True)
-    text(draw,(640,182),f"ID  {player.get('game_id') or 'NOT LINKED'}",20,MUTED,True)
-    draw.rounded_rectangle((640,225,910,267),radius=18,fill=(*accent,38),outline=(*accent,190),width=2)
-    text(draw,(775,246),f'{league.upper()} LEAGUE',17,accent,True,'mm')
-    draw_level_badge(draw,1495,172,level,accent)
-    text(draw,(1390,88),f'{points} ELO',28,WHITE,True)
-    text(draw,(1710,267),'PLAYER '+str(player['user_id'])[-6:],14,MUTED,True,'ra')
-
-    # Main statistics area.
-    panel(draw,(44,340,1188,812),30,fill=PANEL,outline=(55,44,82))
-    text(draw,(82,378),'STATISTICS',27,WHITE,True)
-    text(draw,(82,418),'Performance based on confirmed Dominion matches',15,MUTED)
-    draw_donut(draw,(245,600),112,min(1,kd/2),(*PURPLE,255),(*RED,255),'K / D',f'{kd:.2f}')
-    text(draw,(400,492),'KILLS',15,MUTED,True); text(draw,(400,522),kills,37,CYAN,True)
-    text(draw,(400,590),'DEATHS',15,MUTED,True); text(draw,(400,620),deaths,37,RED,True)
-    stat_cards=[('MATCHES',games),('WINS',wins),('LOSSES',losses),('WIN RATE',f'{winrate:.0f}%'),('AVG KILLS',f'{avg:.1f}'),('ASSISTS',assists),('MVP',mvp),('RATING',f'{(kd*.55+winrate/100*.45):.2f}')]
-    for i,(label,value) in enumerate(stat_cards):
-        col=i%4; row=i//4; x=570+col*145; y=474+row*132
-        draw.rounded_rectangle((x,y,x+128,y+108),radius=18,fill=(*PANEL_2,255),outline=(67,57,91,220),width=1)
-        text(draw,(x+14,y+14),label,12,MUTED,True); text(draw,(x+14,y+50),value,27,WHITE,True)
-
-    # Elo and league sidebar.
-    panel(draw,(1220,340,1756,640),30,fill=PANEL,outline=accent)
-    text(draw,(1258,379),'RANK PROGRESS',22,WHITE,True)
-    lvl,floor,next_floor,ratio=elo_bounds(points)
-    text(draw,(1258,430),f'LEVEL {lvl}',30,accent,True); text(draw,(1715,432),f'{points} ELO',25,WHITE,True,'ra')
-    line_progress(draw,(1258,496,1715,516),ratio,accent)
-    text(draw,(1258,532),f'{floor} ELO',14,MUTED,True)
-    text(draw,(1715,532),('MAX' if next_floor is None else f'{next_floor} ELO'),14,MUTED,True,'ra')
-    remaining='MAXIMUM LEVEL' if next_floor is None else f'{next_floor-points} ELO TO LEVEL {lvl+1}'
-    text(draw,(1258,579),remaining,17,CYAN,True)
-
-    panel(draw,(1220,672,1756,812),26,fill=(10,9,21),outline=(55,44,82))
-    text(draw,(1258,706),'LEAGUE',14,MUTED,True); text(draw,(1258,738),league,31,accent,True)
-    text(draw,(1715,715),'RECORD',14,MUTED,True,'ra'); text(draw,(1715,748),f'{wins}W  {losses}L',24,WHITE,True,'ra')
-
-    # Map performance.
-    panel(draw,(44,846,1188,1306),30,fill=PANEL,outline=(55,44,82))
-    text(draw,(82,883),'MAP PERFORMANCE',25,WHITE,True)
-    text(draw,(82,919),'Recent verified match record',14,MUTED)
-    for i,(name,map_wins,map_losses) in enumerate(map_records(recent,player['user_id'])):
-        col=i%3; row=i//3; x=82+col*356; y=963+row*148
-        draw.rounded_rectangle((x,y,x+326,y+126),radius=20,fill=(*PANEL_2,255),outline=(62,53,84,220),width=1)
-        total=map_wins+map_losses; wr=map_wins/max(1,total)*100
-        # Simple map emblem in Dominion colors.
-        draw.rounded_rectangle((x+18,y+18,x+94,y+108),radius=16,fill=(*PURPLE,35),outline=(*accent,170),width=2)
-        text(draw,(x+56,y+63),name[:2].upper(),22,accent,True,'mm')
-        text(draw,(x+112,y+20),name,19,WHITE,True)
-        text(draw,(x+112,y+55),f'W {map_wins}   L {map_losses}',16,MUTED,True)
-        text(draw,(x+112,y+86),f'WIN RATE  {wr:.0f}%',15,CYAN,True)
-
-    # Recent form sidebar.
-    panel(draw,(1220,846,1756,1306),30,fill=PANEL,outline=CYAN)
-    text(draw,(1258,883),'RECENT MATCHES',25,WHITE,True)
-    text(draw,(1258,921),'Last confirmed games',14,MUTED)
-    results=[match_result(match,player['user_id']) for match in recent[:20]]; results=[r for r in results if r]
-    for i in range(20):
-        col=i%5; row=i//5; x=1258+col*88; y=982+row*73
-        result=results[i] if i<len(results) else '—'; color=GREEN if result=='W' else RED if result=='L' else (69,64,84)
-        draw.rounded_rectangle((x,y,x+64,y+54),radius=13,fill=(*color,35),outline=(*color,235),width=2)
-        text(draw,(x+32,y+27),result,20,WHITE,True,'mm')
-    form_wins=sum(1 for r in results if r=='W'); form_losses=sum(1 for r in results if r=='L')
-    text(draw,(1258,1264),f'FORM  {form_wins}W / {form_losses}L',16,VIOLET,True)
-
-    text(draw,(900,1360),'DOMINION FACEIT  •  RISE  •  ASCEND  •  DOMINATE',16,VIOLET,True,'mm')
-    out=io.BytesIO(); canvas.convert('RGB').save(out,'PNG',quality=96); out.seek(0); return out
-
-
-async def build_profile_card(player,display_name,avatar_url,recent):
-    return await asyncio.to_thread(build_profile_card_sync,player,display_name,avatar_url,recent)
+async def build_profile_card(player,display_name,avatar_url,recent,meta=None): return await asyncio.to_thread(build_profile_card_sync,player,display_name,avatar_url,recent,meta)
