@@ -21,6 +21,8 @@ from PIL import Image
 
 load_dotenv()
 
+BOT_VERSION = "v6-review-special-2026-09-09"
+
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
 _key_candidates: list[str] = []
@@ -1543,6 +1545,12 @@ async def process_upload(message: discord.Message) -> None:
             # directly through the normal registration path even if the
             # phrase appears elsewhere in the message context.
             review_card = is_review_result_card(context)
+            log.info(
+                "Матч #%s: review_card=%s | версия %s",
+                reserved_match_id or "?",
+                review_card,
+                BOT_VERSION,
+            )
             if review_card:
                 modal_text, _helper_image_urls = await get_players_response(message)
                 if not modal_text:
@@ -1774,7 +1782,7 @@ async def backfill_channels(channel_ids: set[int], before_time) -> int:
 
 @client.event
 async def on_ready() -> None:
-    log.info("Селф-бот успешно авторизован: %s", client.user)
+    log.info("Селф-бот успешно авторизован: %s | версия %s", client.user, BOT_VERSION)
 
 
 @client.event
