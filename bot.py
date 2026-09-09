@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v6-review-special-2026-09-09"
+BOT_VERSION = "v8-full-stats-diagnostics-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1118,10 +1118,12 @@ def is_review_result_card(message_text: str) -> bool:
     Do not trigger on an incidental phrase like `на проверку` in instructions,
     history, replies, or other embedded text.
     """
+    # The title starts with a shield emoji in real Discord embeds, therefore
+    # it must not be anchored to the beginning of a plain-text line.
     explicit_title = re.search(
-        r"^\s*Результат\s+матча\s*#\s*\d+[^\n]*\bна\s+проверку\b",
+        r"Результат\s+матча\s*#\s*\d+[^\n]{0,160}?на\s+проверку\b",
         message_text,
-        re.I | re.M,
+        re.I,
     )
     if explicit_title:
         return True
@@ -1135,6 +1137,79 @@ def is_review_result_card(message_text: str) -> bool:
         ):
             return True
     return False
+
+
+def readable_score_from_context(message_text: str) -> Optional[tuple[int, int]]:
+    """Extract the best already-readable A:B score for diagnostic logs."""
+    recognized = re.search(
+        r"Распознано\s+со\s+скриншота\s*:\s*(\d{1,2})\s*[-:]\s*(\d{1,2})",
+        message_text,
+        re.I,
+    )
+    if recognized:
+        return int(recognized.group(1)), int(recognized.group(2))
+    headers = [re.search(rf"Команда\s*{team}[^\n]*", message_text, re.I) for team in "AB"]
+    values: list[int] = []
+    for header in headers:
+        if not header:
+            return None
+        found = re.search(
+            r"(?:CT|T)?\s*[-–—:|·]\s*(\d{1,2})\s*[-–—:|·]\s*[KК][/\\][AА][/\\][CDСД]",
+            header.group(0),
+            re.I,
+        )
+        if not found:
+            return None
+        values.append(int(found.group(1)))
+    return values[0], values[1]
+
+
+def full_match_diagnostics(
+    message_text: str,
+    modal_text: Optional[str] = None,
+    result: Optional[dict] = None,
+) -> str:
+    """Render score and every available player row for Railway error logs."""
+    lines: list[str] = []
+    score = readable_score_from_context(message_text)
+    if result and result.get("score_a") is not None and result.get("score_b") is not None:
+        lines.append(f"СЧЁТ A:B = {result['score_a']}:{result['score_b']}")
+    elif score:
+        lines.append(f"СЧЁТ A:B = {score[0]}:{score[1]}")
+    else:
+        lines.append("СЧЁТ A:B = НЕ ПРОЧИТАН")
+
+    def add_players(title: str, players: list[dict]) -> None:
+        lines.append(title)
+        if not players:
+            lines.append("  игроков разобрать не удалось")
+            return
+        for position, player in enumerate(players, 1):
+            kills = int(player.get("kills", 0) or 0)
+            assists = int(player.get("assists", 0) or 0)
+            deaths = int(player.get("deaths", 0) or 0)
+            if kills == assists == deaths == 0:
+                deaths = 13
+            player_id = player.get("id")
+            nickname = str(player.get("nickname", "") or "неизвестный ник")
+            lines.append(
+                f"  {position}. ID={player_id if player_id is not None else 'длинный/не найден'} "
+                f"ник={nickname} K/A/D={kills}/{assists}/{deaths}"
+            )
+
+    if result:
+        add_players("КОМАНДА A:", list(result.get("team_a", [])))
+        add_players("КОМАНДА B:", list(result.get("team_b", [])))
+    else:
+        slots = parse_card_roster_slots(message_text)
+        add_players("КОМАНДА A ИЗ КАРТОЧКИ:", slots["team_a"] if slots else [])
+        add_players("КОМАНДА B ИЗ КАРТОЧКИ:", slots["team_b"] if slots else [])
+
+    if modal_text:
+        modal = parse_players_modal(modal_text)
+        add_players("ПОЛУЧИТЬ ИГРОКОВ — CT:", modal["CT"] if modal else [])
+        add_players("ПОЛУЧИТЬ ИГРОКОВ — T:", modal["T"] if modal else [])
+    return "\n".join(lines)
 
 
 async def recognize_match(
@@ -1544,24 +1619,37 @@ async def process_upload(message: discord.Message) -> None:
             # title/status says `на проверку`. Ordinary matches must go
             # directly through the normal registration path even if the
             # phrase appears elsewhere in the message context.
-            review_card = is_review_result_card(context)
+            has_players_button = find_get_players_button(message) is not None
+            review_card = is_review_result_card(context) or has_players_button
+            score_hint = readable_score_from_context(context)
             log.info(
-                "Матч #%s: review_card=%s | версия %s",
+                "Матч #%s: review_card=%s players_button=%s score_hint=%s | версия %s",
                 reserved_match_id or "?",
                 review_card,
+                has_players_button,
+                f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
                 BOT_VERSION,
             )
             if review_card:
                 modal_text, _helper_image_urls = await get_players_response(message)
                 if not modal_text:
                     log.error(
-                        "Карточка на проверку пропущена: не удалось открыть/прочитать «Получить игроков»."
+                        "Матч #%s: ошибка карточки на проверку: не удалось открыть/прочитать «Получить игроков». Прочитанный счёт=%s. context=%r\n%s",
+                        reserved_match_id or "?",
+                        f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
+                        context[:4000],
+                        full_match_diagnostics(context),
                     )
                     return
                 result = result_from_review_card_and_modal(context, modal_text)
                 if result is None:
                     log.error(
-                        "Карточка на проверку пропущена: не удалось разобрать карточку или ответ «Получить игроков». Старый AI-валидатор для этого формата не запускается."
+                        "Матч #%s: ошибка разбора карточки/ответа «Получить игроков». Прочитанный счёт=%s. context=%r modal=%r. Старый AI-валидатор не запускается.\n%s",
+                        reserved_match_id or "?",
+                        f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
+                        context[:4000],
+                        modal_text[:2500],
+                        full_match_diagnostics(context, modal_text),
                     )
                     return
             else:
@@ -1582,10 +1670,11 @@ async def process_upload(message: discord.Message) -> None:
             if len(expected_ids) == 10 and len(returned_ids) == 10:
                 if set(returned_ids) != set(expected_ids):
                     log.error(
-                        "Матч #%s пропущен: ID модели %s не совпали с карточкой %s",
+                        "Матч #%s пропущен: ID модели %s не совпали с карточкой %s\n%s",
                         result.get("match_id"),
                         returned_ids,
                         expected_ids,
+                        full_match_diagnostics(context, modal_text if review_card else None, result),
                     )
                     return
             positional_ids = [1, 2, 3, 4, 5, 5, 4, 3, 2, 1]
@@ -1594,9 +1683,10 @@ async def process_upload(message: discord.Message) -> None:
                 and all(isinstance(value, int) and 1 <= value <= 5 for value in returned_ids)
             ):
                 log.error(
-                    "Матч #%s пропущен: модель выдумала позиционные ID %s",
+                    "Матч #%s пропущен: модель выдумала позиционные ID %s\n%s",
                     result.get("match_id"),
                     returned_ids,
+                    full_match_diagnostics(context, modal_text if review_card else None, result),
                 )
                 return
 
@@ -1611,17 +1701,27 @@ async def process_upload(message: discord.Message) -> None:
             )
             if fatal:
                 log.error(
-                    "Не удалось корректно собрать структуру. Notes: %s",
+                    "Матч #%s: не удалось собрать структуру. Прочитанный счёт=%s:%s. result=%r Notes=%s\n%s",
+                    result.get("match_id") or reserved_match_id or "?",
+                    result.get("score_a"),
+                    result.get("score_b"),
+                    result,
                     result.get("notes", ""),
+                    full_match_diagnostics(context, modal_text if review_card else None, result),
                 )
                 return
 
             confidence = float(result.get("overall_confidence", 0))
             if confidence < MIN_CONFIDENCE:
                 log.warning(
-                    "Матч распознан с низкой уверенностью %.2f: %s",
+                    "Матч #%s распознан с низкой уверенностью %.2f. Прочитанный счёт=%s:%s. result=%r Notes=%s\n%s",
+                    result.get("match_id") or reserved_match_id or "?",
                     confidence,
+                    result.get("score_a"),
+                    result.get("score_b"),
+                    result,
                     result.get("notes", ""),
+                    full_match_diagnostics(context, modal_text if review_card else None, result),
                 )
                 return
 
@@ -1633,9 +1733,10 @@ async def process_upload(message: discord.Message) -> None:
                 or len(set(player_ids)) != 10
             ):
                 log.error(
-                    "Матч #%s не отправлен: недопустимые или повторяющиеся ID %s",
+                    "Матч #%s не отправлен: недопустимые или повторяющиеся ID %s\n%s",
                     result.get("match_id"),
                     player_ids,
+                    full_match_diagnostics(context, modal_text if review_card else None, result),
                 )
                 return
 
@@ -1707,7 +1808,14 @@ async def process_upload(message: discord.Message) -> None:
                 message.channel.id,
             )
         except Exception:
-            log.exception("Ошибка обработки файла в process_upload")
+            log.exception(
+                "Ошибка обработки файла в process_upload.\n%s",
+                full_match_diagnostics(
+                    context,
+                    locals().get("modal_text"),
+                    locals().get("result"),
+                ),
+            )
         finally:
             if reserved_match_id is not None:
                 async with processing_match_lock:
