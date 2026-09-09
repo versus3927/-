@@ -70,6 +70,54 @@ def parse_channel_ids(variable_name: str) -> set[int]:
     }
 
 
+_CYRILLIC_TO_LATIN = str.maketrans(
+    {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
+        "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
+        "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+        "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+        "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "ch",
+        "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+        "э": "e", "ю": "yu", "я": "ya",
+    }
+)
+
+
+def normalize_nickname(value: object) -> str:
+    """Normalize tags, punctuation and Cyrillic/Latin spelling for matching."""
+    text = unicodedata.normalize("NFKD", str(value)).casefold()
+    text = text.translate(_CYRILLIC_TO_LATIN)
+    return "".join(character for character in text if character.isalnum())
+
+
+def nickname_similarity(first: object, second: object) -> float:
+    """Match names such as versus/версус/versustop/111versus."""
+    left = normalize_nickname(first)
+    right = normalize_nickname(second)
+    if not left or not right or left.isdigit() or right.isdigit():
+        return 0.0
+    if left == right:
+        return 1.0
+
+    left_without_edge_digits = re.sub(r"^\d+|\d+$", "", left)
+    right_without_edge_digits = re.sub(r"^\d+|\d+$", "", right)
+    if (
+        left_without_edge_digits
+        and right_without_edge_digits
+        and left_without_edge_digits == right_without_edge_digits
+    ):
+        return 0.99
+
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 4 and shorter in longer:
+        return 0.94 + 0.06 * len(shorter) / len(longer)
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def nicknames_match(first: object, second: object) -> bool:
+    return nickname_similarity(first, second) >= 0.72
+
+
 NORMAL_CHANNEL_IDS = parse_channel_ids("NORMAL_CHANNEL_IDS")
 PRIORITY_CHANNEL_IDS = parse_channel_ids("PRIORITY_CHANNEL_IDS")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
@@ -465,14 +513,8 @@ def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
     """Parse authoritative starting-side groups from the player modal."""
     sides: dict[str, list[dict]] = {"CT": [], "T": []}
     current_side: Optional[str] = None
-    named_pattern = re.compile(
-        r"^\s*(\d{1,5})\s+(.+?)\s*=\s*(\d+)\s+(\d+)\s+(\d+)\s*$"
-    )
-    # Реальный ответ кнопки выглядит как `508 0 0 0`: короткий ID и
-    # зарегистрированные K/A/D без ника.
-    numeric_pattern = re.compile(
-        r"^\s*(\d{1,5})\s+(\d+)\s+(\d+)\s+(\d+)\s*$"
-    )
+    named_pattern = re.compile(r"^\s*(\d{1,5})\s+(.+?)\s*=\s*(\d+)\s+(\d+)\s+(\d+)\s*$")
+    numeric_pattern = re.compile(r"^\s*(\d{1,5})\s+(\d+)\s+(\d+)\s+(\d+)\s*$")
 
     for raw_line in modal_text.splitlines():
         line = raw_line.strip()
@@ -487,12 +529,10 @@ def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
         if not named and not numeric:
             continue
         if named:
-            player_id = int(named.group(1))
-            nickname = named.group(2).strip()
+            player_id, nickname = int(named.group(1)), named.group(2).strip()
             kills, assists, deaths = map(int, named.group(3, 4, 5))
         else:
-            player_id = int(numeric.group(1))
-            nickname = ""
+            player_id, nickname = int(numeric.group(1)), ""
             kills, assists, deaths = map(int, numeric.group(2, 3, 4))
         sides[current_side].append({
             "id": player_id,
@@ -644,7 +684,7 @@ def result_from_visual_audit(
             scores: list[float] = []
             for modal_player, visual_index in zip(modal_players, order):
                 visual_player = visual_players[visual_index]
-                name_match = nickname_score(
+                name_match = nickname_similarity(
                     modal_player.get("nickname", ""),
                     visual_player.get("nickname", ""),
                 )
@@ -846,178 +886,92 @@ def parse_card_roster_slots(message_text: str) -> Optional[dict[str, list[dict]]
     return {"team_a": team_a, "team_b": team_b}
 
 
-def result_from_review_card_and_modal(
-    message_text: str,
-    modal_text: str,
-) -> Optional[dict]:
-    """Resolve review-card players using the authoritative `Получить игроков` IDs."""
+def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Optional[dict]:
+    """Use short IDs from `Получить игроков`; fuzzy-match names and absent rows."""
     modal = parse_players_modal(modal_text)
     slots = parse_card_roster_slots(message_text)
     match = re.search(r"Результат\s+матча\s*#\s*(\d+)", message_text, re.I)
-    header_a = re.search(r"Команда\s*A[^\n]*", message_text, re.I)
-    header_b = re.search(r"Команда\s*B[^\n]*", message_text, re.I)
-    if modal is None or slots is None or not match or not header_a or not header_b:
+    headers = [re.search(rf"Команда\s*{x}[^\n]*", message_text, re.I) for x in "AB"]
+    if modal is None or slots is None or match is None or not all(headers):
         return None
 
-    def header_score(header: str) -> Optional[int]:
-        found = re.search(
-            r"(?:CT|T)?\s*[·•:|\-–—]\s*(\d+)\s*[·•:|\-–—]\s*K[/\\]A[/\\][CD]",
-            header,
-            re.I,
-        )
+    def score(header: str) -> Optional[int]:
+        found = re.search(r"(?:CT|T)?\s*[-–—:|·]\s*(\d+)\s*[-–—:|·]\s*K[/\\]A[/\\][CD]", header, re.I)
         return int(found.group(1)) if found else None
 
-    score_a = header_score(header_a.group(0))
-    score_b = header_score(header_b.group(0))
+    score_a, score_b = score(headers[0].group(0)), score(headers[1].group(0))
     if score_a is None or score_b is None:
-        recognized = re.search(
-            r"Распознано\s+со\s+скриншота\s*:\s*(\d+)\s*[-:]\s*(\d+)",
-            message_text,
-            re.I,
-        )
-        if not recognized:
+        found = re.search(r"Распознано\s+со\s+скриншота\s*:\s*(\d+)\s*[-:]\s*(\d+)", message_text, re.I)
+        if not found:
             return None
-        score_a, score_b = int(recognized.group(1)), int(recognized.group(2))
+        score_a, score_b = map(int, found.groups())
 
-    def normalized_kad(player: dict) -> tuple[int, int, int]:
-        values = (
-            int(player.get("kills", 0)),
-            int(player.get("assists", 0)),
-            int(player.get("deaths", 0)),
-        )
-        return (0, 0, 13) if values in {(0, 0, 0), (0, 0, 13)} else values
+    def kad(player: dict) -> tuple[int, int, int]:
+        value = tuple(int(player.get(key, 0)) for key in ("kills", "assists", "deaths"))
+        return (0, 0, 13) if value in {(0, 0, 0), (0, 0, 13)} else value
 
-    card_a_ids = {player["id"] for player in slots["team_a"] if player.get("id")}
-    card_b_ids = {player["id"] for player in slots["team_b"] if player.get("id")}
-    modal_ct_ids = {player["id"] for player in modal["CT"]}
-    modal_t_ids = {player["id"] for player in modal["T"]}
-
-    # Сначала доверяем прямым совпадениям коротких ID.
-    direct_weight = len(card_a_ids & modal_ct_ids) + len(card_b_ids & modal_t_ids)
-    swapped_weight = len(card_a_ids & modal_t_ids) + len(card_b_ids & modal_ct_ids)
-
-    # Если в карточке прямо написано, с какой стороны команда начинала,
-    # это сильнее текущих CT/T на конечной таблице.
-    starting_a = re.search(
-        r"(?:команда\s*)?A\s+начинала\s+за\s+(CT|T)\b",
-        message_text,
-        re.I,
-    )
-    if starting_a:
-        team_a_start = starting_a.group(1).upper()
-    elif direct_weight > swapped_weight:
-        team_a_start = "CT"
-    elif swapped_weight > direct_weight:
-        team_a_start = "T"
+    ids_a = {p["id"] for p in slots["team_a"] if p.get("id")}
+    ids_b = {p["id"] for p in slots["team_b"] if p.get("id")}
+    ids_ct = {p["id"] for p in modal["CT"]}
+    ids_t = {p["id"] for p in modal["T"]}
+    direct = len(ids_a & ids_ct) + len(ids_b & ids_t)
+    swapped = len(ids_a & ids_t) + len(ids_b & ids_ct)
+    stated = re.search(r"(?:команда\s*)?A\s+начинала\s+за\s+(CT|T)\b", message_text, re.I)
+    if stated:
+        side_a = stated.group(1).upper()
+    elif direct != swapped:
+        side_a = "CT" if direct > swapped else "T"
     else:
-        # Последний детерминированный вариант — сравнить уже записанную
-        # статистику из `Получить игроков` со статистикой карточки.
-        def overlap(card_players: list[dict], modal_players: list[dict]) -> int:
-            card_counter = Counter(normalized_kad(player) for player in card_players)
-            modal_counter = Counter(normalized_kad(player) for player in modal_players)
-            return sum((card_counter & modal_counter).values())
+        return None
+    side_b = "T" if side_a == "CT" else "CT"
 
-        direct_stats = overlap(slots["team_a"], modal["CT"]) + overlap(
-            slots["team_b"], modal["T"]
-        )
-        swapped_stats = overlap(slots["team_a"], modal["T"]) + overlap(
-            slots["team_b"], modal["CT"]
-        )
-        if direct_stats == swapped_stats:
-            return None
-        team_a_start = "CT" if direct_stats > swapped_stats else "T"
-
-    team_b_start = "T" if team_a_start == "CT" else "CT"
-
-    def assign_short_ids(
-        card_players: list[dict],
-        helper_players: list[dict],
-    ) -> Optional[list[dict]]:
-        if len(card_players) != 5 or len(helper_players) != 5:
-            return None
-        helper_by_id = {player["id"]: player for player in helper_players}
+    def assign(card: list[dict], helper: list[dict]) -> Optional[list[dict]]:
         assigned: list[Optional[int]] = [None] * 5
-        unused = set(helper_by_id)
-
-        # 1. Короткий ID из карточки — прямое совпадение.
-        for index, player in enumerate(card_players):
-            short_id = player.get("id")
-            if short_id is None:
+        unused = {int(p["id"]) for p in helper}
+        by_id = {int(p["id"]): p for p in helper}
+        for i, player in enumerate(card):
+            if player.get("id") is not None:
+                player_id = int(player["id"])
+                if player_id not in unused:
+                    return None
+                assigned[i] = player_id; unused.remove(player_id)
+        # Named helper formats: versus also matches версус/versustop/111versus.
+        for i, player in enumerate(card):
+            if assigned[i] is not None:
                 continue
-            if short_id not in unused:
-                return None
-            assigned[index] = int(short_id)
-            unused.remove(int(short_id))
-
-        # 2. Для длинного Discord ID ищем уникальную совпавшую статистику.
-        # 0/0/0 из карточки и 0/0/13 считаются одним отсутствующим игроком.
-        for index, player in enumerate(card_players):
-            if assigned[index] is not None:
+            candidates = [pid for pid in unused if by_id[pid].get("nickname") and nicknames_match(player.get("nickname", ""), by_id[pid]["nickname"])]
+            if len(candidates) == 1:
+                assigned[i] = candidates[0]; unused.remove(candidates[0])
+        # Match registered stats; 0/0/0 and 0/0/13 are equivalent absence.
+        for i, player in enumerate(card):
+            if assigned[i] is not None:
                 continue
-            wanted = normalized_kad(player)
-            matches = [
-                player_id
-                for player_id in unused
-                if normalized_kad(helper_by_id[player_id]) == wanted
-            ]
-            if len(matches) == 1:
-                assigned[index] = matches[0]
-                unused.remove(matches[0])
-
-        # 3. Ответ кнопки сохраняет порядок игроков внутри стартовой стороны.
-        # Используем позицию только если этот ID ещё не занят.
-        for index in range(5):
-            if assigned[index] is None:
-                positional_id = int(helper_players[index]["id"])
-                if positional_id in unused:
-                    assigned[index] = positional_id
-                    unused.remove(positional_id)
-
-        # 4. Последний оставшийся ID определяется исключением.
-        unresolved = [index for index, value in enumerate(assigned) if value is None]
-        if len(unresolved) == 1 and len(unused) == 1:
-            assigned[unresolved[0]] = unused.pop()
-        if any(value is None for value in assigned) or unused:
+            candidates = [pid for pid in unused if kad(player) == kad(by_id[pid])]
+            if len(candidates) == 1:
+                assigned[i] = candidates[0]; unused.remove(candidates[0])
+        # The helper preserves roster order; then use elimination.
+        for i, helper_player in enumerate(helper):
+            pid = int(helper_player["id"])
+            if assigned[i] is None and pid in unused:
+                assigned[i] = pid; unused.remove(pid)
+        missing = [i for i, pid in enumerate(assigned) if pid is None]
+        if len(missing) == len(unused) == 1:
+            assigned[missing[0]] = unused.pop()
+        if any(pid is None for pid in assigned) or unused:
             return None
+        output = []
+        for player, pid in zip(card, assigned):
+            kills, assists, deaths = kad(player)
+            output.append({"id": int(pid), "nickname": player.get("nickname", ""), "kills": kills, "assists": assists, "deaths": deaths, "confidence": 1.0})
+        return output
 
-        result: list[dict] = []
-        for player, player_id in zip(card_players, assigned):
-            kills, assists, deaths = normalized_kad(player)
-            result.append(
-                {
-                    "id": int(player_id),
-                    "nickname": str(player.get("nickname", "")),
-                    "kills": kills,
-                    "assists": assists,
-                    "deaths": deaths,
-                    "confidence": 1.0,
-                }
-            )
-        return result
-
-    modal_for_a = modal[team_a_start]
-    modal_for_b = modal[team_b_start]
-    team_a = assign_short_ids(slots["team_a"], modal_for_a)
-    team_b = assign_short_ids(slots["team_b"], modal_for_b)
+    team_a = assign(slots["team_a"], modal[side_a])
+    team_b = assign(slots["team_b"], modal[side_b])
     if team_a is None or team_b is None:
         return None
-
-    all_ids = [player["id"] for player in [*team_a, *team_b]]
-    helper_ids = [player["id"] for player in [*modal["CT"], *modal["T"]]]
-    if len(set(all_ids)) != 10 or set(all_ids) != set(helper_ids):
+    if len({p["id"] for p in [*team_a, *team_b]}) != 10:
         return None
-
-    return {
-        "is_match_result": True,
-        "match_id": int(match.group(1)),
-        "score_a": score_a,
-        "score_b": score_b,
-        "ct_team": "A" if team_a_start == "CT" else "B",
-        "team_a": team_a,
-        "team_b": team_b,
-        "overall_confidence": 1.0,
-        "notes": "Короткие ID взяты из «Получить игроков»; длинные Discord ID сопоставлены по стороне, статистике, порядку и исключению.",
-    }
+    return {"is_match_result": True, "match_id": int(match.group(1)), "score_a": score_a, "score_b": score_b, "ct_team": "A" if side_a == "CT" else "B", "team_a": team_a, "team_b": team_b, "overall_confidence": 1.0, "notes": "ID сверены через «Получить игроков»; ники сопоставлены нечётко; отсутствующие игроки зарегистрированы 0/0/13."}
 
 
 def reconcile_numeric_mentions(result: dict, message_text: str) -> bool:
@@ -1430,6 +1384,15 @@ Build a registration result:
     result = json.loads(output_text)
     if score_only or visual_audit:
         return result
+    # Любой полностью нулевой игрок регистрируется как отсутствующий 0/0/13.
+    for team_key in ("team_a", "team_b"):
+        for player in result.get(team_key, []):
+            if (
+                int(player.get("kills", 0) or 0) == 0
+                and int(player.get("assists", 0) or 0) == 0
+                and int(player.get("deaths", 0) or 0) == 0
+            ):
+                player["deaths"] = 13
     explicit_ct_team = explicit_ct_team_from_card(message_text)
     if explicit_ct_team in ("A", "B"):
         result["ct_team"] = explicit_ct_team
@@ -1583,27 +1546,16 @@ async def process_upload(message: discord.Message) -> None:
                         "Карточка на проверку пропущена: не удалось открыть/прочитать «Получить игроков»."
                     )
                     return
-                # Сначала разбираем карточку детерминированно: короткие ID и
-                # стартовые стороны берём из «Получить игроков», K/A/D и счёт
-                # — из самой карточки. Длинные Discord ID не используются.
                 result = result_from_review_card_and_modal(context, modal_text)
                 if result is None:
-                    log.warning(
-                        "Детерминированная сверка карточки не удалась; запускаю строгую визуальную проверку."
-                    )
                     timeout = aiohttp.ClientTimeout(total=30)
                     async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in urls[:4])
-                        )
-                    visual_result = await recognize_match(
-                        raw_images,
-                        visual_audit=True,
-                    )
+                        raw_images = await asyncio.gather(*(download_image(session, url) for url in urls[:4]))
+                    visual_result = await recognize_match(raw_images, visual_audit=True)
                     result = result_from_visual_audit(context, modal_text, visual_result)
                 if result is None:
                     log.error(
-                        "Карточка на проверку пропущена: не удалось однозначно сопоставить короткие ID и статистику."
+                        "Карточка на проверку пропущена: не удалось однозначно сопоставить ID, ники и статистику."
                     )
                     return
             else:
