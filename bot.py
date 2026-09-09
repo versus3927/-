@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v10-helper-stats-zero-recovery-2026-09-09"
+BOT_VERSION = "v11-ephemeral-capture-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -364,10 +364,17 @@ def extract_player_modal_text(root: object) -> Optional[str]:
 
     while queue:
         value, depth = queue.pop(0)
-        if value is None or depth > 7:
+        if value is None or depth > 12:
             continue
         if isinstance(value, str):
-            if "# CT" in value.upper() and "# T" in value.upper():
+            upper = value.upper()
+            has_match = bool(re.search(r"=G\s+\d+", upper))
+            has_ct = bool(re.search(r"(?m)^\s*#?\s*CT\s*$", upper))
+            has_t = bool(re.search(r"(?m)^\s*#?\s*T\s*$", upper))
+            numeric_rows = len(
+                re.findall(r"(?m)^\s*\d{1,5}\s+\d+\s+\d+\s+\d+\s*$", value)
+            )
+            if has_match and has_ct and has_t and numeric_rows >= 8:
                 candidates.append(value)
             continue
         if isinstance(value, (bytes, bytearray, int, float, bool)):
@@ -385,12 +392,20 @@ def extract_player_modal_text(root: object) -> Optional[str]:
             queue.extend((item, depth + 1) for item in value)
             continue
 
+        # Some discord.py-self interaction wrappers keep the response only in
+        # private instance fields. Inspect their bounded __dict__ values too.
+        with contextlib.suppress(Exception):
+            object_values = list(vars(value).values())[:80]
+            queue.extend((item, depth + 1) for item in object_values)
+
         # discord.py-self versions expose modal fields through slightly
         # different wrappers. Only inspect the known, bounded attributes.
         for attribute in (
-            "value", "default", "text", "content", "data", "modal",
+            "value", "default", "text", "content", "data", "modal", "payload",
+            "raw_data", "values", "embeds", "embed", "fields", "description",
             "interaction", "message", "response", "response_message",
-            "successful", "result", "messages", "components", "children", "items",
+            "original_response", "followup", "successful", "result", "messages",
+            "components", "children", "items",
         ):
             with contextlib.suppress(Exception):
                 child = getattr(value, attribute)
@@ -463,12 +478,6 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
             )
             if custom_id and interaction_custom_id and interaction_custom_id != custom_id:
                 return False
-            # When the library exposes the source message, never accept an
-            # interaction belonging to a different result card.
-            interaction_message = getattr(interaction, "message", None)
-            interaction_message_id = getattr(interaction_message, "id", None)
-            if interaction_message_id is not None and interaction_message_id != message.id:
-                return False
             interaction_text = extract_player_modal_text(interaction)
             return not interaction_text or modal_matches_expected(interaction_text)
 
@@ -477,9 +486,9 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
         # has been populated. `interaction` is retained as a compatibility
         # fallback for builds that only expose the first event.
         def helper_message_check(candidate: object) -> bool:
-            if getattr(getattr(candidate, "channel", None), "id", None) != message.channel.id:
-                return False
             text = extract_player_modal_text(candidate)
+            # Ephemeral responses may expose no channel or a synthetic
+            # channel. The exact match number is a safer binding.
             return modal_matches_expected(text)
 
         waiters = [
@@ -489,32 +498,54 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
         ]
         try:
             click_result = await button.click()
-            direct_text = extract_player_modal_text(click_result)
-            if modal_matches_expected(direct_text):
-                return direct_text, extract_interaction_image_urls(click_result)
-
+            observed_roots: list[object] = [button, message]
+            if click_result is not None:
+                observed_roots.append(click_result)
             deadline = asyncio.get_running_loop().time() + PLAYER_MODAL_TIMEOUT
             pending = set(waiters)
-            while pending:
+            while True:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
+                    log.error(
+                        "Матч #%s: тайм-аут захвата ephemeral-ответа «Получить игроков»; observed=%s",
+                        expected_match_id or "?",
+                        [type(item).__name__ for item in observed_roots],
+                    )
                     return None, []
-                done, pending = await asyncio.wait(
-                    pending,
-                    timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if not done:
-                    return None, []
-                for completed in done:
-                    with contextlib.suppress(Exception):
-                        response_text = extract_player_modal_text(completed.result())
-                        if modal_matches_expected(response_text):
-                            return (
-                                response_text,
-                                extract_interaction_image_urls(completed.result()),
+
+                # Poll already returned interaction objects because their
+                # response fields can be populated after button.click exits.
+                cached = list(getattr(client, "cached_messages", None) or [])[-25:]
+                for root in [*observed_roots, *cached]:
+                    response_text = extract_player_modal_text(root)
+                    if modal_matches_expected(response_text):
+                        log.info(
+                            "Матч #%s: ephemeral-ответ «Получить игроков» захвачен из %s",
+                            expected_match_id or "?",
+                            type(root).__name__,
+                        )
+                        return response_text, extract_interaction_image_urls(root)
+
+                if pending:
+                    done, still_pending = await asyncio.wait(
+                        pending,
+                        timeout=min(0.35, remaining),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    pending = set(still_pending)
+                    for completed in done:
+                        try:
+                            event_result = completed.result()
+                        except Exception:
+                            log.exception(
+                                "Матч #%s: ошибка получения interaction event",
+                                expected_match_id or "?",
                             )
-            return None, []
+                            continue
+                        if event_result is not None:
+                            observed_roots.append(event_result)
+                else:
+                    await asyncio.sleep(min(0.2, remaining))
         finally:
             for waiter in waiters:
                 if not waiter.done():
