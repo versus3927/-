@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v26-log-original-card-2026-09-09"
+BOT_VERSION = "v27-final-result-min-four-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -385,7 +385,7 @@ def build_status_html(status: dict[str, object]) -> str:
       <dt>Всего</dt><dd>{esc(status['registrations_total'])}</dd>
       <dt>Сегодня</dt><dd>{esc(status['registrations_today'])}</dd>
       <dt>За последний час</dt><dd>{esc(status['registrations_hour'])}</dd>
-      <dt>Минимум игроков</dt><dd>6 совпадений</dd>
+      <dt>Минимум игроков</dt><dd>4 совпадения</dd>
     </dl></article>
     <article class="card"><h2>Распознавание</h2><dl>
       <dt>API-режим</dt><dd>{esc(status['api_style'])}</dd>
@@ -1361,7 +1361,7 @@ def result_from_card_and_visual_audit(
         side_a = str(audit.get("side_right") or "").upper()
 
     if (
-        chosen_count < 6
+        chosen_count < 4
         or min(alignment_a[1], alignment_b[1]) < 1
         or min(alignment_a[3], alignment_b[3]) < 0.72
         or (
@@ -1916,7 +1916,7 @@ async def recognize_match(
     if visual_audit:
         prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
-Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least six card players are reliably matched in total.
+Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least four card players are reliably matched in total.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
 For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
