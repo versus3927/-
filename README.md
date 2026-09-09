@@ -41,6 +41,7 @@ Set these in **Variables**:
 8. For raw long numeric Discord mentions, the bot keeps the roster slot's K/A/D from the card and matches it only to an unused scoreboard player on the same team with exactly the same K/A/D. It then restores the short 2–5 digit registration ID and preserves roster order. Ambiguous matches are skipped instead of guessed. Duplicate matches and placeholder IDs are rejected. Send `стата`, `статистика`, or `stats` for totals.
 9. Repeated result cards with the same match number do not block registration. The bot processes one copy, waits for `Готово`, and then removes all matching image-card duplicates from that registration channel. If processing fails, the preserved copies remain retryable on the next `старт` during the same bot session. If the match is already present in persistent registration history, repeated cards are removed immediately without sending `=g` a second time.
 10. A scoreboard may contain only four visible players on one side. The bot matches those visible rows to the five-player card roster and registers the unmatched player as `0 0 13` instead of rejecting the whole match.
+11. Registration formats are handled separately. A complete `внесён` card keeps the score and every K/A/D value printed in the card. A `на проверку` card takes IDs/nicknames from the card and statistics from the screenshot. Only a card player with no matching screenshot nickname receives `0 0 13`; matched players always keep their recognized statistics.
 
 Do not upload a real `.env` file or commit tokens.
 

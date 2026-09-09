@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v17-missing-player-0013-2026-09-09"
+BOT_VERSION = "v18-two-registration-modes-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1167,31 +1167,44 @@ def result_from_card_and_visual_audit(
 
     def best_alignment(
         card_players: list[dict], visual_players: list[dict]
-    ) -> tuple[tuple[Optional[int], ...], float, float]:
-        visible_count = len(visual_players)
+    ) -> tuple[tuple[Optional[int], ...], int, float, float]:
         best_order: tuple[Optional[int], ...] = tuple([None] * 5)
+        best_count = 0
         best_average = -1.0
         best_minimum = -1.0
-        # Assign every visible scoreboard row to one unique player from the
-        # five-player card roster. An unmatched card player is absent.
-        for card_order in permutations(range(5), visible_count):
-            scores = [
-                nickname_similarity(
-                    card_players[card_index].get("nickname", ""),
-                    visual_players[visual_index].get("nickname", ""),
-                )
-                for visual_index, card_index in enumerate(card_order)
-            ]
-            average = sum(scores) / visible_count
-            minimum = min(scores)
-            if (average, minimum) > (best_average, best_minimum):
-                mapping: list[Optional[int]] = [None] * 5
-                for visual_index, card_index in enumerate(card_order):
-                    mapping[card_index] = visual_index
-                best_order = tuple(mapping)
-                best_average = average
-                best_minimum = minimum
-        return best_order, best_average, best_minimum
+        # Match only reliable nickname pairs. A card player with no reliable
+        # row (missing from the screenshot or shown under a wrong nickname)
+        # remains unmatched and is registered as 0/0/13. Unmatched visual
+        # rows are ignored instead of donating their stats to another ID.
+        from itertools import combinations
+
+        max_pairs = min(5, len(visual_players))
+        for pair_count in range(max_pairs, 0, -1):
+            for card_indices in combinations(range(5), pair_count):
+                for visual_indices in permutations(range(len(visual_players)), pair_count):
+                    scores = [
+                        nickname_similarity(
+                            card_players[card_index].get("nickname", ""),
+                            visual_players[visual_index].get("nickname", ""),
+                        )
+                        for card_index, visual_index in zip(card_indices, visual_indices)
+                    ]
+                    if any(score < 0.72 for score in scores):
+                        continue
+                    average = sum(scores) / pair_count
+                    minimum = min(scores)
+                    metric = (pair_count, average, minimum)
+                    if metric > (best_count, best_average, best_minimum):
+                        mapping: list[Optional[int]] = [None] * 5
+                        for card_index, visual_index in zip(card_indices, visual_indices):
+                            mapping[card_index] = visual_index
+                        best_order = tuple(mapping)
+                        best_count = pair_count
+                        best_average = average
+                        best_minimum = minimum
+            if best_count == pair_count:
+                break
+        return best_order, best_count, best_average, best_minimum
 
     card_a = rosters["team_a"]
     card_b = rosters["team_b"]
@@ -1199,16 +1212,20 @@ def result_from_card_and_visual_audit(
     direct_b = best_alignment(card_b, right_players)
     swapped_a = best_alignment(card_a, right_players)
     swapped_b = best_alignment(card_b, left_players)
-    direct_names = direct_a[1] + direct_b[1]
-    swapped_names = swapped_a[1] + swapped_b[1]
+    direct_count = direct_a[1] + direct_b[1]
+    swapped_count = swapped_a[1] + swapped_b[1]
+    direct_names = direct_a[2] + direct_b[2]
+    swapped_names = swapped_a[2] + swapped_b[2]
 
-    if direct_names >= swapped_names:
+    if (direct_count, direct_names) >= (swapped_count, swapped_names):
+        chosen_count, other_count = direct_count, swapped_count
         chosen_names, other_names = direct_names, swapped_names
         alignment_a, alignment_b = direct_a, direct_b
         visual_a, visual_b = left_players, right_players
         score_a, score_b = score_left, score_right
         side_a = str(audit.get("side_left") or "").upper()
     else:
+        chosen_count, other_count = swapped_count, direct_count
         chosen_names, other_names = swapped_names, direct_names
         alignment_a, alignment_b = swapped_a, swapped_b
         visual_a, visual_b = right_players, left_players
@@ -1216,15 +1233,20 @@ def result_from_card_and_visual_audit(
         side_a = str(audit.get("side_right") or "").upper()
 
     if (
-        chosen_names / 2 < 0.78
-        or min(alignment_a[2], alignment_b[2]) < 0.55
-        or chosen_names - other_names < 0.08
+        chosen_count < 8
+        or min(alignment_a[1], alignment_b[1]) < 4
+        or min(alignment_a[3], alignment_b[3]) < 0.72
+        or (
+            chosen_count == other_count
+            and chosen_names - other_names < 0.08
+        )
         or side_a not in {"CT", "T"}
     ):
         log.error(
             "Матч #%s: карточка неоднозначно сопоставлена с исходным табло "
-            "(direct=%.3f swapped=%.3f side_a=%s).",
-            match.group(1), direct_names, swapped_names, side_a or "?",
+            "(direct=%s/%.3f swapped=%s/%.3f side_a=%s).",
+            match.group(1), direct_count, direct_names,
+            swapped_count, swapped_names, side_a or "?",
         )
         return None
 
@@ -1483,7 +1505,8 @@ def parse_complete_card(message_text: str) -> Optional[dict]:
 
     def header_score(header: str) -> Optional[int]:
         found = re.search(
-            r"(?:CT|T)?\s*[·•:|\-–—]\s*(\d+)\s*[·•:|\-–—]\s*K[/\\]A[/\\][CD]",
+            r"(?:CT|T)?\s*[·•:|\-–—]\s*(\d+)\s*[·•:|\-–—]\s*"
+            r"[KК][/\\][AА][/\\][CDСД]",
             header,
             re.I,
         )
@@ -1636,12 +1659,32 @@ def full_match_diagnostics(
         add_players("КОМАНДА A:", list(result.get("team_a", [])))
         add_players("КОМАНДА B:", list(result.get("team_b", [])))
     else:
-        slots = (
-            parse_card_roster_slots(message_text)
-            or parse_card_roster_identities(message_text)
-        )
-        add_players("КОМАНДА A ИЗ КАРТОЧКИ:", slots["team_a"] if slots else [])
-        add_players("КОМАНДА B ИЗ КАРТОЧКИ:", slots["team_b"] if slots else [])
+        slots = parse_card_roster_slots(message_text)
+        if slots:
+            add_players("КОМАНДА A ИЗ КАРТОЧКИ:", slots["team_a"])
+            add_players("КОМАНДА B ИЗ КАРТОЧКИ:", slots["team_b"])
+        else:
+            identities = parse_card_roster_identities(message_text)
+
+            def add_identities(title: str, players: list[dict]) -> None:
+                lines.append(title)
+                if not players:
+                    lines.append("  игроков разобрать не удалось")
+                    return
+                for position, player in enumerate(players, 1):
+                    lines.append(
+                        f"  {position}. ID={player['id']} "
+                        f"ник={player.get('nickname', '')} K/A/D=ИЗ СКРИНШОТА"
+                    )
+
+            add_identities(
+                "КОМАНДА A ИЗ КАРТОЧКИ:",
+                identities["team_a"] if identities else [],
+            )
+            add_identities(
+                "КОМАНДА B ИЗ КАРТОЧКИ:",
+                identities["team_b"] if identities else [],
+            )
 
     if modal_text:
         modal = parse_players_modal(modal_text)
@@ -2159,23 +2202,35 @@ async def process_upload(message: discord.Message) -> None:
                 processing_completed = True
                 return
 
-            # The button workflow is reserved strictly for cards whose own
-            # title/status says `на проверку`. Ordinary matches must go
-            # directly through the normal registration path even if the
-            # phrase appears elsewhere in the message context.
+            # There are two independent registration formats:
+            # 1) complete `внесён` cards already containing score and K/A/D;
+            # 2) `на проверку` cards containing IDs/nicks plus a scoreboard.
+            # A helper button may exist on both and must not choose the mode.
             has_players_button = find_get_players_button(message) is not None
-            review_card = is_review_result_card(context) or has_players_button
+            review_card = is_review_result_card(context)
+            complete_card = parse_complete_card(context)
             score_hint = readable_score_from_context(context)
             log.info(
-                "Матч #%s: review_card=%s players_button=%s score_hint=%s | версия %s",
+                "Матч #%s: complete_card=%s review_card=%s players_button=%s "
+                "score_hint=%s | версия %s",
                 reserved_match_id or "?",
+                complete_card is not None,
                 review_card,
                 has_players_button,
                 f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
                 BOT_VERSION,
             )
-            if review_card:
-                modal_text: Optional[str] = None
+            modal_text: Optional[str] = None
+            if complete_card is not None:
+                # Complete cards keep their exact card K/A/D. AI is used only
+                # when needed to identify which card team was CT/T.
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    raw_images = await asyncio.gather(
+                        *(download_image(session, url) for url in urls[:4])
+                    )
+                result = await recognize_match(raw_images, context)
+            elif review_card or has_players_button:
                 card_rosters = parse_card_roster_identities(context)
                 if card_rosters is not None:
                     # This format already contains all ten registration IDs.
