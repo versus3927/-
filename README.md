@@ -42,6 +42,7 @@ Set these in **Variables**:
 9. Repeated result cards with the same match number do not block registration. The bot processes one copy, waits for `Готово`, and then removes all matching image-card duplicates from that registration channel. If processing fails, the preserved copies remain retryable on the next `старт` during the same bot session. If the match is already present in persistent registration history, repeated cards are removed immediately without sending `=g` a second time.
 10. A scoreboard may contain only three or four visible players on one side. The bot matches the visible rows to the five-player card roster and registers each unmatched player as `0 0 13` instead of rejecting the whole match.
 11. Registration formats are handled separately. A complete `внесён` card keeps the score and every K/A/D value printed in the card. A `на проверку` card takes IDs/nicknames from the card and statistics from the screenshot. Only a card player with no matching screenshot nickname receives `0 0 13`; matched players always keep their recognized statistics.
+12. After a successful registration is confirmed, the bot automatically deletes the registration bot's visible `Готово — Матч #... закрыт` confirmation message. `Не вышло` responses are preserved for diagnostics.
 
 Do not upload a real `.env` file or commit tokens.
 

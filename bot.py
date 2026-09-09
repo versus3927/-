@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v19-multiple-missing-players-2026-09-09"
+BOT_VERSION = "v20-delete-success-confirmation-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2156,7 +2156,25 @@ async def wait_for_registration_confirmation(
         return False, "тайм-аут ожидания ответа регистрационного бота"
 
     response_text = plain_message_text(response)
-    return "готово" in response_text.lower(), response_text[:500]
+    confirmed = "готово" in response_text.lower()
+    if confirmed:
+        # Remove the registration bot's visible `Готово` card after we have
+        # read it. Failure responses are kept for diagnostics and retry.
+        try:
+            await response.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            log.warning(
+                "Нет права удалить подтверждение регистрации матча #%s",
+                match_id,
+            )
+        except Exception:
+            log.exception(
+                "Не удалось удалить подтверждение регистрации матча #%s",
+                match_id,
+            )
+    return confirmed, response_text[:500]
 
 
 async def process_upload(message: discord.Message) -> None:
