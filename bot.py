@@ -896,7 +896,7 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
         return None
 
     def score(header: str) -> Optional[int]:
-        found = re.search(r"(?:CT|T)?\s*[-–—:|·]\s*(\d+)\s*[-–—:|·]\s*K[/\\]A[/\\][CD]", header, re.I)
+        found = re.search(r"(?:CT|T)?\s*[-–—:|·]\s*(\d+)\s*[-–—:|·]\s*[KК][/\\][AА][/\\][CDСД]", header, re.I)
         return int(found.group(1)) if found else None
 
     score_a, score_b = score(headers[0].group(0)), score(headers[1].group(0))
@@ -942,7 +942,11 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
             candidates = [pid for pid in unused if by_id[pid].get("nickname") and nicknames_match(player.get("nickname", ""), by_id[pid]["nickname"])]
             if len(candidates) == 1:
                 assigned[i] = candidates[0]; unused.remove(candidates[0])
-        # Match registered stats; 0/0/0 and 0/0/13 are equivalent absence.
+        # Match registered stats only AFTER every visible short ID has been
+        # reserved. Therefore, when two players have identical K/A/D and only
+        # one has a long Discord ID, the long-ID slot receives the remaining
+        # short ID instead of being rejected as ambiguous.
+        # 0/0/0 and 0/0/13 are always equivalent absence.
         for i, player in enumerate(card):
             if assigned[i] is not None:
                 continue
@@ -1548,14 +1552,8 @@ async def process_upload(message: discord.Message) -> None:
                     return
                 result = result_from_review_card_and_modal(context, modal_text)
                 if result is None:
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(*(download_image(session, url) for url in urls[:4]))
-                    visual_result = await recognize_match(raw_images, visual_audit=True)
-                    result = result_from_visual_audit(context, modal_text, visual_result)
-                if result is None:
                     log.error(
-                        "Карточка на проверку пропущена: не удалось однозначно сопоставить ID, ники и статистику."
+                        "Карточка на проверку пропущена: не удалось разобрать карточку или ответ «Получить игроков». Старый AI-валидатор для этого формата не запускается."
                     )
                     return
             else:
