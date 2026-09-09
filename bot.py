@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v23-public-commands-status-html-2026-09-09"
+BOT_VERSION = "v25-forwarded-test-only-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -427,6 +427,14 @@ def message_parts(message: discord.Message) -> list[object]:
     for snapshot in getattr(message, "message_snapshots", None) or []:
         parts.append(getattr(snapshot, "message", snapshot))
     return parts
+
+
+def is_forwarded_message(message: discord.Message) -> bool:
+    """Detect a Discord forwarded message without changing card parsing."""
+    if getattr(message, "message_snapshots", None):
+        return True
+    flags = getattr(message, "flags", None)
+    return bool(getattr(flags, "forwarded", False))
 
 
 async def resolve_member_mentions(text: str, message: discord.Message) -> str:
@@ -2356,7 +2364,7 @@ async def wait_for_registration_confirmation(
     return confirmed, response_text[:500]
 
 
-async def process_upload(message: discord.Message) -> None:
+async def process_upload(message: discord.Message, test_only: bool = False) -> None:
     urls = image_urls(message)
     if not urls:
         return
@@ -2364,7 +2372,7 @@ async def process_upload(message: discord.Message) -> None:
     context = await message_context(message)
     context_match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", context, re.I)
     reserved_match_id = int(context_match.group(1)) if context_match else None
-    if reserved_match_id is not None:
+    if reserved_match_id is not None and not test_only:
         async with processing_match_lock:
             if reserved_match_id in processing_match_ids:
                 log.info(
@@ -2384,6 +2392,8 @@ async def process_upload(message: discord.Message) -> None:
             # second registration is needed. Remove every repeated result
             # card for it from the registration channel immediately.
             if (
+                not test_only
+                and
                 reserved_match_id is not None
                 and await registration_exists(reserved_match_id)
             ):
@@ -2604,6 +2614,14 @@ async def process_upload(message: discord.Message) -> None:
                 return
 
             command_text = format_registration(result)
+            if test_only:
+                # Forwarded cards outside registration channels are a safe
+                # preview: return only the generated =g command. Do not save
+                # stats, wait for confirmation or delete any source message.
+                await message.channel.send(command_text)
+                processing_completed = True
+                return
+
             match_id = int(result["match_id"])
             if not await record_registration(match_id):
                 deleted = await delete_duplicate_match_cards(message, match_id)
@@ -2688,21 +2706,29 @@ async def process_upload(message: discord.Message) -> None:
             if not processing_completed:
                 # Keep failed cards retryable during the same bot session.
                 processed_message_ids.discard(message.id)
-            if reserved_match_id is not None:
+            if reserved_match_id is not None and not test_only:
                 async with processing_match_lock:
                     processing_match_ids.discard(reserved_match_id)
 
 
-async def process_message_once(message: discord.Message) -> bool:
+async def process_message_once(
+    message: discord.Message,
+    test_only: bool = False,
+) -> bool:
     """Process an image message once during the current bot session."""
     if message.id in processed_message_ids:
         return False
-    if not allowed_for_parsing(message) or not image_urls(message):
+    if test_only:
+        if client.user and message.author.id == client.user.id:
+            return False
+        if not is_forwarded_message(message) or not image_urls(message):
+            return False
+    elif not allowed_for_parsing(message) or not image_urls(message):
         return False
 
     processed_message_ids.add(message.id)
     async with processing_semaphore:
-        await process_upload(message)
+        await process_upload(message, test_only=test_only)
     return True
 
 
@@ -2963,6 +2989,16 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(
             f"✅ Архив режима «{mode_name}» проверен. Найдено изображений: {count}."
         )
+        return
+
+    # A forwarded game card outside the active registration channels is a
+    # test request. It is recognized by the unchanged parser and receives
+    # only the generated registration command as a reply.
+    if (
+        is_forwarded_message(message)
+        and message.channel.id not in active_channel_ids
+    ):
+        await process_message_once(message, test_only=True)
         return
 
     if is_active:

@@ -45,6 +45,7 @@ Set these in **Variables**:
 12. After a successful registration is confirmed, the bot automatically deletes the registration bot's visible `Готово — Матч #... закрыт` confirmation message. `Не вышло` responses are preserved for diagnostics.
 13. Send `удалить рег соо` to scan the complete history of every channel listed in `NORMAL_CHANNEL_IDS` and `PRIORITY_CHANNEL_IDS` and delete all old successful `Готово — Матч #... закрыт со счётом...` messages. Other messages, including `Не вышло`, are not touched.
 14. Send `бот ты тут?` to receive readiness, current session, the Discord nickname resolved from `MY_ACCOUNT_ID`, active channels, uptime, latency, registration counters, model/key counts, and a self-contained HTML status report. Tokens and API-key values are never included. All Discord users may run all commands.
+15. For testing, forward a game card with its screenshot into any chat outside the currently active registration channels. The bot uses the same unchanged recognition algorithm and replies with only the generated `=g` registration message. Test previews are not saved to statistics, do not wait for `Готово`, and do not delete the forwarded source message.
 
 Do not upload a real `.env` file or commit tokens.
 
