@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v9-discord-errors-tags-2026-09-09"
+BOT_VERSION = "v10-helper-stats-zero-recovery-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -889,6 +889,7 @@ def parse_card_roster_slots(message_text: str) -> Optional[dict[str, list[dict]]
             nickname = re.sub(r"<@!?\d{15,22}>", "", label)
             nickname = re.sub(r"(?<!\d)#\s*\d{1,5}(?!\d)", "", nickname)
             nickname = nickname.strip(" @|`*_.,")
+            nickname = re.sub(r"^[^\w\[({]+", "", nickname, flags=re.UNICODE)
             nickname = strip_leading_clan_tags(nickname)
             slots.append({
                 "id": short_id,
@@ -908,7 +909,11 @@ def parse_card_roster_slots(message_text: str) -> Optional[dict[str, list[dict]]
     return {"team_a": team_a, "team_b": team_b}
 
 
-def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Optional[dict]:
+def result_from_review_card_and_modal(
+    message_text: str,
+    modal_text: str,
+    visual_audit: Optional[dict] = None,
+) -> Optional[dict]:
     """Use short IDs from `Получить игроков`; fuzzy-match names and absent rows."""
     modal = parse_players_modal(modal_text)
     slots = parse_card_roster_slots(message_text)
@@ -947,6 +952,30 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
         return None
     side_b = "T" if side_a == "CT" else "CT"
 
+    visual_players: list[dict] = []
+    if visual_audit and visual_audit.get("is_scoreboard"):
+        visual_players = [
+            *list(visual_audit.get("left_players", [])),
+            *list(visual_audit.get("right_players", [])),
+        ]
+
+    def visual_stats_for_nickname(nickname: str) -> Optional[tuple[int, int, int]]:
+        if not nickname or not visual_players:
+            return None
+        ranked = sorted(
+            (
+                (nickname_similarity(nickname, player.get("nickname", "")), player)
+                for player in visual_players
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if not ranked or ranked[0][0] < 0.72:
+            return None
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.08:
+            return None
+        return kad(ranked[0][1])
+
     def assign(card: list[dict], helper: list[dict]) -> Optional[list[dict]]:
         assigned: list[Optional[int]] = [None] * 5
         unused = {int(p["id"]) for p in helper}
@@ -954,9 +983,11 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
         for i, player in enumerate(card):
             if player.get("id") is not None:
                 player_id = int(player["id"])
-                if player_id not in unused:
-                    return None
-                assigned[i] = player_id; unused.remove(player_id)
+                # IDs rendered inside Discord display names can be stale.
+                # Trust them only when that ID is present in «Получить игроков».
+                if player_id in unused:
+                    assigned[i] = player_id
+                    unused.remove(player_id)
         # Named helper formats: versus also matches версус/versustop/111versus.
         for i, player in enumerate(card):
             if assigned[i] is not None:
@@ -964,9 +995,6 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
             candidates = [pid for pid in unused if by_id[pid].get("nickname") and nicknames_match(player.get("nickname", ""), by_id[pid]["nickname"])]
             if len(candidates) == 1:
                 assigned[i] = candidates[0]; unused.remove(candidates[0])
-        # Never use the already registered helper statistics. The helper is
-        # authoritative only for short IDs, starting sides and roster order.
-        # The card already contains this match's K/A/D.
         # The helper preserves roster order; then use elimination.
         for i, helper_player in enumerate(helper):
             pid = int(helper_player["id"])
@@ -979,7 +1007,27 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
             return None
         output = []
         for player, pid in zip(card, assigned):
-            kills, assists, deaths = kad(player)
+            helper_player = by_id[int(pid)]
+            helper_raw = (
+                int(helper_player.get("kills", 0) or 0),
+                int(helper_player.get("assists", 0) or 0),
+                int(helper_player.get("deaths", 0) or 0),
+            )
+            # Non-zero statistics from «Получить игроков» are already known
+            # and must not be read again from the screenshot.
+            if helper_raw != (0, 0, 0):
+                kills, assists, deaths = helper_raw
+            else:
+                # Only a 0/0/0 row needs recovery. Find its cleaned nickname
+                # on the final scoreboard (tags such as CLION/OLD are ignored).
+                recovered = visual_stats_for_nickname(str(player.get("nickname", "")))
+                card_stats = kad(player)
+                if recovered is not None and recovered != (0, 0, 13):
+                    kills, assists, deaths = recovered
+                elif card_stats != (0, 0, 13):
+                    kills, assists, deaths = card_stats
+                else:
+                    kills, assists, deaths = (0, 0, 13)
             output.append({"id": int(pid), "nickname": player.get("nickname", ""), "kills": kills, "assists": assists, "deaths": deaths, "confidence": 1.0})
         return output
 
@@ -989,7 +1037,7 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
         return None
     if len({p["id"] for p in [*team_a, *team_b]}) != 10:
         return None
-    return {"is_match_result": True, "match_id": int(match.group(1)), "score_a": score_a, "score_b": score_b, "ct_team": "A" if side_a == "CT" else "B", "team_a": team_a, "team_b": team_b, "overall_confidence": 1.0, "notes": "ID сверены через «Получить игроков»; ники сопоставлены нечётко; отсутствующие игроки зарегистрированы 0/0/13."}
+    return {"is_match_result": True, "match_id": int(match.group(1)), "score_a": score_a, "score_b": score_b, "ct_team": "A" if side_a == "CT" else "B", "team_a": team_a, "team_b": team_b, "overall_confidence": 1.0, "notes": "ID и ненулевая статистика взяты из «Получить игроков»; только строки 0/0/0 восстановлены по очищенному нику на скриншоте или зарегистрированы 0/0/13."}
 
 
 def reconcile_numeric_mentions(result: dict, message_text: str) -> bool:
@@ -1321,6 +1369,7 @@ async def recognize_match(
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
 Return side_left and side_right as CT or T. Transcribe exactly five players per side, top to bottom.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
+For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
 Set confidence below 0.90 if any score or K/A/D digit is unclear. Return only valid JSON."""
     elif score_only:
