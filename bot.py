@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v16-deduplicate-and-retry-2026-09-09"
+BOT_VERSION = "v17-missing-player-0013-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1150,8 +1150,8 @@ def result_from_card_and_visual_audit(
     if (
         confidence < 0.90
         or not (0 <= score_left <= 99 and 0 <= score_right <= 99)
-        or len(left_players) != 5
-        or len(right_players) != 5
+        or len(left_players) not in {4, 5}
+        or len(right_players) not in {4, 5}
     ):
         return None
 
@@ -1167,22 +1167,28 @@ def result_from_card_and_visual_audit(
 
     def best_alignment(
         card_players: list[dict], visual_players: list[dict]
-    ) -> tuple[tuple[int, ...], float, float]:
-        best_order: tuple[int, ...] = tuple(range(5))
+    ) -> tuple[tuple[Optional[int], ...], float, float]:
+        visible_count = len(visual_players)
+        best_order: tuple[Optional[int], ...] = tuple([None] * 5)
         best_average = -1.0
         best_minimum = -1.0
-        for order in permutations(range(5)):
+        # Assign every visible scoreboard row to one unique player from the
+        # five-player card roster. An unmatched card player is absent.
+        for card_order in permutations(range(5), visible_count):
             scores = [
                 nickname_similarity(
-                    card_player.get("nickname", ""),
+                    card_players[card_index].get("nickname", ""),
                     visual_players[visual_index].get("nickname", ""),
                 )
-                for card_player, visual_index in zip(card_players, order)
+                for visual_index, card_index in enumerate(card_order)
             ]
-            average = sum(scores) / 5
+            average = sum(scores) / visible_count
             minimum = min(scores)
             if (average, minimum) > (best_average, best_minimum):
-                best_order = tuple(order)
+                mapping: list[Optional[int]] = [None] * 5
+                for visual_index, card_index in enumerate(card_order):
+                    mapping[card_index] = visual_index
+                best_order = tuple(mapping)
                 best_average = average
                 best_minimum = minimum
         return best_order, best_average, best_minimum
@@ -1225,10 +1231,21 @@ def result_from_card_and_visual_audit(
     def merge_team(
         card_players: list[dict],
         visual_players: list[dict],
-        order: tuple[int, ...],
+        order: tuple[Optional[int], ...],
     ) -> list[dict]:
         merged: list[dict] = []
         for card_player, visual_index in zip(card_players, order):
+            if visual_index is None:
+                merged.append(
+                    {
+                        "id": int(card_player["id"]),
+                        "nickname": str(card_player.get("nickname", "")),
+                        "kills": 0,
+                        "assists": 0,
+                        "deaths": 13,
+                    }
+                )
+                continue
             visual_player = visual_players[visual_index]
             kills = int(visual_player["kills"])
             assists = int(visual_player["assists"])
@@ -1261,7 +1278,8 @@ def result_from_card_and_visual_audit(
         "overall_confidence": confidence,
         "notes": (
             "ID и ники взяты из карточки; счёт, стороны и K/A/D — только "
-            "из исходного скриншота. «Получить игроков» не использовалось."
+            "из исходного скриншота. Отсутствующий на табло игрок получает "
+            "0/0/13. «Получить игроков» не использовалось."
         ),
     }
 
@@ -1618,7 +1636,10 @@ def full_match_diagnostics(
         add_players("КОМАНДА A:", list(result.get("team_a", [])))
         add_players("КОМАНДА B:", list(result.get("team_b", [])))
     else:
-        slots = parse_card_roster_slots(message_text)
+        slots = (
+            parse_card_roster_slots(message_text)
+            or parse_card_roster_identities(message_text)
+        )
         add_players("КОМАНДА A ИЗ КАРТОЧКИ:", slots["team_a"] if slots else [])
         add_players("КОМАНДА B ИЗ КАРТОЧКИ:", slots["team_b"] if slots else [])
 
@@ -1712,8 +1733,8 @@ async def recognize_match(
                 "score_right": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
                 "side_left": {"type": ["string", "null"], "enum": ["CT", "T", None]},
                 "side_right": {"type": ["string", "null"], "enum": ["CT", "T", None]},
-                "left_players": {"type": "array", "items": visual_player_schema, "minItems": 5, "maxItems": 5},
-                "right_players": {"type": "array", "items": visual_player_schema, "minItems": 5, "maxItems": 5},
+                "left_players": {"type": "array", "items": visual_player_schema, "minItems": 4, "maxItems": 5},
+                "right_players": {"type": "array", "items": visual_player_schema, "minItems": 4, "maxItems": 5},
                 "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "notes": {"type": "string"},
             },
@@ -1724,7 +1745,7 @@ async def recognize_match(
     if visual_audit:
         prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
-Return side_left and side_right as CT or T. Transcribe exactly five players per side, top to bottom.
+Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain four visible rows when one player is absent; never invent a fifth row.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
 For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
