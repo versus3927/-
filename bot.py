@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v18-two-registration-modes-2026-09-09"
+BOT_VERSION = "v19-multiple-missing-players-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1150,8 +1150,8 @@ def result_from_card_and_visual_audit(
     if (
         confidence < 0.90
         or not (0 <= score_left <= 99 and 0 <= score_right <= 99)
-        or len(left_players) not in {4, 5}
-        or len(right_players) not in {4, 5}
+        or len(left_players) not in {3, 4, 5}
+        or len(right_players) not in {3, 4, 5}
     ):
         return None
 
@@ -1234,7 +1234,7 @@ def result_from_card_and_visual_audit(
 
     if (
         chosen_count < 8
-        or min(alignment_a[1], alignment_b[1]) < 4
+        or min(alignment_a[1], alignment_b[1]) < 3
         or min(alignment_a[3], alignment_b[3]) < 0.72
         or (
             chosen_count == other_count
@@ -1776,8 +1776,8 @@ async def recognize_match(
                 "score_right": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
                 "side_left": {"type": ["string", "null"], "enum": ["CT", "T", None]},
                 "side_right": {"type": ["string", "null"], "enum": ["CT", "T", None]},
-                "left_players": {"type": "array", "items": visual_player_schema, "minItems": 4, "maxItems": 5},
-                "right_players": {"type": "array", "items": visual_player_schema, "minItems": 4, "maxItems": 5},
+                "left_players": {"type": "array", "items": visual_player_schema, "minItems": 3, "maxItems": 5},
+                "right_players": {"type": "array", "items": visual_player_schema, "minItems": 3, "maxItems": 5},
                 "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "notes": {"type": "string"},
             },
@@ -1788,7 +1788,7 @@ async def recognize_match(
     if visual_audit:
         prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
-Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain four visible rows when one player is absent; never invent a fifth row.
+Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain three or four visible rows when players are absent; never invent missing rows.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
 For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
