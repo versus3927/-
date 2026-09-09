@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v13-card-ids-no-helper-2026-09-09"
+BOT_VERSION = "v16-deduplicate-and-retry-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -194,6 +194,15 @@ def load_registration_records() -> list[dict]:
     except Exception:
         log.exception("Не удалось прочитать файл статистики %s", STATS_FILE)
         return []
+
+
+async def registration_exists(match_id: int) -> bool:
+    """Return whether this match is already present in persistent history."""
+    async with stats_lock:
+        return any(
+            str(item.get("match_id")) == str(match_id)
+            for item in load_registration_records()
+        )
 
 
 async def record_registration(match_id: int) -> bool:
@@ -2003,6 +2012,56 @@ def plain_message_text(message: discord.Message) -> str:
     return "\n".join(chunks)
 
 
+async def delete_duplicate_match_cards(
+    source_message: discord.Message,
+    match_id: int,
+    keep_current: bool = False,
+) -> int:
+    """Delete duplicate source cards for one match from this channel.
+
+    Only image result cards with the exact `Результат матча #N` title are
+    touched. Registration commands and confirmation messages are preserved.
+    """
+    candidates: dict[int, discord.Message] = {source_message.id: source_message}
+    try:
+        async for candidate in source_message.channel.history(limit=BACKFILL_LIMIT):
+            candidates[candidate.id] = candidate
+    except Exception:
+        log.exception(
+            "Не удалось просмотреть канал для удаления дублей матча #%s",
+            match_id,
+        )
+
+    deleted = 0
+    for candidate in candidates.values():
+        if keep_current and candidate.id == source_message.id:
+            continue
+        if not image_urls(candidate):
+            continue
+        text = plain_message_text(candidate)
+        found = re.search(r"Результат\s+матча\s*#\s*(\d+)", text, re.I)
+        if not found or int(found.group(1)) != int(match_id):
+            continue
+        try:
+            await candidate.delete()
+            deleted += 1
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            log.warning(
+                "Нет права удалить дубль сообщения %s матча #%s",
+                candidate.id,
+                match_id,
+            )
+        except Exception:
+            log.exception(
+                "Не удалось удалить дубль сообщения %s матча #%s",
+                candidate.id,
+                match_id,
+            )
+    return deleted
+
+
 async def wait_for_registration_confirmation(
     sent_registration: discord.Message,
     match_id: int,
@@ -2051,11 +2110,34 @@ async def process_upload(message: discord.Message) -> None:
                     "Матч #%s уже обрабатывается — повторная карточка пропущена",
                     reserved_match_id,
                 )
+                # Do not mark this duplicate as permanently inspected. If the
+                # active copy fails, the next `старт` may retry this one.
+                processed_message_ids.discard(message.id)
                 return
             processing_match_ids.add(reserved_match_id)
 
+    processing_completed = False
     async with message.channel.typing():
         try:
+            # If this match was already confirmed earlier, no recognition or
+            # second registration is needed. Remove every repeated result
+            # card for it from the registration channel immediately.
+            if (
+                reserved_match_id is not None
+                and await registration_exists(reserved_match_id)
+            ):
+                deleted = await delete_duplicate_match_cards(
+                    message,
+                    reserved_match_id,
+                )
+                log.info(
+                    "Матч #%s уже зарегистрирован; удалено карточек-дублей: %s",
+                    reserved_match_id,
+                    deleted,
+                )
+                processing_completed = True
+                return
+
             # The button workflow is reserved strictly for cards whose own
             # title/status says `на проверку`. Ordinary matches must go
             # directly through the normal registration path even if the
@@ -2251,7 +2333,13 @@ async def process_upload(message: discord.Message) -> None:
             command_text = format_registration(result)
             match_id = int(result["match_id"])
             if not await record_registration(match_id):
-                log.info("Матч #%s уже зарегистрирован — повтор пропущен", match_id)
+                deleted = await delete_duplicate_match_cards(message, match_id)
+                log.info(
+                    "Матч #%s уже зарегистрирован — удалено карточек-дублей: %s",
+                    match_id,
+                    deleted,
+                )
+                processing_completed = True
                 return
 
             await asyncio.sleep(SEND_DELAY)
@@ -2292,24 +2380,18 @@ async def process_upload(message: discord.Message) -> None:
                         result.get("match_id"),
                     )
 
-            if DELETE_SOURCE_AFTER_REGISTRATION:
-                await asyncio.sleep(SOURCE_DELETE_DELAY)
-                try:
-                    await message.delete()
-                except discord.NotFound:
-                    # Исходная карточка уже удалена автоматически.
-                    pass
-                except discord.Forbidden:
-                    log.warning(
-                        "Нет права удалить исходное сообщение %s в канале %s",
-                        message.id,
-                        message.channel.id,
-                    )
-                except Exception:
-                    log.exception(
-                        "Не удалось удалить исходное сообщение матча #%s",
-                        result.get("match_id"),
-                    )
+            await asyncio.sleep(SOURCE_DELETE_DELAY)
+            deleted_duplicates = await delete_duplicate_match_cards(
+                message,
+                match_id,
+                keep_current=not DELETE_SOURCE_AFTER_REGISTRATION,
+            )
+            log.info(
+                "Матч #%s подтверждён; удалено карточек-дублей: %s",
+                match_id,
+                deleted_duplicates,
+            )
+            processing_completed = True
             log.info(
                 "Матч #%s ��спешно отправлен в канал %s",
                 result["match_id"],
@@ -2330,6 +2412,9 @@ async def process_upload(message: discord.Message) -> None:
                 "Необработанное исключение в process_upload.", diagnostics,
             )
         finally:
+            if not processing_completed:
+                # Keep failed cards retryable during the same bot session.
+                processed_message_ids.discard(message.id)
             if reserved_match_id is not None:
                 async with processing_match_lock:
                     processing_match_ids.discard(reserved_match_id)
