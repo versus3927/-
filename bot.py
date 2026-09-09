@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v25-forwarded-test-only-2026-09-09"
+BOT_VERSION = "v26-log-original-card-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2128,6 +2128,46 @@ def format_registration(result: dict) -> str:
     return "\n".join(lines)
 
 
+async def send_original_card_to_log(
+    source_message: discord.Message,
+    log_channel,
+    match_id: int,
+) -> None:
+    """Forward the original game card to logs, with a readable fallback."""
+    forward_message = getattr(source_message, "forward", None)
+    if callable(forward_message):
+        try:
+            await forward_message(log_channel)
+            return
+        except TypeError:
+            try:
+                await forward_message(destination=log_channel)
+                return
+            except Exception:
+                log.warning(
+                    "Не удалось переслать исходную карточку матча #%s; "
+                    "используется резервная копия",
+                    match_id,
+                    exc_info=True,
+                )
+        except Exception:
+            log.warning(
+                "Не удалось переслать исходную карточку матча #%s; "
+                "используется резервная копия",
+                match_id,
+                exc_info=True,
+            )
+
+    source_text = plain_message_text(source_message).strip()
+    source_urls = image_urls(source_message)
+    urls_text = "\n".join(source_urls[:4])
+    prefix = f"🖼 Исходная карточка игры #{match_id}\n"
+    available = max(0, 1990 - len(prefix) - len(urls_text))
+    clipped_text = source_text[:available]
+    chunks = [prefix.rstrip(), clipped_text, urls_text]
+    await log_channel.send("\n".join(chunk for chunk in chunks if chunk).strip())
+
+
 async def send_registration_log(
     result: dict,
     source_message: discord.Message,
@@ -2147,6 +2187,11 @@ async def send_registration_log(
             f"Счёт: {result['score_a']}:{result['score_b']}\n"
             f"Источник: <#{source_message.channel.id}>\n"
             f"```text\n{command_text}\n```"
+        )
+        await send_original_card_to_log(
+            source_message,
+            log_channel,
+            int(result["match_id"]),
         )
     except Exception:
         log.exception(

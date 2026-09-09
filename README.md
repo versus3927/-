@@ -10,7 +10,7 @@ Set these in **Variables**:
 - `GEMINI_BASE_URL` — provider base URL. For AI STAR OpenAI-compatible requests use `https://ai.starimg.ru/v1`; for official Google omit it.
 - `NORMAL_CHANNEL_IDS` — comma-separated IDs of ordinary-game channels.
 - `PRIORITY_CHANNEL_IDS` — comma-separated IDs of priority-game channels.
-- `LOG_CHANNEL_ID` — ID of the channel that receives every successful registration, including match number, score, source, and full command.
+- `LOG_CHANNEL_ID` — ID of the channel that receives every successful registration, including match number, score, full command, and the original game card. The source is forwarded when Discord supports it; otherwise the bot posts a readable copy with the source image links.
 - `MY_ACCOUNT_ID` — Discord user ID displayed by the `бот ты тут?` status command. It does not restrict command access.
 - `MIN_CONFIDENCE` — default `0.82`.
 - `BACKFILL_LIMIT` — how many previous messages to inspect in each selected channel; default `500`.
@@ -46,6 +46,7 @@ Set these in **Variables**:
 13. Send `удалить рег соо` to scan the complete history of every channel listed in `NORMAL_CHANNEL_IDS` and `PRIORITY_CHANNEL_IDS` and delete all old successful `Готово — Матч #... закрыт со счётом...` messages. Other messages, including `Не вышло`, are not touched.
 14. Send `бот ты тут?` to receive readiness, current session, the Discord nickname resolved from `MY_ACCOUNT_ID`, active channels, uptime, latency, registration counters, model/key counts, and a self-contained HTML status report. Tokens and API-key values are never included. All Discord users may run all commands.
 15. For testing, forward a game card with its screenshot into any chat outside the currently active registration channels. The bot uses the same unchanged recognition algorithm and replies with only the generated `=g` registration message. Test previews are not saved to statistics, do not wait for `Готово`, and do not delete the forwarded source message.
+16. After a real registration receives `Готово`, the log channel gets both the registration summary and the original game card. This happens before source-card cleanup, so the log copy remains available afterward.
 
 Do not upload a real `.env` file or commit tokens.
 
