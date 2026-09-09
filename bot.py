@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v8-full-stats-diagnostics-2026-09-09"
+BOT_VERSION = "v9-discord-errors-tags-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -87,9 +87,28 @@ _CYRILLIC_TO_LATIN = str.maketrans(
 
 def normalize_nickname(value: object) -> str:
     """Normalize tags, punctuation and Cyrillic/Latin spelling for matching."""
-    text = unicodedata.normalize("NFKD", str(value)).casefold()
+    text = strip_leading_clan_tags(str(value))
+    text = unicodedata.normalize("NFKD", text).casefold()
     text = text.translate(_CYRILLIC_TO_LATIN)
     return "".join(character for character in text if character.isalnum())
+
+
+def strip_leading_clan_tags(value: str) -> str:
+    """Drop faded clan tags like [CLION] or plain `CLION` before the real nick."""
+    text = str(value).strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"^\s*[\[({][^\])}]{1,20}[\])}]\s*", "", text)
+        # Discord may render a role/clan prefix without brackets, for example
+        # `CLION 1331` or `CLION | 1331`. Only an all-uppercase/digit prefix is
+        # removed; the actual nickname is everything after it.
+        text = re.sub(
+            r"^\s*[A-ZА-ЯЁ0-9]{2,16}(?:\s*[|:·•\-–—]\s*|\s+)(?=\S)",
+            "",
+            text,
+        )
+    return text.strip()
 
 
 def nickname_similarity(first: object, second: object) -> float:
@@ -479,14 +498,14 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
             while pending:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    return None
+                    return None, []
                 done, pending = await asyncio.wait(
                     pending,
                     timeout=remaining,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    return None
+                    return None, []
                 for completed in done:
                     with contextlib.suppress(Exception):
                         response_text = extract_player_modal_text(completed.result())
@@ -870,6 +889,7 @@ def parse_card_roster_slots(message_text: str) -> Optional[dict[str, list[dict]]
             nickname = re.sub(r"<@!?\d{15,22}>", "", label)
             nickname = re.sub(r"(?<!\d)#\s*\d{1,5}(?!\d)", "", nickname)
             nickname = nickname.strip(" @|`*_.,")
+            nickname = strip_leading_clan_tags(nickname)
             slots.append({
                 "id": short_id,
                 "nickname": nickname,
@@ -944,17 +964,9 @@ def result_from_review_card_and_modal(message_text: str, modal_text: str) -> Opt
             candidates = [pid for pid in unused if by_id[pid].get("nickname") and nicknames_match(player.get("nickname", ""), by_id[pid]["nickname"])]
             if len(candidates) == 1:
                 assigned[i] = candidates[0]; unused.remove(candidates[0])
-        # Match registered stats only AFTER every visible short ID has been
-        # reserved. Therefore, when two players have identical K/A/D and only
-        # one has a long Discord ID, the long-ID slot receives the remaining
-        # short ID instead of being rejected as ambiguous.
-        # 0/0/0 and 0/0/13 are always equivalent absence.
-        for i, player in enumerate(card):
-            if assigned[i] is not None:
-                continue
-            candidates = [pid for pid in unused if kad(player) == kad(by_id[pid])]
-            if len(candidates) == 1:
-                assigned[i] = candidates[0]; unused.remove(candidates[0])
+        # Never use the already registered helper statistics. The helper is
+        # authoritative only for short IDs, starting sides and roster order.
+        # The card already contains this match's K/A/D.
         # The helper preserves roster order; then use elimination.
         for i, helper_player in enumerate(helper):
             pid = int(helper_player["id"])
@@ -1546,6 +1558,38 @@ async def send_registration_log(
         )
 
 
+async def send_processing_error_log(
+    match_id: object,
+    source_message: discord.Message,
+    reason: str,
+    diagnostics: str,
+) -> None:
+    """Send processing errors, score and all player stats to the Discord log channel."""
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        log_channel = client.get_channel(LOG_CHANNEL_ID)
+        if log_channel is None:
+            log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
+        header = (
+            f"❌ Ошибка регистрации игры #{match_id}\n"
+            f"Причина: {reason[:500]}\n"
+            f"Источник: <#{source_message.channel.id}>\n"
+        )
+        # Discord messages are limited to 2000 characters. Send the complete
+        # diagnostics in ordered chunks so no player row is lost.
+        chunks = [diagnostics[index:index + 1700] for index in range(0, len(diagnostics), 1700)] or ["Диагностика отсутствует"]
+        for index, chunk in enumerate(chunks):
+            prefix = header if index == 0 else f"❌ Игра #{match_id}, продолжение {index + 1}\n"
+            await log_channel.send(f"{prefix}```text\n{chunk}\n```")
+    except Exception:
+        log.exception(
+            "Не удалось отправить Discord-лог ошибки матча #%s в канал %s",
+            match_id,
+            LOG_CHANNEL_ID,
+        )
+
+
 def plain_message_text(message: discord.Message) -> str:
     chunks: list[str] = []
     for part in message_parts(message):
@@ -1633,23 +1677,35 @@ async def process_upload(message: discord.Message) -> None:
             if review_card:
                 modal_text, _helper_image_urls = await get_players_response(message)
                 if not modal_text:
+                    diagnostics = full_match_diagnostics(context)
                     log.error(
                         "Матч #%s: ошибка карточки на проверку: не удалось открыть/прочитать «Получить игроков». Прочитанный счёт=%s. context=%r\n%s",
                         reserved_match_id or "?",
                         f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
                         context[:4000],
-                        full_match_diagnostics(context),
+                        diagnostics,
+                    )
+                    await send_processing_error_log(
+                        reserved_match_id or "?", message,
+                        "Не удалось открыть/прочитать «Получить игроков».",
+                        diagnostics,
                     )
                     return
                 result = result_from_review_card_and_modal(context, modal_text)
                 if result is None:
+                    diagnostics = full_match_diagnostics(context, modal_text)
                     log.error(
                         "Матч #%s: ошибка разбора карточки/ответа «Получить игроков». Прочитанный счёт=%s. context=%r modal=%r. Старый AI-валидатор не запускается.\n%s",
                         reserved_match_id or "?",
                         f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
                         context[:4000],
                         modal_text[:2500],
-                        full_match_diagnostics(context, modal_text),
+                        diagnostics,
+                    )
+                    await send_processing_error_log(
+                        reserved_match_id or "?", message,
+                        "Не удалось сопоставить карточку с «Получить игроков».",
+                        diagnostics,
                     )
                     return
             else:
@@ -1669,12 +1725,17 @@ async def process_upload(message: discord.Message) -> None:
             returned_ids = [player.get("id") for player in returned_players]
             if len(expected_ids) == 10 and len(returned_ids) == 10:
                 if set(returned_ids) != set(expected_ids):
+                    diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                     log.error(
                         "Матч #%s пропущен: ID модели %s не совпали с карточкой %s\n%s",
                         result.get("match_id"),
                         returned_ids,
                         expected_ids,
-                        full_match_diagnostics(context, modal_text if review_card else None, result),
+                        diagnostics,
+                    )
+                    await send_processing_error_log(
+                        result.get("match_id") or reserved_match_id or "?", message,
+                        "ID результата не совпали с ID карточки.", diagnostics,
                     )
                     return
             positional_ids = [1, 2, 3, 4, 5, 5, 4, 3, 2, 1]
@@ -1682,11 +1743,16 @@ async def process_upload(message: discord.Message) -> None:
                 len(returned_ids) == 10
                 and all(isinstance(value, int) and 1 <= value <= 5 for value in returned_ids)
             ):
+                diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                 log.error(
                     "Матч #%s пропущен: модель выдумала позиционные ID %s\n%s",
                     result.get("match_id"),
                     returned_ids,
-                    full_match_diagnostics(context, modal_text if review_card else None, result),
+                    diagnostics,
+                )
+                await send_processing_error_log(
+                    result.get("match_id") or reserved_match_id or "?", message,
+                    "Получены выдуманные позиционные ID.", diagnostics,
                 )
                 return
 
@@ -1700,6 +1766,7 @@ async def process_upload(message: discord.Message) -> None:
                 or len(result.get("team_b", [])) != 5
             )
             if fatal:
+                diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                 log.error(
                     "Матч #%s: не удалось собрать структуру. Прочитанный счёт=%s:%s. result=%r Notes=%s\n%s",
                     result.get("match_id") or reserved_match_id or "?",
@@ -1707,12 +1774,17 @@ async def process_upload(message: discord.Message) -> None:
                     result.get("score_b"),
                     result,
                     result.get("notes", ""),
-                    full_match_diagnostics(context, modal_text if review_card else None, result),
+                    diagnostics,
+                )
+                await send_processing_error_log(
+                    result.get("match_id") or reserved_match_id or "?", message,
+                    "Не удалось собрать полную структуру матча.", diagnostics,
                 )
                 return
 
             confidence = float(result.get("overall_confidence", 0))
             if confidence < MIN_CONFIDENCE:
+                diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                 log.warning(
                     "Матч #%s распознан с низкой уверенностью %.2f. Прочитанный счёт=%s:%s. result=%r Notes=%s\n%s",
                     result.get("match_id") or reserved_match_id or "?",
@@ -1721,7 +1793,11 @@ async def process_upload(message: discord.Message) -> None:
                     result.get("score_b"),
                     result,
                     result.get("notes", ""),
-                    full_match_diagnostics(context, modal_text if review_card else None, result),
+                    diagnostics,
+                )
+                await send_processing_error_log(
+                    result.get("match_id") or reserved_match_id or "?", message,
+                    f"Низкая уверенность распознавания: {confidence:.2f}.", diagnostics,
                 )
                 return
 
@@ -1732,11 +1808,16 @@ async def process_upload(message: discord.Message) -> None:
                 or any(not isinstance(value, int) or value <= 0 for value in player_ids)
                 or len(set(player_ids)) != 10
             ):
+                diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                 log.error(
                     "Матч #%s не отправлен: недопустимые или повторяющиеся ID %s\n%s",
                     result.get("match_id"),
                     player_ids,
-                    full_match_diagnostics(context, modal_text if review_card else None, result),
+                    diagnostics,
+                )
+                await send_processing_error_log(
+                    result.get("match_id") or reserved_match_id or "?", message,
+                    "Недопустимые или повторяющиеся ID игроков.", diagnostics,
                 )
                 return
 
@@ -1808,13 +1889,18 @@ async def process_upload(message: discord.Message) -> None:
                 message.channel.id,
             )
         except Exception:
+            diagnostics = full_match_diagnostics(
+                context,
+                locals().get("modal_text"),
+                locals().get("result"),
+            )
             log.exception(
                 "Ошибка обработки файла в process_upload.\n%s",
-                full_match_diagnostics(
-                    context,
-                    locals().get("modal_text"),
-                    locals().get("result"),
-                ),
+                diagnostics,
+            )
+            await send_processing_error_log(
+                reserved_match_id or "?", message,
+                "Необработанное исключение в process_upload.", diagnostics,
             )
         finally:
             if reserved_match_id is not None:
