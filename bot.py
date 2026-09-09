@@ -21,7 +21,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v11-ephemeral-capture-2026-09-09"
+BOT_VERSION = "v13-card-ids-no-helper-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -115,10 +115,15 @@ def nickname_similarity(first: object, second: object) -> float:
     """Match names such as versus/версус/versustop/111versus."""
     left = normalize_nickname(first)
     right = normalize_nickname(second)
-    if not left or not right or left.isdigit() or right.isdigit():
+    if not left or not right:
         return 0.0
     if left == right:
         return 1.0
+    # Numeric nicknames are valid in STANDOFF 2 (for example `51`).  They are
+    # safe only as an exact match; fuzzy numeric matching would confuse them
+    # with player IDs and scoreboard values.
+    if left.isdigit() or right.isdigit():
+        return 0.0
 
     left_without_edge_digits = re.sub(r"^\d+|\d+$", "", left)
     right_without_edge_digits = re.sub(r"^\d+|\d+$", "", right)
@@ -753,6 +758,127 @@ def result_from_visual_audit(
                 best_minimum = minimum
         return best_order, best_average, best_minimum
 
+    # Current review cards contain only `#ID nickname` roster lines, while
+    # «Получить игроков» contains the same IDs split into the authoritative
+    # starting CT/T groups and zeroed statistics.  Enrich those IDs with card
+    # nicknames, then take score and K/A/D exclusively from the screenshot.
+    card_rosters = parse_card_roster_identities(message_text)
+    if card_rosters is not None:
+        card_a = card_rosters["team_a"]
+        card_b = card_rosters["team_b"]
+        ids_a = {int(player["id"]) for player in card_a}
+        ids_b = {int(player["id"]) for player in card_b}
+        ids_ct = {int(player["id"]) for player in parsed["CT"]}
+        ids_t = {int(player["id"]) for player in parsed["T"]}
+
+        if ids_a == ids_ct and ids_b == ids_t:
+            ct_team = "A"
+        elif ids_a == ids_t and ids_b == ids_ct:
+            ct_team = "B"
+        else:
+            direct_ids = len(ids_a & ids_ct) + len(ids_b & ids_t)
+            swapped_ids = len(ids_a & ids_t) + len(ids_b & ids_ct)
+            if max(direct_ids, swapped_ids) < 8 or abs(direct_ids - swapped_ids) < 2:
+                log.error(
+                    "Матч #%s: ID карточки неоднозначно сопоставлены с CT/T "
+                    "(direct=%s swapped=%s).",
+                    match.group(1), direct_ids, swapped_ids,
+                )
+                return None
+            ct_team = "A" if direct_ids > swapped_ids else "B"
+
+        direct_a = best_alignment(card_a, left_players)
+        direct_b = best_alignment(card_b, right_players)
+        swapped_a = best_alignment(card_a, right_players)
+        swapped_b = best_alignment(card_b, left_players)
+        direct_names = direct_a[1] + direct_b[1]
+        swapped_names = swapped_a[1] + swapped_b[1]
+
+        if direct_names >= swapped_names:
+            chosen_names, other_names = direct_names, swapped_names
+            alignment_a, alignment_b = direct_a, direct_b
+            visual_a, visual_b = left_players, right_players
+            score_a, score_b = score_left, score_right
+            visual_side_a = str(audit.get("side_left") or "").upper()
+            visual_side_b = str(audit.get("side_right") or "").upper()
+        else:
+            chosen_names, other_names = swapped_names, direct_names
+            alignment_a, alignment_b = swapped_a, swapped_b
+            visual_a, visual_b = right_players, left_players
+            score_a, score_b = score_right, score_left
+            visual_side_a = str(audit.get("side_right") or "").upper()
+            visual_side_b = str(audit.get("side_left") or "").upper()
+
+        expected_side_a = "CT" if ct_team == "A" else "T"
+        expected_side_b = "T" if ct_team == "A" else "CT"
+        if (
+            visual_side_a in {"CT", "T"}
+            and visual_side_a != expected_side_a
+        ) or (
+            visual_side_b in {"CT", "T"}
+            and visual_side_b != expected_side_b
+        ):
+            log.error(
+                "Матч #%s: стороны скриншота %s/%s противоречат ID окна "
+                "игроков (Team A=%s).",
+                match.group(1), visual_side_a, visual_side_b, expected_side_a,
+            )
+            return None
+
+        if (
+            chosen_names / 2 < 0.78
+            or min(alignment_a[2], alignment_b[2]) < 0.55
+            or chosen_names - other_names < 0.08
+        ):
+            log.error(
+                "Матч #%s: ники карточки неоднозначно сопоставлены со "
+                "скриншотом (direct=%.3f swapped=%.3f).",
+                match.group(1), direct_names, swapped_names,
+            )
+            return None
+
+        def merge_card_team(
+            card_players: list[dict],
+            visual_players: list[dict],
+            order: tuple[int, ...],
+        ) -> list[dict]:
+            merged: list[dict] = []
+            for card_player, visual_index in zip(card_players, order):
+                visual_player = visual_players[visual_index]
+                kills = int(visual_player["kills"])
+                assists = int(visual_player["assists"])
+                deaths = int(visual_player["deaths"])
+                if kills == 0 and assists == 0 and deaths == 0:
+                    deaths = 13
+                merged.append(
+                    {
+                        "id": int(card_player["id"]),
+                        "nickname": str(
+                            visual_player.get("nickname")
+                            or card_player.get("nickname", "")
+                        ),
+                        "kills": kills,
+                        "assists": assists,
+                        "deaths": deaths,
+                    }
+                )
+            return merged
+
+        return {
+            "is_match_result": True,
+            "match_id": int(match.group(1)),
+            "score_a": score_a,
+            "score_b": score_b,
+            "ct_team": ct_team,
+            "team_a": merge_card_team(card_a, visual_a, alignment_a[0]),
+            "team_b": merge_card_team(card_b, visual_b, alignment_b[0]),
+            "overall_confidence": confidence,
+            "notes": (
+                "ID и стороны взяты из «Получить игроков»; ники — из "
+                "карточки; счёт и K/A/D — только из исходного скриншота."
+            ),
+        }
+
     direct_ct = best_alignment(parsed["CT"], left_players)
     direct_t = best_alignment(parsed["T"], right_players)
     swapped_ct = best_alignment(parsed["CT"], right_players)
@@ -938,6 +1064,197 @@ def parse_card_roster_slots(message_text: str) -> Optional[dict[str, list[dict]]
     if len(team_a) != 5 or len(team_b) != 5:
         return None
     return {"team_a": team_a, "team_b": team_b}
+
+
+def parse_card_roster_identities(
+    message_text: str,
+) -> Optional[dict[str, list[dict]]]:
+    """Read review-card rosters that contain only `#ID nickname` lines.
+
+    New review cards no longer print K/A/D in their text.  The IDs and names
+    still identify the two card teams; the actual score and statistics must
+    be read from the original scoreboard image.
+    """
+    header_a = re.search(r"Команда\s*A[^\n]*", message_text, re.I)
+    header_b = re.search(r"Команда\s*B[^\n]*", message_text, re.I)
+    if not header_a or not header_b or header_b.start() <= header_a.start():
+        return None
+
+    def parse_section(section: str) -> list[dict]:
+        players: list[dict] = []
+        for raw_line in section.splitlines():
+            line = raw_line.strip().strip("`*_")
+            found = re.match(
+                r"^[•·-]?\s*@?\s*#\s*(\d{1,5})\s*(?:\|\s*)?(.+?)\s*$",
+                line,
+            )
+            if not found:
+                continue
+            nickname = re.sub(
+                r"\s*[—–-]\s*\d+\s*/\s*\d+\s*/\s*\d+\s*$",
+                "",
+                found.group(2),
+            ).strip(" @|`*_.,")
+            if not nickname:
+                continue
+            players.append(
+                {
+                    "id": int(found.group(1)),
+                    "nickname": strip_leading_clan_tags(nickname),
+                    "kills": 0,
+                    "assists": 0,
+                    "deaths": 0,
+                }
+            )
+            if len(players) == 5:
+                break
+        return players
+
+    team_a = parse_section(message_text[header_a.end():header_b.start()])
+    team_b = parse_section(message_text[header_b.end():])
+    if len(team_a) != 5 or len(team_b) != 5:
+        return None
+    all_ids = [player["id"] for player in [*team_a, *team_b]]
+    if len(set(all_ids)) != 10:
+        return None
+    return {"team_a": team_a, "team_b": team_b}
+
+
+def result_from_card_and_visual_audit(
+    message_text: str,
+    audit: dict,
+) -> Optional[dict]:
+    """Build a result from card IDs/nicks and the original scoreboard only."""
+    rosters = parse_card_roster_identities(message_text)
+    match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
+    if rosters is None or match is None or not audit.get("is_scoreboard"):
+        return None
+
+    try:
+        confidence = float(audit.get("overall_confidence", 0) or 0)
+        score_left = int(audit["score_left"])
+        score_right = int(audit["score_right"])
+        left_players = list(audit["left_players"])
+        right_players = list(audit["right_players"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        confidence < 0.90
+        or not (0 <= score_left <= 99 and 0 <= score_right <= 99)
+        or len(left_players) != 5
+        or len(right_players) != 5
+    ):
+        return None
+
+    def valid_visual_player(player: dict) -> bool:
+        try:
+            values = [int(player[key]) for key in ("kills", "assists", "deaths")]
+        except (KeyError, TypeError, ValueError):
+            return False
+        return all(0 <= value <= 100 for value in values)
+
+    if not all(valid_visual_player(player) for player in [*left_players, *right_players]):
+        return None
+
+    def best_alignment(
+        card_players: list[dict], visual_players: list[dict]
+    ) -> tuple[tuple[int, ...], float, float]:
+        best_order: tuple[int, ...] = tuple(range(5))
+        best_average = -1.0
+        best_minimum = -1.0
+        for order in permutations(range(5)):
+            scores = [
+                nickname_similarity(
+                    card_player.get("nickname", ""),
+                    visual_players[visual_index].get("nickname", ""),
+                )
+                for card_player, visual_index in zip(card_players, order)
+            ]
+            average = sum(scores) / 5
+            minimum = min(scores)
+            if (average, minimum) > (best_average, best_minimum):
+                best_order = tuple(order)
+                best_average = average
+                best_minimum = minimum
+        return best_order, best_average, best_minimum
+
+    card_a = rosters["team_a"]
+    card_b = rosters["team_b"]
+    direct_a = best_alignment(card_a, left_players)
+    direct_b = best_alignment(card_b, right_players)
+    swapped_a = best_alignment(card_a, right_players)
+    swapped_b = best_alignment(card_b, left_players)
+    direct_names = direct_a[1] + direct_b[1]
+    swapped_names = swapped_a[1] + swapped_b[1]
+
+    if direct_names >= swapped_names:
+        chosen_names, other_names = direct_names, swapped_names
+        alignment_a, alignment_b = direct_a, direct_b
+        visual_a, visual_b = left_players, right_players
+        score_a, score_b = score_left, score_right
+        side_a = str(audit.get("side_left") or "").upper()
+    else:
+        chosen_names, other_names = swapped_names, direct_names
+        alignment_a, alignment_b = swapped_a, swapped_b
+        visual_a, visual_b = right_players, left_players
+        score_a, score_b = score_right, score_left
+        side_a = str(audit.get("side_right") or "").upper()
+
+    if (
+        chosen_names / 2 < 0.78
+        or min(alignment_a[2], alignment_b[2]) < 0.55
+        or chosen_names - other_names < 0.08
+        or side_a not in {"CT", "T"}
+    ):
+        log.error(
+            "Матч #%s: карточка неоднозначно сопоставлена с исходным табло "
+            "(direct=%.3f swapped=%.3f side_a=%s).",
+            match.group(1), direct_names, swapped_names, side_a or "?",
+        )
+        return None
+
+    def merge_team(
+        card_players: list[dict],
+        visual_players: list[dict],
+        order: tuple[int, ...],
+    ) -> list[dict]:
+        merged: list[dict] = []
+        for card_player, visual_index in zip(card_players, order):
+            visual_player = visual_players[visual_index]
+            kills = int(visual_player["kills"])
+            assists = int(visual_player["assists"])
+            deaths = int(visual_player["deaths"])
+            if kills == 0 and assists == 0 and deaths == 0:
+                deaths = 13
+            merged.append(
+                {
+                    # The card itself is authoritative for registration IDs.
+                    "id": int(card_player["id"]),
+                    "nickname": str(
+                        visual_player.get("nickname")
+                        or card_player.get("nickname", "")
+                    ),
+                    "kills": kills,
+                    "assists": assists,
+                    "deaths": deaths,
+                }
+            )
+        return merged
+
+    return {
+        "is_match_result": True,
+        "match_id": int(match.group(1)),
+        "score_a": score_a,
+        "score_b": score_b,
+        "ct_team": "A" if side_a == "CT" else "B",
+        "team_a": merge_team(card_a, visual_a, alignment_a[0]),
+        "team_b": merge_team(card_b, visual_b, alignment_b[0]),
+        "overall_confidence": confidence,
+        "notes": (
+            "ID и ники взяты из карточки; счёт, стороны и K/A/D — только "
+            "из исходного скриншота. «Получить игроков» не использовалось."
+        ),
+    }
 
 
 def result_from_review_card_and_modal(
@@ -1755,39 +2072,69 @@ async def process_upload(message: discord.Message) -> None:
                 BOT_VERSION,
             )
             if review_card:
-                modal_text, _helper_image_urls = await get_players_response(message)
-                if not modal_text:
-                    diagnostics = full_match_diagnostics(context)
-                    log.error(
-                        "Матч #%s: ошибка карточки на проверку: не удалось открыть/прочитать «Получить игроков». Прочитанный счёт=%s. context=%r\n%s",
-                        reserved_match_id or "?",
-                        f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
-                        context[:4000],
-                        diagnostics,
+                modal_text: Optional[str] = None
+                card_rosters = parse_card_roster_identities(context)
+                if card_rosters is not None:
+                    # This format already contains all ten registration IDs.
+                    # Do not click «Получить игроков»: read only score, sides
+                    # and K/A/D from the original scoreboard screenshot.
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        raw_images = await asyncio.gather(
+                            *(download_image(session, url) for url in urls[:4])
+                        )
+                    audit = await recognize_match(
+                        raw_images,
+                        visual_audit=True,
                     )
-                    await send_processing_error_log(
-                        reserved_match_id or "?", message,
-                        "Не удалось открыть/прочитать «Получить игроков».",
-                        diagnostics,
-                    )
-                    return
-                result = result_from_review_card_and_modal(context, modal_text)
-                if result is None:
-                    diagnostics = full_match_diagnostics(context, modal_text)
-                    log.error(
-                        "Матч #%s: ошибка разбора карточки/ответа «Получить игроков». Прочитанный счёт=%s. context=%r modal=%r. Старый AI-валидатор не запускается.\n%s",
-                        reserved_match_id or "?",
-                        f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
-                        context[:4000],
-                        modal_text[:2500],
-                        diagnostics,
-                    )
-                    await send_processing_error_log(
-                        reserved_match_id or "?", message,
-                        "Не удалось сопоставить карточку с «Получить игроков».",
-                        diagnostics,
-                    )
-                    return
+                    result = result_from_card_and_visual_audit(context, audit)
+                    if result is None:
+                        diagnostics = full_match_diagnostics(context)
+                        log.error(
+                            "Матч #%s: не удалось сопоставить ID/ники карточки "
+                            "с исходным табло. score_hint=%s context=%r "
+                            "audit=%r.\n%s",
+                            reserved_match_id or "?",
+                            f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
+                            context[:4000],
+                            audit,
+                            diagnostics,
+                        )
+                        await send_processing_error_log(
+                            reserved_match_id or "?", message,
+                            "Не удалось сопоставить карточку с исходным табло.",
+                            diagnostics,
+                        )
+                        return
+                else:
+                    # Keep support for old review cards whose IDs/statistics
+                    # can be recovered only through the helper button.
+                    modal_text, _helper_image_urls = await get_players_response(message)
+                    if not modal_text:
+                        diagnostics = full_match_diagnostics(context)
+                        log.error(
+                            "Матч #%s: не удалось открыть/прочитать «Получить игроков». "
+                            "Прочитанный счёт=%s. context=%r\n%s",
+                            reserved_match_id or "?",
+                            f"{score_hint[0]}:{score_hint[1]}" if score_hint else "не прочитан",
+                            context[:4000],
+                            diagnostics,
+                        )
+                        await send_processing_error_log(
+                            reserved_match_id or "?", message,
+                            "Не удалось открыть/прочитать «Получить игроков».",
+                            diagnostics,
+                        )
+                        return
+                    result = result_from_review_card_and_modal(context, modal_text)
+                    if result is None:
+                        diagnostics = full_match_diagnostics(context, modal_text)
+                        await send_processing_error_log(
+                            reserved_match_id or "?", message,
+                            "Не удалось сопоставить старую карточку с «Получить игроков».",
+                            diagnostics,
+                        )
+                        return
             else:
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
