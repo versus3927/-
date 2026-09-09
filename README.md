@@ -43,6 +43,7 @@ Set these in **Variables**:
 10. A scoreboard may contain only three or four visible players on one side. The bot matches the visible rows to the five-player card roster and registers each unmatched player as `0 0 13` instead of rejecting the whole match.
 11. Registration formats are handled separately. A complete `внесён` card keeps the score and every K/A/D value printed in the card. A `на проверку` card takes IDs/nicknames from the card and statistics from the screenshot. Only a card player with no matching screenshot nickname receives `0 0 13`; matched players always keep their recognized statistics.
 12. After a successful registration is confirmed, the bot automatically deletes the registration bot's visible `Готово — Матч #... закрыт` confirmation message. `Не вышло` responses are preserved for diagnostics.
+13. Send `удалить рег соо` to scan the complete history of every channel listed in `NORMAL_CHANNEL_IDS` and `PRIORITY_CHANNEL_IDS` and delete all old successful `Готово — Матч #... закрыт со счётом...` messages. Other messages, including `Не вышло`, are not touched.
 
 Do not upload a real `.env` file or commit tokens.
 
