@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import html
 import io
 import json
 import logging
@@ -21,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v22-minimum-six-visible-players-2026-09-09"
+BOT_VERSION = "v23-public-commands-status-html-2026-09-09"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -173,6 +174,7 @@ logging.basicConfig(
 log = logging.getLogger("faceit-reg-self")
 
 client = discord.Client()
+BOT_STARTED_AT = datetime.now(timezone.utc)
 is_active = False
 active_channel_ids: set[int] = set()
 processed_message_ids: set[int] = set()
@@ -280,6 +282,124 @@ def registration_stats_text() -> str:
         f"За 1 час: **{since(timedelta(hours=1))}**\n"
         f"За 30 минут: **{since(timedelta(minutes=30))}**"
     )
+
+
+def registration_status_counts() -> dict[str, int]:
+    """Return compact registration counters for the status report."""
+    now = datetime.now(timezone.utc)
+    valid_times: list[datetime] = []
+    for item in load_registration_records():
+        try:
+            value = datetime.fromisoformat(str(item["registered_at"]))
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            valid_times.append(value.astimezone(timezone.utc))
+        except (KeyError, TypeError, ValueError):
+            continue
+    local_now = now.astimezone(STATS_TIMEZONE)
+    today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start.astimezone(timezone.utc)
+    return {
+        "total": len(valid_times),
+        "today": sum(value >= today_start_utc for value in valid_times),
+        "hour": sum(value >= now - timedelta(hours=1) for value in valid_times),
+    }
+
+
+def format_uptime(seconds: int) -> str:
+    days, remainder = divmod(max(0, seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} д")
+    if hours or days:
+        parts.append(f"{hours} ч")
+    if minutes or hours or days:
+        parts.append(f"{minutes} мин")
+    parts.append(f"{secs} сек")
+    return " ".join(parts)
+
+
+def build_status_html(status: dict[str, object]) -> str:
+    """Build a self-contained, secret-free HTML readiness report."""
+    esc = lambda value: html.escape(str(value), quote=True)
+    channel_items = "".join(
+        f"<li><span>{esc(name)}</span></li>"
+        for name in status.get("channels", [])
+    ) or "<li><span>Каналы не выбраны</span></li>"
+    active_class = "ok" if status.get("active") else "idle"
+    active_text = "Авторег запущен" if status.get("active") else "Авторег ожидает команду"
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FACEIT AutoReg — статус</title>
+  <style>
+    :root {{ color-scheme: light dark; --bg:#f9f8f7; --surface:#fff; --soft:#f0efed; --text:#2c2c2b; --muted:#7d7a75; --border:#e6e5e3; --blue:#2783de; --green:#46a171; --orange:#d5803b; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; padding:32px 20px; background:var(--bg); color:var(--text); font:16px/1.5 Arial,system-ui,sans-serif; }}
+    main {{ width:min(960px,100%); margin:0 auto; }}
+    header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-bottom:24px; }}
+    h1 {{ margin:0 0 6px; font-size:32px; line-height:1.15; letter-spacing:-.02em; }}
+    .sub {{ margin:0; color:var(--muted); }}
+    .badge {{ display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border:1px solid color-mix(in srgb,var(--green) 35%,var(--border)); border-radius:999px; background:color-mix(in srgb,var(--green) 10%,var(--surface)); color:var(--green); font-weight:700; white-space:nowrap; }}
+    .dot {{ width:9px; height:9px; border-radius:50%; background:currentColor; }}
+    .grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }}
+    .card {{ padding:20px; border:1px solid var(--border); border-radius:12px; background:var(--surface); box-shadow:0 1px 2px rgba(0,0,0,.04); }}
+    .card.wide {{ grid-column:1/-1; }}
+    h2 {{ margin:0 0 16px; font-size:18px; }}
+    dl {{ display:grid; grid-template-columns:minmax(130px,.8fr) minmax(0,1.2fr); gap:10px 16px; margin:0; }}
+    dt {{ color:var(--muted); }} dd {{ margin:0; font-weight:700; overflow-wrap:anywhere; }}
+    .state {{ color:var(--green); }} .state.idle {{ color:var(--orange); }}
+    ul {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:0; padding:0; list-style:none; }}
+    li {{ padding:10px 12px; border-radius:8px; background:var(--soft); overflow-wrap:anywhere; }}
+    footer {{ margin-top:20px; color:var(--muted); font-size:14px; }}
+    code {{ font-family:Consolas,Menlo,monospace; font-size:.92em; }}
+    @media (max-width:700px) {{ body {{ padding:20px 16px; }} header {{ display:block; }} .badge {{ margin-top:16px; }} .grid {{ grid-template-columns:1fr; }} .card.wide {{ grid-column:auto; }} ul {{ grid-template-columns:1fr; }} dl {{ grid-template-columns:1fr; gap:3px; }} dd {{ margin-bottom:8px; }} }}
+    @media (prefers-color-scheme:dark) {{ :root {{ --bg:#191919; --surface:#202020; --soft:#2b2b2a; --text:#fff; --muted:rgba(255,255,255,.65); --border:rgba(255,255,255,.20); --blue:#5e9fe8; --green:#72bc8f; --orange:#de9255; }} .card {{ box-shadow:none; }} }}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>FACEIT AutoReg</h1><p class="sub">Отчёт готовности без токенов и API-ключей</p></div>
+    <div class="badge"><span class="dot"></span>Бот на связи</div>
+  </header>
+  <section class="grid">
+    <article class="card"><h2>Состояние</h2><dl>
+      <dt>Режим</dt><dd class="state {active_class}">{active_text}</dd>
+      <dt>Версия</dt><dd><code>{esc(status['version'])}</code></dd>
+      <dt>Аптайм</dt><dd>{esc(status['uptime'])}</dd>
+      <dt>Задержка Discord</dt><dd>{esc(status['latency'])}</dd>
+      <dt>Сейчас обрабатывается</dt><dd>{esc(status['processing'])}</dd>
+    </dl></article>
+    <article class="card"><h2>Пользователь из Variables</h2><dl>
+      <dt>Ник в Discord</dt><dd>{esc(status['configured_name'])}</dd>
+      <dt>MY_ACCOUNT_ID</dt><dd><code>{esc(status['configured_id'])}</code></dd>
+      <dt>Текущая сессия</dt><dd>{esc(status['session_user'])}</dd>
+      <dt>Команды</dt><dd>Доступны всем пользователям</dd>
+    </dl></article>
+    <article class="card"><h2>Регистрации</h2><dl>
+      <dt>Всего</dt><dd>{esc(status['registrations_total'])}</dd>
+      <dt>Сегодня</dt><dd>{esc(status['registrations_today'])}</dd>
+      <dt>За последний час</dt><dd>{esc(status['registrations_hour'])}</dd>
+      <dt>Минимум игроков</dt><dd>6 совпадений</dd>
+    </dl></article>
+    <article class="card"><h2>Распознавание</h2><dl>
+      <dt>API-режим</dt><dd>{esc(status['api_style'])}</dd>
+      <dt>Модели</dt><dd>{esc(status['models'])}</dd>
+      <dt>Ключей настроено</dt><dd>{esc(status['key_count'])}</dd>
+      <dt>Параллельность</dt><dd>{esc(status['concurrency'])}</dd>
+      <dt>Мин. уверенность</dt><dd>{esc(status['confidence'])}</dd>
+    </dl></article>
+    <article class="card wide"><h2>Каналы текущего режима</h2><ul>{channel_items}</ul></article>
+  </section>
+  <footer>Сформировано: {esc(status['generated_at'])} · Часовой пояс: {esc(status['timezone'])}</footer>
+</main>
+</body>
+</html>"""
 
 
 def next_gemini_assignment() -> tuple[str, str, int]:
@@ -2650,14 +2770,102 @@ async def on_message(message: discord.Message) -> None:
 
     command = message.content.strip().lower()
 
+    if re.fullmatch(r"бот\s*,?\s*ты\s+тут\s*\?*", command, re.I):
+        configured_user = None
+        if MY_ACCOUNT_ID:
+            guild = getattr(message, "guild", None)
+            if guild is not None:
+                configured_user = guild.get_member(MY_ACCOUNT_ID)
+            if configured_user is None:
+                configured_user = client.get_user(MY_ACCOUNT_ID)
+            if configured_user is None:
+                try:
+                    configured_user = await client.fetch_user(MY_ACCOUNT_ID)
+                except Exception:
+                    log.exception(
+                        "Не удалось получить пользователя MY_ACCOUNT_ID=%s",
+                        MY_ACCOUNT_ID,
+                    )
+
+        if configured_user is None:
+            configured_name = (
+                "Не найден в Discord" if MY_ACCOUNT_ID else "MY_ACCOUNT_ID не указан"
+            )
+        else:
+            configured_name = str(
+                getattr(configured_user, "display_name", None)
+                or getattr(configured_user, "global_name", None)
+                or getattr(configured_user, "name", configured_user)
+            )
+
+        channel_names: list[str] = []
+        for channel_id in sorted(active_channel_ids):
+            channel = client.get_channel(channel_id)
+            channel_name = getattr(channel, "name", None)
+            channel_names.append(
+                f"#{channel_name} · {channel_id}" if channel_name else str(channel_id)
+            )
+
+        counts = registration_status_counts()
+        now = datetime.now(timezone.utc)
+        uptime = format_uptime(int((now - BOT_STARTED_AT).total_seconds()))
+        latency_value = getattr(client, "latency", None)
+        latency = (
+            f"{round(float(latency_value) * 1000)} мс"
+            if isinstance(latency_value, (int, float)) and latency_value >= 0
+            else "неизвестно"
+        )
+        session_user = (
+            f"{client.user} · {getattr(client.user, 'id', 'неизвестно')}"
+            if client.user
+            else "сессия не определена"
+        )
+        generated_at = now.astimezone(STATS_TIMEZONE).strftime("%d.%m.%Y %H:%M:%S")
+        status = {
+            "active": is_active,
+            "version": BOT_VERSION,
+            "uptime": uptime,
+            "latency": latency,
+            "processing": len(processing_match_ids),
+            "configured_name": configured_name,
+            "configured_id": MY_ACCOUNT_ID or "не указан",
+            "session_user": session_user,
+            "registrations_total": counts["total"],
+            "registrations_today": counts["today"],
+            "registrations_hour": counts["hour"],
+            "api_style": AI_API_STYLE,
+            "models": ", ".join(GEMINI_MODELS),
+            "key_count": len(GEMINI_API_KEYS),
+            "concurrency": PROCESS_CONCURRENCY,
+            "confidence": f"{MIN_CONFIDENCE:.2f}",
+            "channels": channel_names,
+            "generated_at": generated_at,
+            "timezone": str(STATS_TIMEZONE),
+        }
+        report_bytes = build_status_html(status).encode("utf-8")
+        report_file = discord.File(
+            io.BytesIO(report_bytes),
+            filename=f"faceit-bot-status-{now.strftime('%Y%m%d-%H%M%S')}.html",
+        )
+        active_text = "запущен" if is_active else "ожидает `старт ...`"
+        await message.channel.send(
+            "🟢 **Я тут и готов к работе**\n"
+            f"Версия: `{BOT_VERSION}`\n"
+            f"Сессия Discord: **{client.user}** (`{getattr(client.user, 'id', '—')}`)\n"
+            f"MY_ACCOUNT_ID: `{MY_ACCOUNT_ID or 'не указан'}` → **{configured_name}**\n"
+            f"Авторег: **{active_text}** · обрабатывается игр: **{len(processing_match_ids)}**\n"
+            f"Регистраций: всего **{counts['total']}**, сегодня **{counts['today']}**\n"
+            f"Моделей: **{len(GEMINI_MODELS)}** · API-ключей: **{len(GEMINI_API_KEYS)}**\n"
+            "Команды доступны **всем пользователям**. Подробный HTML-отчёт прикреплён.",
+            file=report_file,
+        )
+        return
+
     if re.fullmatch(
         r"удалить\s+рег(?:истрационные)?\s+соо(?:бщения)?",
         command,
         re.I,
     ):
-        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
-            return
-
         registration_channel_ids = NORMAL_CHANNEL_IDS | PRIORITY_CHANNEL_IDS
         if not registration_channel_ids:
             await message.channel.send(
@@ -2681,9 +2889,6 @@ async def on_message(message: discord.Message) -> None:
 
     forget_match = re.fullmatch(r"забыть\s+#?(\d+)", command, re.I)
     if forget_match:
-        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
-            return
-
         match_id = int(forget_match.group(1))
         async with processing_match_lock:
             if match_id in processing_match_ids:
@@ -2715,21 +2920,14 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if command.startswith("забыть"):
-        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
-            return
         await message.channel.send("Формат команды: `забыть 2548`")
         return
 
     if command in ("стата", "статистика", "stats"):
-        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
-            return
         await message.channel.send(registration_stats_text())
         return
 
     if command == "енд" or command.startswith("старт"):
-        if MY_ACCOUNT_ID and message.author.id != MY_ACCOUNT_ID:
-            return
-
         if command == "енд":
             is_active = False
             active_channel_ids.clear()

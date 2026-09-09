@@ -11,7 +11,7 @@ Set these in **Variables**:
 - `NORMAL_CHANNEL_IDS` — comma-separated IDs of ordinary-game channels.
 - `PRIORITY_CHANNEL_IDS` — comma-separated IDs of priority-game channels.
 - `LOG_CHANNEL_ID` — ID of the channel that receives every successful registration, including match number, score, source, and full command.
-- `MY_ACCOUNT_ID` — your Discord account ID; recommended so only you can use `старт` and `енд`.
+- `MY_ACCOUNT_ID` — Discord user ID displayed by the `бот ты тут?` status command. It does not restrict command access.
 - `MIN_CONFIDENCE` — default `0.82`.
 - `BACKFILL_LIMIT` — how many previous messages to inspect in each selected channel; default `500`.
 - `SEND_DELAY` — delay before sending each result; default `0.25` seconds.
@@ -44,6 +44,7 @@ Set these in **Variables**:
 11. Registration formats are handled separately. A complete `внесён` card keeps the score and every K/A/D value printed in the card. A `на проверку` card takes IDs/nicknames from the card and statistics from the screenshot. Only a card player with no matching screenshot nickname receives `0 0 13`; matched players always keep their recognized statistics.
 12. After a successful registration is confirmed, the bot automatically deletes the registration bot's visible `Готово — Матч #... закрыт` confirmation message. `Не вышло` responses are preserved for diagnostics.
 13. Send `удалить рег соо` to scan the complete history of every channel listed in `NORMAL_CHANNEL_IDS` and `PRIORITY_CHANNEL_IDS` and delete all old successful `Готово — Матч #... закрыт со счётом...` messages. Other messages, including `Не вышло`, are not touched.
+14. Send `бот ты тут?` to receive readiness, current session, the Discord nickname resolved from `MY_ACCOUNT_ID`, active channels, uptime, latency, registration counters, model/key counts, and a self-contained HTML status report. Tokens and API-key values are never included. All Discord users may run all commands.
 
 Do not upload a real `.env` file or commit tokens.
 
