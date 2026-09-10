@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v35-warning-reasons-and-per-player-delivery-2026-09-10"
+BOT_VERSION = "v37-surrender-score-normalization-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -89,6 +89,16 @@ _CYRILLIC_TO_LATIN = str.maketrans(
 def normalize_nickname(value: object) -> str:
     """Normalize tags, punctuation and Cyrillic/Latin spelling for matching."""
     text = strip_leading_clan_tags(str(value))
+    # Scoreboards often contain a harmless creator/platform prefix while the
+    # Discord roster contains the same nick with trailing digits.  For
+    # example, `yt: Shamin` must match `Shamin336` instead of being registered
+    # as an absent 0/0/13 player.
+    text = re.sub(
+        r"^\s*(?:yt|youtube|ttv|twitch|vk)\s*(?:[:|._\-–—]+\s*|\s+)",
+        "",
+        text,
+        flags=re.I,
+    )
     text = unicodedata.normalize("NFKD", text).casefold()
     text = text.translate(_CYRILLIC_TO_LATIN)
     return "".join(character for character in text if character.isalnum())
@@ -1884,7 +1894,16 @@ async def recognize_match(
     if score_only and visual_audit:
         raise ValueError("score_only и visual_audit нельзя включать одновременно")
     card_result = None if (score_only or visual_audit) else parse_complete_card(message_text)
-    if card_result is not None and card_result.get("ct_team") in ("A", "B"):
+    if (
+        card_result is not None
+        and card_result.get("ct_team") in ("A", "B")
+        # A normal completed game has a 13+ winner.  A sub-13 result may be a
+        # surrender and must still inspect the screenshot before registration.
+        and max(
+            int(card_result.get("score_a", 0) or 0),
+            int(card_result.get("score_b", 0) or 0),
+        ) >= 13
+    ):
         log.info(
             "Матч #%s разобран напрямую без запроса к ИИ",
             card_result["match_id"],
@@ -1915,6 +1934,8 @@ async def recognize_match(
         "type": "object",
         "properties": {
             "is_match_result": {"type": "boolean"},
+            "is_surrender": {"type": "boolean"},
+            "winner_team": {"type": ["string", "null"], "enum": ["A", "B", None]},
             "match_id": {"type": ["integer", "null"]},
             "score_a": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
             "score_b": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
@@ -1926,6 +1947,8 @@ async def recognize_match(
         },
         "required": [
             "is_match_result",
+            "is_surrender",
+            "winner_team",
             "match_id",
             "score_a",
             "score_b",
@@ -1954,6 +1977,8 @@ async def recognize_match(
             "type": "object",
             "properties": {
                 "is_scoreboard": {"type": "boolean"},
+                "is_surrender": {"type": "boolean"},
+                "winner_side": {"type": ["string", "null"], "enum": ["LEFT", "RIGHT", None]},
                 "score_left": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
                 "score_right": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
                 "side_left": {"type": ["string", "null"], "enum": ["CT", "T", None]},
@@ -1963,13 +1988,14 @@ async def recognize_match(
                 "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "notes": {"type": "string"},
             },
-            "required": ["is_scoreboard", "score_left", "score_right", "side_left", "side_right", "left_players", "right_players", "overall_confidence", "notes"],
+            "required": ["is_scoreboard", "is_surrender", "winner_side", "score_left", "score_right", "side_left", "side_right", "left_players", "right_players", "overall_confidence", "notes"],
             "additionalProperties": False,
         }
 
     if visual_audit:
         prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
+If the result says `СДАЛИСЬ`/surrendered, set is_surrender=true. Set winner_side to the side that DID NOT surrender. The `СДАЛИСЬ` label belongs to the side that surrendered, so the opposite side is the winner. For a normal completed game set is_surrender=false and winner_side=null. Keep score_left/score_right as the raw numbers visibly printed; the program will convert the winner to 13.
 Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least four card players are reliably matched in total.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
 For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
@@ -1980,6 +2006,7 @@ Set confidence below 0.90 if any score or K/A/D digit is unclear. Return only va
 The Discord card text identifies Team A and Team B. Return score_a and score_b as rounds won by those exact teams, mapping the scoreboard sides to A/B by player nicknames when needed.
 Ignore any helper template containing `<счёт A> <счёт B>`: those are placeholders, not a score.
 Read the large final scoreboard/result score from the image. Typical valid results are 13:0 through overtime scores.
+For a surrender result (`СДАЛИСЬ`), set is_surrender=true and winner_team to the team that did not surrender. Keep the losing team's displayed round count, but return 13 for the winning team. For a normal result set is_surrender=false and winner_team=null.
 Set is_match_result=true when a final match scoreboard is visible. Return the visible match number when available, otherwise null.
 For this score-only request return team_a=[] and team_b=[], ct_team=null. overall_confidence describes confidence in the two score numbers. Explain briefly in notes."""
     else:
@@ -1989,6 +2016,7 @@ Build a registration result:
 - match_id: number after 'Результ����т матча #'.
 - Team A must always be returned in team_a; Team B in team_b.
 - score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
+- Surrendered games are valid. If the screenshot says `СДАЛИСЬ`, set is_surrender=true, identify which side surrendered, and set winner_team to the opposite Team A/B roster. Register the winner with 13 rounds and keep the loser's displayed round count. Read and match every visible player's K/A/D exactly as in a normal match. For normal games set is_surrender=false and winner_team=null.
 - ct_team MUST be `A` when Team A is on the CT/DEFENSE side of the screenshot, or `B` when Team B is on CT/DEFENSE. Never assume Team A is CT. Determine it by matching roster nicknames and scores to the CT/DEFENSE half of the scoreboard.
 - Cards titled 'на проверку' are valid match results and MUST be registered when match number, score and rosters can be recovered. These cards often already contain short # IDs and K/A/D next to every player; use those values directly even when the attached scoreboard is small or blurry.
 - In review cards, strings like `@#64 | kanei — 8/2/12` mean registration id=64, nickname=kanei, kills=8, assists=2, deaths=12. The @ formatting does not turn the short # number into a Discord user ID.
@@ -2127,9 +2155,35 @@ Build a registration result:
         output_text = output_text.split("\n", 1)[1]
         output_text = output_text.rsplit("```", 1)[0].strip()
     result = json.loads(output_text)
+    if result.get("is_surrender"):
+        if visual_audit:
+            winner_side = result.get("winner_side")
+            if winner_side == "LEFT":
+                result["score_left"] = 13
+            elif winner_side == "RIGHT":
+                result["score_right"] = 13
+            else:
+                result["overall_confidence"] = 0.0
+                result["notes"] = (
+                    str(result.get("notes", ""))
+                    + " Не удалось определить победившую сторону при сдаче."
+                ).strip()
+        else:
+            winner_team = result.get("winner_team")
+            if winner_team == "A":
+                result["score_a"] = 13
+            elif winner_team == "B":
+                result["score_b"] = 13
+            else:
+                result["overall_confidence"] = 0.0
+                result["notes"] = (
+                    str(result.get("notes", ""))
+                    + " Не удалось определить победившую команду при сдаче."
+                ).strip()
     if score_only or visual_audit:
         return result
-    # Любой полностью нулевой игрок регистрируется как отсутствующий 0/0/13.
+    # A genuine 0/0/0 row is registered as 0/0/13, while retaining the exact
+    # warning reason so it cannot later be mistaken for a nickname mismatch.
     for team_key in ("team_a", "team_b"):
         for player in result.get(team_key, []):
             if (
@@ -2138,6 +2192,7 @@ Build a registration result:
                 and int(player.get("deaths", 0) or 0) == 0
             ):
                 player["deaths"] = 13
+                player["warning_reason"] = "додж статистики"
     explicit_ct_team = explicit_ct_team_from_card(message_text)
     if explicit_ct_team in ("A", "B"):
         result["ct_team"] = explicit_ct_team
@@ -2148,6 +2203,12 @@ Build a registration result:
             "со строками таблицы по K/A/D; команда не будет отправлена."
         )
     if card_result is not None:
+        if result.get("is_surrender"):
+            # Keep exact player K/A/D from the complete Discord card, but use
+            # the normalized 13:X surrender score read from the screenshot.
+            card_result["score_a"] = int(result["score_a"])
+            card_result["score_b"] = int(result["score_b"])
+            card_result["notes"] += " Счёт сдачи нормализован до 13 раундов победителю."
         ct_team = explicit_ct_team or result.get("ct_team")
         if ct_team not in ("A", "B"):
             card_result["overall_confidence"] = 0.0
@@ -2161,24 +2222,34 @@ Build a registration result:
 
 WARNING_REASON_LABELS = {
     "нет на скриншоте": "Отсутствие на финальном скриншоте",
-    "неправильный ник": "Несоответствие игрового никнейма",
+    "неправильный ник": "Неверный игровой никнейм",
     "додж статистики": "Додж статистики",
 }
 
 
 def mark_zero_stat_warning_reasons(result: dict) -> int:
-    """Guarantee that every final 0/0/13 registration becomes a warning."""
+    """Apply warning rules without confusing a nickname miss with stat dodge.
+
+    An already detected nickname/absence reason is authoritative.  A matched
+    scoreboard row is a statistics dodge only when it has fewer than four
+    kills (including a genuine 0/0/0 row).  A bare synthetic 0/0/13 with no
+    source marker means that the nickname could not be matched.
+    """
     marked = 0
     for player in [*result.get("team_a", []), *result.get("team_b", [])]:
         try:
-            final_stats = (
-                int(player.get("kills", -1)),
-                int(player.get("assists", -1)),
-                int(player.get("deaths", -1)),
-            )
+            kills = int(player.get("kills", -1))
+            assists = int(player.get("assists", -1))
+            deaths = int(player.get("deaths", -1))
         except (TypeError, ValueError):
             continue
-        if final_stats == (0, 0, 13) and not player.get("warning_reason"):
+
+        if player.get("warning_reason"):
+            continue
+        if (kills, assists, deaths) == (0, 0, 13):
+            player["warning_reason"] = "неправильный ник"
+            marked += 1
+        elif 0 <= kills < 4:
             player["warning_reason"] = "додж статистики"
             marked += 1
     return marked
@@ -2611,16 +2682,11 @@ async def send_zero_stat_warnings(
     warning_players: list[tuple[str, int, dict]] = []
     for team_key in ("team_a", "team_b"):
         for player_index, player in enumerate(result.get(team_key, [])):
-            if (
-                player.get("warning_reason") in {
-                    "неправильный ник",
-                    "нет на скриншоте",
-                    "додж статистики",
-                }
-                and int(player.get("kills", -1)) == 0
-                and int(player.get("assists", -1)) == 0
-                and int(player.get("deaths", -1)) == 13
-            ):
+            if player.get("warning_reason") in {
+                "неправильный ник",
+                "нет на скриншоте",
+                "додж статистики",
+            }:
                 warning_players.append((team_key, player_index, player))
     if not warning_players:
         return
