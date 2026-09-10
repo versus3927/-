@@ -68,3 +68,5 @@ When forwarded-message snapshots do not expose their `mentions` collection, the 
 Do not upload a real `.env` file or commit tokens.
 
 > Note: automated user accounts/self-bots can violate Discord's Terms of Service and may lead to account restrictions. A normal Discord bot token is the safer supported option.
+
+Warning reasons follow the league rules: a player missing from the final screenshot receives `Отсутствие на финальном скриншоте`, while a player present among all ten rows under a different nickname receives `Несоответствие игрового никнейма`. Service pings such as `@Система` are ignored when resolving Discord tags, and each player is delivered independently so one failed warning cannot cancel the others.

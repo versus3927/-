@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v34-roster-mention-tagging-2026-09-10"
+BOT_VERSION = "v35-warning-reasons-and-per-player-delivery-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1839,7 +1839,7 @@ def full_match_diagnostics(
 
     if result:
         add_players("КОМАНДА A:", list(result.get("team_a", [])))
-        add_players("КОМАНДА B:", list(result.get("team_b", [])))
+        add_players("К��МАНДА B:", list(result.get("team_b", [])))
     else:
         slots = parse_card_roster_slots(message_text)
         if slots:
@@ -2159,6 +2159,13 @@ Build a registration result:
     return result
 
 
+WARNING_REASON_LABELS = {
+    "нет на скриншоте": "Отсутствие на финальном скриншоте",
+    "неправильный ник": "Несоответствие игрового никнейма",
+    "додж статистики": "Додж статистики",
+}
+
+
 def mark_zero_stat_warning_reasons(result: dict) -> int:
     """Guarantee that every final 0/0/13 registration becomes a warning."""
     marked = 0
@@ -2385,10 +2392,18 @@ def card_roster_discord_ids(
         return {"team_a": [], "team_b": []}
 
     def mention_ids(section: str) -> list[int]:
-        return [
-            int(value)
-            for value in re.findall(r"<@!?(\d{15,22})>", section)
-        ][:5]
+        collected: list[int] = []
+        for line in section.splitlines():
+            # A roster line always carries a registration number next to the
+            # mention. Service lines such as a bot ping (`@Система`) do not,
+            # so ignoring them prevents tagging the wrong account.
+            if not re.search(r"\d{1,5}", re.sub(r"<@!?\d{15,22}>", " ", line)):
+                continue
+            for value in re.findall(r"<@!?(\d{15,22})>", line):
+                user_id = int(value)
+                if user_id not in collected:
+                    collected.append(user_id)
+        return collected[:5]
 
     return {
         "team_a": mention_ids(raw_text[header_a.end():header_b.start()]),
@@ -2647,6 +2662,16 @@ async def send_zero_stat_warnings(
             warning_channel,
         )
         roster_discord_ids = card_roster_discord_ids(source_message)
+        log.info(
+            "Матч #%s: кандидатов на варн %s (%s)",
+            result.get("match_id"),
+            len(warning_players),
+            ", ".join(
+                f"#{player.get('id')} {player.get('warning_reason')}"
+                for _, _, player in warning_players
+            ),
+        )
+        sent_warnings = 0
         for team_key, player_index, player in warning_players:
             ordered_ids = roster_discord_ids.get(team_key, [])
             ordered_user_id = (
@@ -2689,20 +2714,29 @@ async def send_zero_stat_warnings(
                     player.get("id"),
                     player.get("nickname"),
                 )
-            reason_text = (
-                "Додж статистики"
-                if player["warning_reason"] in {"неправильный ник", "додж статистики"}
-                else "Отсутствие на финальном скриншоте"
+            reason_text = WARNING_REASON_LABELS.get(
+                player["warning_reason"],
+                "Додж статистики",
             )
             warning_text = f"{target}\n{reason_text} - #{result['match_id']}"
 
-            await send_warning_with_screenshot(
-                warning_channel,
-                warning_text,
-                int(result["match_id"]),
-                source_images,
-                source_urls,
-            )
+            try:
+                await send_warning_with_screenshot(
+                    warning_channel,
+                    warning_text,
+                    int(result["match_id"]),
+                    source_images,
+                    source_urls,
+                )
+            except Exception:
+                # One failed warning must never cancel the remaining players.
+                log.exception(
+                    "Не удалось отправить автоварн матча #%s игроку #%s",
+                    result.get("match_id"),
+                    player.get("id"),
+                )
+                continue
+            sent_warnings += 1
             if warning_log_channel is not None:
                 try:
                     await send_warning_with_screenshot(
@@ -2718,6 +2752,12 @@ async def send_zero_stat_warnings(
                         result.get("match_id"),
                         LOG_CHANNEL_ID,
                     )
+        log.info(
+            "Матч #%s: отправлено варнов %s из %s",
+            result.get("match_id"),
+            sent_warnings,
+            len(warning_players),
+        )
     except Exception:
         log.exception(
             "Не удалось отправить автоварн матча #%s в канал %s",
