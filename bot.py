@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v32-all-zero-thirteen-warnings-2026-09-10"
+BOT_VERSION = "v33-profile-role-identity-resolution-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2401,8 +2401,8 @@ async def warning_member(
 
     guilds: list[object] = []
     for guild in (
-        getattr(warning_channel, "guild", None),
         getattr(source_message, "guild", None),
+        getattr(warning_channel, "guild", None),
     ):
         if guild is not None and guild not in guilds:
             guilds.append(guild)
@@ -2418,6 +2418,92 @@ async def warning_member(
         if member is not None:
             return member
     return None
+
+
+def warning_identity_candidates(
+    source_message: discord.Message,
+    warning_channel,
+) -> list[object]:
+    """Collect cached members so plain card nicknames can become real tags."""
+    candidates: dict[int, object] = {}
+    for user in mentioned_users(source_message):
+        user_id = getattr(user, "id", None)
+        if isinstance(user_id, int):
+            candidates[user_id] = user
+
+    guilds: list[object] = []
+    for guild in (
+        getattr(source_message, "guild", None),
+        getattr(warning_channel, "guild", None),
+        *(getattr(client, "guilds", None) or []),
+    ):
+        if guild is not None and guild not in guilds:
+            guilds.append(guild)
+
+    for guild in guilds:
+        for member in getattr(guild, "members", None) or []:
+            member_id = getattr(member, "id", None)
+            if isinstance(member_id, int):
+                # Keep the source-guild Member object first: that is where the
+                # Pro League role shown in the player's profile usually lives.
+                candidates.setdefault(member_id, member)
+    return list(candidates.values())
+
+
+async def resolve_warning_identity(
+    source_message: discord.Message,
+    player: dict,
+    warning_channel,
+    candidates: list[object],
+) -> tuple[Optional[int], Optional[object]]:
+    """Resolve a card nickname such as `ezio` to `MCRW | ezio`'s profile."""
+    direct_user_id = discord_user_id_for_player(source_message, player)
+    if direct_user_id is not None:
+        member = await warning_member(
+            direct_user_id,
+            source_message,
+            warning_channel,
+        )
+        return direct_user_id, member
+
+    nickname = str(player.get("nickname") or "").strip()
+    registration_id = int(player.get("id") or 0)
+    ranked: list[tuple[float, int, object]] = []
+    for member in candidates:
+        member_id = getattr(member, "id", None)
+        if not isinstance(member_id, int):
+            continue
+        names = {
+            str(getattr(member, "display_name", "") or ""),
+            str(getattr(member, "nick", "") or ""),
+            str(getattr(member, "global_name", "") or ""),
+            str(getattr(member, "name", "") or ""),
+        }
+        score = max(
+            (nickname_similarity(nickname, name) for name in names),
+            default=0.0,
+        )
+        if registration_id > 0 and any(
+            re.search(rf"(?:^|\D){registration_id}(?:\D|$)", name)
+            for name in names
+            if name
+        ):
+            score = max(score, 1.0)
+        ranked.append((score, member_id, member))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    if not ranked or ranked[0][0] < 0.90:
+        return None, None
+    if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.04:
+        log.warning(
+            "Неоднозначный Discord-профиль для #%s %s: %.3f и %.3f",
+            registration_id,
+            nickname,
+            ranked[0][0],
+            ranked[1][0],
+        )
+        return None, None
+    return ranked[0][1], ranked[0][2]
 
 
 async def send_warning_with_screenshot(
@@ -2523,8 +2609,17 @@ async def send_zero_stat_warnings(
                             exc_info=True,
                         )
 
+        identity_candidates = warning_identity_candidates(
+            source_message,
+            warning_channel,
+        )
         for player in warning_players:
-            user_id = discord_user_id_for_player(source_message, player)
+            user_id, member = await resolve_warning_identity(
+                source_message,
+                player,
+                warning_channel,
+                identity_candidates,
+            )
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
                     "Варн матча #%s пропущен для Pro League пользователя %s",
@@ -2533,11 +2628,6 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
-            member = (
-                await warning_member(user_id, source_message, warning_channel)
-                if user_id is not None
-                else None
-            )
             if member is not None and member_has_pro_league_role(member):
                 log.info(
                     "Варн матча #%s пропущен: у %s есть роль Pro League",
@@ -2551,6 +2641,13 @@ async def send_zero_stat_warnings(
                 if user_id is not None
                 else f"`{player.get('nickname') or 'ник не найден'}`"
             )
+            if user_id is None:
+                log.warning(
+                    "Матч #%s: не удалось определить Discord ID для #%s %s",
+                    result.get("match_id"),
+                    player.get("id"),
+                    player.get("nickname"),
+                )
             reason_text = (
                 "Додж статистики"
                 if player["warning_reason"] in {"неправильный ник", "додж статистики"}

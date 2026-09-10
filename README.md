@@ -62,6 +62,7 @@ PRO_LEAGUE_USER_IDS: set[int] = {
 ```
 
 The role check accepts `🔴 Pro League` and other versions whose name contains `Pro League`, even when extra emoji or symbols are present.
+When a result card contains only a plain nickname instead of a Discord mention, the bot searches cached members from the source, warning, and other mutual guilds. Clan-prefixed display names are normalized, so `ezio` can resolve to a profile named `MCRW | ezio`; the resulting warning uses a real `<@user>` tag and the profile's roles are checked before sending.
 
 Do not upload a real `.env` file or commit tokens.
 
