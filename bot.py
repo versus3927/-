@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v30-warning-message-layout-2026-09-10"
+BOT_VERSION = "v31-zero-row-warning-fix-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1451,21 +1451,24 @@ def result_from_card_and_visual_audit(
             kills = int(visual_player["kills"])
             assists = int(visual_player["assists"])
             deaths = int(visual_player["deaths"])
+            warning_reason: Optional[str] = None
             if kills == 0 and assists == 0 and deaths == 0:
                 deaths = 13
-            merged.append(
-                {
-                    # The card itself is authoritative for registration IDs.
-                    "id": int(card_player["id"]),
-                    "nickname": str(
-                        visual_player.get("nickname")
-                        or card_player.get("nickname", "")
-                    ),
-                    "kills": kills,
-                    "assists": assists,
-                    "deaths": deaths,
-                }
-            )
+                warning_reason = "додж статистики"
+            merged_player = {
+                # The card itself is authoritative for registration IDs.
+                "id": int(card_player["id"]),
+                "nickname": str(
+                    visual_player.get("nickname")
+                    or card_player.get("nickname", "")
+                ),
+                "kills": kills,
+                "assists": assists,
+                "deaths": deaths,
+            }
+            if warning_reason is not None:
+                merged_player["warning_reason"] = warning_reason
+            merged.append(merged_player)
         return merged
 
     return {
@@ -2449,12 +2452,20 @@ async def send_zero_stat_warnings(
 ) -> None:
     """Warn tagged non-Pro-League players who received an unmatched 0/0/13."""
     if not WARN_CHANNEL_ID:
+        log.warning(
+            "Автоварны отключены: WARN_CHANNEL_ID не указан (матч #%s)",
+            result.get("match_id"),
+        )
         return
 
     warning_players = [
         player
         for player in [*result.get("team_a", []), *result.get("team_b", [])]
-        if player.get("warning_reason") in {"неправильный ник", "нет на скриншоте"}
+        if player.get("warning_reason") in {
+            "неправильный ник",
+            "нет на скриншоте",
+            "додж статистики",
+        }
         and int(player.get("kills", -1)) == 0
         and int(player.get("assists", -1)) == 0
         and int(player.get("deaths", -1)) == 13
@@ -2524,7 +2535,7 @@ async def send_zero_stat_warnings(
             )
             reason_text = (
                 "Додж статистики"
-                if player["warning_reason"] == "неправильный ник"
+                if player["warning_reason"] in {"неправильный ник", "додж статистики"}
                 else "Отсутствие на финальном скриншоте"
             )
             warning_text = f"{target}\n{reason_text} - #{result['match_id']}"
