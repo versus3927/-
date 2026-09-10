@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v37-surrender-score-normalization-2026-09-10"
+BOT_VERSION = "v38-warning-tags-and-league-eligibility-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -169,6 +169,14 @@ PRO_LEAGUE_USER_IDS: set[int] = {
 PRO_LEAGUE_ROLE_NAMES = {
     "Pro League",
     "🔴 Pro League",
+}
+# Автоварны предназначены только для участников лиг выше Default League.
+# Pro League по-прежнему полностью освобождена от автоварнов.
+WARNING_ELIGIBLE_ROLE_FRAGMENTS = {
+    "prospect",
+    "проспект",
+    "division",
+    "дивизион",
 }
 MY_ACCOUNT_ID = int(os.getenv("MY_ACCOUNT_ID", "0"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
@@ -2497,6 +2505,63 @@ def member_has_pro_league_role(member: object) -> bool:
     return False
 
 
+def member_has_warning_eligible_league_role(member: object) -> bool:
+    """Return True only for Prospect/Division members eligible for warnings."""
+    for role in getattr(member, "roles", None) or []:
+        role_name = normalize_nickname(getattr(role, "name", ""))
+        if role_name and any(
+            normalize_nickname(fragment) in role_name
+            for fragment in WARNING_ELIGIBLE_ROLE_FRAGMENTS
+        ):
+            return True
+    return False
+
+
+async def query_warning_members(
+    source_message: discord.Message,
+    warning_channel,
+    player: dict,
+) -> list[object]:
+    """Ask Discord for uncached members so a plain nickname can be tagged."""
+    nickname = strip_leading_clan_tags(str(player.get("nickname") or "")).strip()
+    registration_id = str(int(player.get("id") or 0))
+    queries: list[str] = []
+    for value in (nickname, re.sub(r"^\d+|\d+$", "", nickname), registration_id):
+        value = value.strip()
+        if value and value not in queries:
+            queries.append(value)
+
+    found: dict[int, object] = {}
+    guilds: list[object] = []
+    for guild in (
+        getattr(source_message, "guild", None),
+        getattr(warning_channel, "guild", None),
+    ):
+        if guild is not None and guild not in guilds:
+            guilds.append(guild)
+
+    for guild in guilds:
+        query_members = getattr(guild, "query_members", None)
+        if not callable(query_members):
+            continue
+        for query in queries:
+            try:
+                members = await query_members(query=query, limit=100, cache=True)
+            except Exception:
+                log.warning(
+                    "Не удалось выполнить поиск участника %r на сервере %s",
+                    query,
+                    getattr(guild, "id", "?"),
+                    exc_info=True,
+                )
+                continue
+            for member in members or []:
+                member_id = getattr(member, "id", None)
+                if isinstance(member_id, int):
+                    found[member_id] = member
+    return list(found.values())
+
+
 async def warning_member(
     user_id: int,
     source_message: discord.Message,
@@ -2609,6 +2674,39 @@ async def resolve_warning_identity(
         ranked.append((score, member_id, member))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
+    if not ranked or ranked[0][0] < 0.90:
+        # Large servers do not always cache every member. Query Discord before
+        # falling back to a plain nickname, otherwise the warning cannot tag
+        # the user or safely check that user's league roles.
+        fetched = await query_warning_members(
+            source_message,
+            warning_channel,
+            player,
+        )
+        known_ids = {item[1] for item in ranked}
+        for fetched_member in fetched:
+            member_id = getattr(fetched_member, "id", None)
+            if not isinstance(member_id, int) or member_id in known_ids:
+                continue
+            names = {
+                str(getattr(fetched_member, "display_name", "") or ""),
+                str(getattr(fetched_member, "nick", "") or ""),
+                str(getattr(fetched_member, "global_name", "") or ""),
+                str(getattr(fetched_member, "name", "") or ""),
+            }
+            score = max(
+                (nickname_similarity(nickname, name) for name in names),
+                default=0.0,
+            )
+            if registration_id > 0 and any(
+                re.search(rf"(?:^|\D){registration_id}(?:\D|$)", name)
+                for name in names
+                if name
+            ):
+                score = max(score, 1.0)
+            ranked.append((score, member_id, fetched_member))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
     if not ranked or ranked[0][0] < 0.90:
         return None, None
     if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.04:
@@ -2752,6 +2850,19 @@ async def send_zero_stat_warnings(
                 identity_candidates,
                 ordered_user_id,
             )
+            if user_id is None or member is None:
+                # Never post an untagged warning: without a Member object the
+                # account cannot be identified reliably and league roles
+                # cannot be checked safely.
+                log.warning(
+                    "Варн матча #%s пропущен: не найден Discord-профиль "
+                    "для #%s %s",
+                    result.get("match_id"),
+                    player.get("id"),
+                    player.get("nickname"),
+                )
+                continue
+
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
                     "Варн матча #%s пропущен для Pro League пользователя %s",
@@ -2768,18 +2879,15 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
-            target = (
-                f"<@{user_id}>"
-                if user_id is not None
-                else f"`{player.get('nickname') or 'ник не найден'}`"
-            )
-            if user_id is None:
-                log.warning(
-                    "Матч #%s: не удалось определить Discord ID для #%s %s",
+            if not member_has_warning_eligible_league_role(member):
+                log.info(
+                    "Варн матча #%s пропущен для %s: нет роли Prospect/Division",
                     result.get("match_id"),
-                    player.get("id"),
-                    player.get("nickname"),
+                    user_id,
                 )
+                continue
+
+            target = f"<@{user_id}>"
             reason_text = WARNING_REASON_LABELS.get(
                 player["warning_reason"],
                 "Додж статистики",
