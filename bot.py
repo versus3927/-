@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v31-zero-row-warning-fix-2026-09-10"
+BOT_VERSION = "v32-all-zero-thirteen-warnings-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2159,6 +2159,24 @@ Build a registration result:
     return result
 
 
+def mark_zero_stat_warning_reasons(result: dict) -> int:
+    """Guarantee that every final 0/0/13 registration becomes a warning."""
+    marked = 0
+    for player in [*result.get("team_a", []), *result.get("team_b", [])]:
+        try:
+            final_stats = (
+                int(player.get("kills", -1)),
+                int(player.get("assists", -1)),
+                int(player.get("deaths", -1)),
+            )
+        except (TypeError, ValueError):
+            continue
+        if final_stats == (0, 0, 13) and not player.get("warning_reason"):
+            player["warning_reason"] = "додж статистики"
+            marked += 1
+    return marked
+
+
 def format_registration(result: dict) -> str:
     ct_team = result.get("ct_team")
     if ct_team not in ("A", "B"):
@@ -2979,6 +2997,13 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 )
                 return
 
+            newly_marked_warnings = mark_zero_stat_warning_reasons(result)
+            if newly_marked_warnings:
+                log.info(
+                    "Матч #%s: дополнительно отмечено игроков 0/0/13 для варна: %s",
+                    result.get("match_id"),
+                    newly_marked_warnings,
+                )
             command_text = format_registration(result)
             if test_only:
                 # Forwarded cards outside registration channels are a safe
