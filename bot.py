@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v33-profile-role-identity-resolution-2026-09-10"
+BOT_VERSION = "v34-roster-mention-tagging-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2374,6 +2374,28 @@ def discord_user_id_for_player(
     return best_user_id if best_score >= 0.72 else None
 
 
+def card_roster_discord_ids(
+    source_message: discord.Message,
+) -> dict[str, list[int]]:
+    """Read raw Discord mention IDs from Team A/B in their roster order."""
+    raw_text = plain_message_text(source_message)
+    header_a = re.search(r"(?:Команда|Team)\s*A[^\n]*", raw_text, re.I)
+    header_b = re.search(r"(?:Команда|Team)\s*B[^\n]*", raw_text, re.I)
+    if not header_a or not header_b or header_b.start() <= header_a.start():
+        return {"team_a": [], "team_b": []}
+
+    def mention_ids(section: str) -> list[int]:
+        return [
+            int(value)
+            for value in re.findall(r"<@!?(\d{15,22})>", section)
+        ][:5]
+
+    return {
+        "team_a": mention_ids(raw_text[header_a.end():header_b.start()]),
+        "team_b": mention_ids(raw_text[header_b.end():]),
+    }
+
+
 def member_has_pro_league_role(member: object) -> bool:
     configured_names = {
         normalize_nickname(role_name)
@@ -2455,6 +2477,7 @@ async def resolve_warning_identity(
     player: dict,
     warning_channel,
     candidates: list[object],
+    ordered_user_id: Optional[int] = None,
 ) -> tuple[Optional[int], Optional[object]]:
     """Resolve a card nickname such as `ezio` to `MCRW | ezio`'s profile."""
     direct_user_id = discord_user_id_for_player(source_message, player)
@@ -2465,6 +2488,14 @@ async def resolve_warning_identity(
             warning_channel,
         )
         return direct_user_id, member
+
+    if ordered_user_id is not None:
+        member = await warning_member(
+            ordered_user_id,
+            source_message,
+            warning_channel,
+        )
+        return ordered_user_id, member
 
     nickname = str(player.get("nickname") or "").strip()
     registration_id = int(player.get("id") or 0)
@@ -2562,18 +2593,20 @@ async def send_zero_stat_warnings(
         )
         return
 
-    warning_players = [
-        player
-        for player in [*result.get("team_a", []), *result.get("team_b", [])]
-        if player.get("warning_reason") in {
-            "неправильный ник",
-            "нет на скриншоте",
-            "додж статистики",
-        }
-        and int(player.get("kills", -1)) == 0
-        and int(player.get("assists", -1)) == 0
-        and int(player.get("deaths", -1)) == 13
-    ]
+    warning_players: list[tuple[str, int, dict]] = []
+    for team_key in ("team_a", "team_b"):
+        for player_index, player in enumerate(result.get(team_key, [])):
+            if (
+                player.get("warning_reason") in {
+                    "неправильный ник",
+                    "нет на скриншоте",
+                    "додж статистики",
+                }
+                and int(player.get("kills", -1)) == 0
+                and int(player.get("assists", -1)) == 0
+                and int(player.get("deaths", -1)) == 13
+            ):
+                warning_players.append((team_key, player_index, player))
     if not warning_players:
         return
 
@@ -2613,12 +2646,20 @@ async def send_zero_stat_warnings(
             source_message,
             warning_channel,
         )
-        for player in warning_players:
+        roster_discord_ids = card_roster_discord_ids(source_message)
+        for team_key, player_index, player in warning_players:
+            ordered_ids = roster_discord_ids.get(team_key, [])
+            ordered_user_id = (
+                ordered_ids[player_index]
+                if player_index < len(ordered_ids)
+                else None
+            )
             user_id, member = await resolve_warning_identity(
                 source_message,
                 player,
                 warning_channel,
                 identity_candidates,
+                ordered_user_id,
             )
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
