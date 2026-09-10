@@ -11,6 +11,7 @@ Set these in **Variables**:
 - `NORMAL_CHANNEL_IDS` — comma-separated IDs of ordinary-game channels.
 - `PRIORITY_CHANNEL_IDS` — comma-separated IDs of priority-game channels.
 - `LOG_CHANNEL_ID` — ID of the channel that receives every successful registration, including match number, score, full command, and the original game card. The source is forwarded when Discord supports it; otherwise the bot posts a readable copy with the source image links.
+- `WARN_CHANNEL_ID` — ID of the channel that receives automatic warnings for unmatched players registered as `0 0 13`.
 - `MY_ACCOUNT_ID` — Discord user ID displayed by the `бот ты тут?` status command. It does not restrict command access.
 - `MIN_CONFIDENCE` — default `0.82`.
 - `BACKFILL_LIMIT` — how many previous messages to inspect in each selected channel; default `500`.
@@ -47,6 +48,20 @@ Set these in **Variables**:
 14. Send `бот ты тут?` to receive readiness, current session, the Discord nickname resolved from `MY_ACCOUNT_ID`, active channels, uptime, latency, registration counters, model/key counts, and a self-contained HTML status report. Tokens and API-key values are never included. All Discord users may run all commands.
 15. For testing, forward a game card with its screenshot into any chat outside the currently active registration channels. The bot uses the same unchanged recognition algorithm and replies with only the generated `=g` registration message. Test previews are not saved to statistics, do not wait for `Готово`, and do not delete the forwarded source message.
 16. After a real registration receives `Готово`, the log channel gets both the registration summary and the original game card. This happens before source-card cleanup, so the log copy remains available afterward.
+17. If an unmatched roster player is registered as `0 0 13`, `WARN_CHANNEL_ID` receives an automatic warning with the tagged Discord user, the reason (`неправильный ник` or `нет на скриншоте`), and the original match card/screenshot. Members with the `🔴 Pro League` role or an ID listed in the code are skipped. Every issued warning is also copied to `LOG_CHANNEL_ID`.
+
+## Pro League exceptions in code
+
+Variable space is not used for the player exception list. Add Discord user IDs directly near the top of `bot.py`:
+
+```python
+PRO_LEAGUE_USER_IDS: set[int] = {
+    111111111111111111,
+    222222222222222222,
+}
+```
+
+The role check accepts `🔴 Pro League` and other versions whose name contains `Pro League`, even when extra emoji or symbols are present.
 
 Do not upload a real `.env` file or commit tokens.
 

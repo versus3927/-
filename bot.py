@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v27-final-result-min-four-2026-09-09"
+BOT_VERSION = "v29-hardcoded-pro-league-warning-logs-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -148,6 +148,18 @@ def nicknames_match(first: object, second: object) -> bool:
 NORMAL_CHANNEL_IDS = parse_channel_ids("NORMAL_CHANNEL_IDS")
 PRIORITY_CHANNEL_IDS = parse_channel_ids("PRIORITY_CHANNEL_IDS")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+WARN_CHANNEL_ID = int(os.getenv("WARN_CHANNEL_ID", "0"))
+PRO_LEAGUE_USER_IDS: set[int] = {
+    # Вставляйте Discord user ID игроков Про Лиги сюда, по одному на строку:
+    # 111111111111111111,
+    # 222222222222222222,
+}
+# Эмодзи и дополнительные значки в названии роли не мешают проверке:
+# роль вида `🔴 Pro League ⓘ` также распознаётся по фрагменту `Pro League`.
+PRO_LEAGUE_ROLE_NAMES = {
+    "Pro League",
+    "🔴 Pro League",
+}
 MY_ACCOUNT_ID = int(os.getenv("MY_ACCOUNT_ID", "0"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.82"))
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
@@ -386,6 +398,8 @@ def build_status_html(status: dict[str, object]) -> str:
       <dt>Сегодня</dt><dd>{esc(status['registrations_today'])}</dd>
       <dt>За последний час</dt><dd>{esc(status['registrations_hour'])}</dd>
       <dt>Минимум игроков</dt><dd>4 совпадения</dd>
+      <dt>Автоварны</dt><dd>{esc(status['warning_status'])}</dd>
+      <dt>Pro League ID</dt><dd>{esc(status['pro_exemptions'])}</dd>
     </dl></article>
     <article class="card"><h2>Распознавание</h2><dl>
       <dt>API-режим</dt><dd>{esc(status['api_style'])}</dd>
@@ -1383,8 +1397,40 @@ def result_from_card_and_visual_audit(
         visual_players: list[dict],
         order: tuple[Optional[int], ...],
     ) -> list[dict]:
+        unmatched_card_indices = [
+            index for index, visual_index in enumerate(order)
+            if visual_index is None
+        ]
+        used_visual_indices = {
+            visual_index for visual_index in order if visual_index is not None
+        }
+        unused_visual_indices = [
+            index for index in range(len(visual_players))
+            if index not in used_visual_indices
+        ]
+        # Every unused visible row means that one unmatched roster player was
+        # shown under a different nickname. Any remaining unmatched roster
+        # slots were not visible on the screenshot at all. Pair only for the
+        # warning reason; the recognition/matching result itself is unchanged.
+        wrong_nickname_card_indices: set[int] = set()
+        available_cards = set(unmatched_card_indices)
+        for visual_index in unused_visual_indices:
+            if not available_cards:
+                break
+            card_index = max(
+                available_cards,
+                key=lambda index: nickname_similarity(
+                    card_players[index].get("nickname", ""),
+                    visual_players[visual_index].get("nickname", ""),
+                ),
+            )
+            wrong_nickname_card_indices.add(card_index)
+            available_cards.remove(card_index)
+
         merged: list[dict] = []
-        for card_player, visual_index in zip(card_players, order):
+        for card_index, (card_player, visual_index) in enumerate(
+            zip(card_players, order)
+        ):
             if visual_index is None:
                 merged.append(
                     {
@@ -1393,6 +1439,11 @@ def result_from_card_and_visual_audit(
                         "kills": 0,
                         "assists": 0,
                         "deaths": 13,
+                        "warning_reason": (
+                            "неправильный ник"
+                            if card_index in wrong_nickname_card_indices
+                            else "нет на скриншоте"
+                        ),
                     }
                 )
                 continue
@@ -2132,6 +2183,7 @@ async def send_original_card_to_log(
     source_message: discord.Message,
     log_channel,
     match_id: int,
+    fallback_title: Optional[str] = None,
 ) -> None:
     """Forward the original game card to logs, with a readable fallback."""
     forward_message = getattr(source_message, "forward", None)
@@ -2161,7 +2213,8 @@ async def send_original_card_to_log(
     source_text = plain_message_text(source_message).strip()
     source_urls = image_urls(source_message)
     urls_text = "\n".join(source_urls[:4])
-    prefix = f"🖼 Исходная карточка игры #{match_id}\n"
+    prefix = fallback_title or f"🖼 Исходная карточка игры #{match_id}"
+    prefix = f"{prefix.rstrip()}\n"
     available = max(0, 1990 - len(prefix) - len(urls_text))
     clipped_text = source_text[:available]
     chunks = [prefix.rstrip(), clipped_text, urls_text]
@@ -2247,6 +2300,205 @@ def plain_message_text(message: discord.Message) -> str:
             for field in embed.fields:
                 chunks.append(f"{field.name}\n{field.value}")
     return "\n".join(chunks)
+
+
+def mentioned_users(message: discord.Message) -> list[object]:
+    """Collect unique Discord users mentioned in the card or its snapshot."""
+    users: dict[int, object] = {}
+    for part in message_parts(message):
+        for user in getattr(part, "mentions", None) or []:
+            user_id = getattr(user, "id", None)
+            if isinstance(user_id, int):
+                users[user_id] = user
+    return list(users.values())
+
+
+def discord_user_id_for_player(
+    source_message: discord.Message,
+    player: dict,
+) -> Optional[int]:
+    """Resolve the Discord account that belongs to one roster player."""
+    raw_text = plain_message_text(source_message)
+    registration_id = int(player.get("id") or 0)
+    if registration_id > 0:
+        patterns = (
+            rf"(?im)^\s*(?:[-•]\s*)?#?\s*{registration_id}\b[^\n]*?<@!?(\d{{15,22}})>",
+            rf"(?im)^\s*<@!?(\d{{15,22}})>[^\n]*?#?\s*{registration_id}\b",
+        )
+        for pattern in patterns:
+            found = re.search(pattern, raw_text)
+            if found:
+                return int(found.group(1))
+
+    nickname = str(player.get("nickname") or "").strip()
+    nickname_digits = re.sub(r"\D", "", nickname)
+    if nickname_digits == nickname and 15 <= len(nickname_digits) <= 22:
+        return int(nickname_digits)
+
+    best_user_id: Optional[int] = None
+    best_score = 0.0
+    for user in mentioned_users(source_message):
+        user_id = getattr(user, "id", None)
+        if not isinstance(user_id, int):
+            continue
+        names = {
+            str(getattr(user, "display_name", "") or ""),
+            str(getattr(user, "global_name", "") or ""),
+            str(getattr(user, "name", "") or ""),
+        }
+        score = max((nickname_similarity(nickname, name) for name in names), default=0.0)
+        if score > best_score:
+            best_score = score
+            best_user_id = user_id
+    return best_user_id if best_score >= 0.72 else None
+
+
+def member_has_pro_league_role(member: object) -> bool:
+    configured_names = {
+        normalize_nickname(role_name)
+        for role_name in PRO_LEAGUE_ROLE_NAMES
+    }
+    for role in getattr(member, "roles", None) or []:
+        role_name = normalize_nickname(getattr(role, "name", ""))
+        if role_name and any(
+            configured and configured in role_name
+            for configured in configured_names
+        ):
+            return True
+    return False
+
+
+async def warning_member(
+    user_id: int,
+    source_message: discord.Message,
+    warning_channel,
+):
+    """Find a member in either the warnings guild or source guild."""
+    for user in mentioned_users(source_message):
+        if getattr(user, "id", None) == user_id and getattr(user, "roles", None) is not None:
+            return user
+
+    guilds: list[object] = []
+    for guild in (
+        getattr(warning_channel, "guild", None),
+        getattr(source_message, "guild", None),
+    ):
+        if guild is not None and guild not in guilds:
+            guilds.append(guild)
+
+    for guild in guilds:
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+        if member is not None:
+            return member
+    return None
+
+
+async def send_zero_stat_warnings(
+    result: dict,
+    source_message: discord.Message,
+) -> None:
+    """Warn tagged non-Pro-League players who received an unmatched 0/0/13."""
+    if not WARN_CHANNEL_ID:
+        return
+
+    warning_players = [
+        player
+        for player in [*result.get("team_a", []), *result.get("team_b", [])]
+        if player.get("warning_reason") in {"неправильный ник", "нет на скриншоте"}
+        and int(player.get("kills", -1)) == 0
+        and int(player.get("assists", -1)) == 0
+        and int(player.get("deaths", -1)) == 13
+    ]
+    if not warning_players:
+        return
+
+    try:
+        warning_channel = client.get_channel(WARN_CHANNEL_ID)
+        if warning_channel is None:
+            warning_channel = await client.fetch_channel(WARN_CHANNEL_ID)
+
+        warning_lines: list[str] = []
+        for player in warning_players:
+            user_id = discord_user_id_for_player(source_message, player)
+            if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
+                log.info(
+                    "Варн матча #%s пропущен для Pro League пользователя %s",
+                    result.get("match_id"),
+                    user_id,
+                )
+                continue
+
+            member = (
+                await warning_member(user_id, source_message, warning_channel)
+                if user_id is not None
+                else None
+            )
+            if member is not None and member_has_pro_league_role(member):
+                log.info(
+                    "Варн матча #%s пропущен: у %s есть роль Pro League",
+                    result.get("match_id"),
+                    user_id,
+                )
+                continue
+
+            target = (
+                f"<@{user_id}>"
+                if user_id is not None
+                else f"`{player.get('nickname') or 'ник не найден'}` *(не удалось определить Discord ID)*"
+            )
+            warning_lines.append(
+                f"- {target} — **{player['warning_reason']}** "
+                f"(`#{player.get('id')}`, зарегистрировано `0 0 13`)"
+            )
+
+        if not warning_lines:
+            return
+
+        warning_text = (
+            f"⚠️ **Автоварн · матч #{result['match_id']}**\n"
+            f"Счёт: **{result['score_a']}:{result['score_b']}**\n"
+            + "\n".join(warning_lines)
+        )
+        await warning_channel.send(warning_text)
+
+        # Every actually issued warning is also recorded in the main log.
+        # If both IDs point to the same channel, the warning above is already
+        # the log entry and must not be duplicated.
+        if LOG_CHANNEL_ID and LOG_CHANNEL_ID != WARN_CHANNEL_ID:
+            try:
+                warning_log_channel = client.get_channel(LOG_CHANNEL_ID)
+                if warning_log_channel is None:
+                    warning_log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
+                await warning_log_channel.send(
+                    f"🧾 **Лог выданного автоварна**\n"
+                    f"Источник: <#{source_message.channel.id}>\n"
+                    f"{warning_text}"
+                )
+            except Exception:
+                log.exception(
+                    "Не удалось записать автоварн матча #%s в лог-канал %s",
+                    result.get("match_id"),
+                    LOG_CHANNEL_ID,
+                )
+
+        await send_original_card_to_log(
+            source_message,
+            warning_channel,
+            int(result["match_id"]),
+            fallback_title=f"📸 Скрин матча #{result['match_id']} для варна",
+        )
+    except Exception:
+        log.exception(
+            "Не удалось отправить автоварн матча #%s в канал %s",
+            result.get("match_id"),
+            WARN_CHANNEL_ID,
+        )
 
 
 async def delete_duplicate_match_cards(
@@ -2703,6 +2955,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 return
 
             await send_registration_log(result, message, command_text)
+            await send_zero_stat_warnings(result, message)
             if DELETE_AFTER_REGISTRATION:
                 await asyncio.sleep(DELETE_DELAY)
                 try:
@@ -2904,6 +3157,10 @@ async def on_message(message: discord.Message) -> None:
             "registrations_total": counts["total"],
             "registrations_today": counts["today"],
             "registrations_hour": counts["hour"],
+            "warning_status": (
+                f"канал {WARN_CHANNEL_ID}" if WARN_CHANNEL_ID else "не настроены"
+            ),
+            "pro_exemptions": len(PRO_LEAGUE_USER_IDS),
             "api_style": AI_API_STYLE,
             "models": ", ".join(GEMINI_MODELS),
             "key_count": len(GEMINI_API_KEYS),
@@ -2927,6 +3184,8 @@ async def on_message(message: discord.Message) -> None:
             f"Авторег: **{active_text}** · обрабатывается игр: **{len(processing_match_ids)}**\n"
             f"Регистраций: всего **{counts['total']}**, сегодня **{counts['today']}**\n"
             f"Моделей: **{len(GEMINI_MODELS)}** · API-ключей: **{len(GEMINI_API_KEYS)}**\n"
+            f"Автоварны: **{'включены' if WARN_CHANNEL_ID else 'не настроены'}** · "
+            f"Pro League ID: **{len(PRO_LEAGUE_USER_IDS)}**\n"
             "Команды доступны **всем пользователям**. Подробный HTML-отчёт прикреплён.",
             file=report_file,
         )
