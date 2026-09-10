@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v29-hardcoded-pro-league-warning-logs-2026-09-10"
+BOT_VERSION = "v30-warning-message-layout-2026-09-10"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2399,6 +2399,50 @@ async def warning_member(
     return None
 
 
+async def send_warning_with_screenshot(
+    channel,
+    warning_text: str,
+    match_id: int,
+    source_images: list[bytes],
+    source_urls: list[str],
+) -> None:
+    """Post the mention/reason and original screenshot in one Discord message."""
+    files: list[discord.File] = []
+    for index, raw_image in enumerate(source_images, 1):
+        extension = "png"
+        try:
+            with Image.open(io.BytesIO(raw_image)) as image:
+                extension = {
+                    "JPEG": "jpg",
+                    "JPG": "jpg",
+                    "WEBP": "webp",
+                    "GIF": "gif",
+                }.get(str(image.format or "").upper(), "png")
+        except Exception:
+            pass
+        files.append(
+            discord.File(
+                io.BytesIO(raw_image),
+                filename=f"match-{match_id}-warning-{index}.{extension}",
+            )
+        )
+
+    if files:
+        try:
+            await channel.send(warning_text, files=files)
+            return
+        except Exception:
+            log.warning(
+                "Не удалось приложить скрин матча #%s к варну; "
+                "отправляются ссылки на изображения",
+                match_id,
+                exc_info=True,
+            )
+
+    fallback = "\n".join([warning_text, *source_urls[:4]])
+    await channel.send(fallback[:2000])
+
+
 async def send_zero_stat_warnings(
     result: dict,
     source_message: discord.Message,
@@ -2423,7 +2467,33 @@ async def send_zero_stat_warnings(
         if warning_channel is None:
             warning_channel = await client.fetch_channel(WARN_CHANNEL_ID)
 
-        warning_lines: list[str] = []
+        warning_log_channel = None
+        if LOG_CHANNEL_ID and LOG_CHANNEL_ID != WARN_CHANNEL_ID:
+            try:
+                warning_log_channel = client.get_channel(LOG_CHANNEL_ID)
+                if warning_log_channel is None:
+                    warning_log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
+            except Exception:
+                log.exception(
+                    "Не удалось открыть лог-канал %s для записи автоварнов",
+                    LOG_CHANNEL_ID,
+                )
+
+        source_urls = image_urls(source_message)[:4]
+        source_images: list[bytes] = []
+        if source_urls:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for source_url in source_urls:
+                    try:
+                        source_images.append(await download_image(session, source_url))
+                    except Exception:
+                        log.warning(
+                            "Не удалось скачать изображение матча #%s для варна",
+                            result.get("match_id"),
+                            exc_info=True,
+                        )
+
         for player in warning_players:
             user_id = discord_user_id_for_player(source_message, player)
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
@@ -2450,49 +2520,37 @@ async def send_zero_stat_warnings(
             target = (
                 f"<@{user_id}>"
                 if user_id is not None
-                else f"`{player.get('nickname') or 'ник не найден'}` *(не удалось определить Discord ID)*"
+                else f"`{player.get('nickname') or 'ник не найден'}`"
             )
-            warning_lines.append(
-                f"- {target} — **{player['warning_reason']}** "
-                f"(`#{player.get('id')}`, зарегистрировано `0 0 13`)"
+            reason_text = (
+                "Додж статистики"
+                if player["warning_reason"] == "неправильный ник"
+                else "Отсутствие на финальном скриншоте"
             )
+            warning_text = f"{target}\n{reason_text} - #{result['match_id']}"
 
-        if not warning_lines:
-            return
-
-        warning_text = (
-            f"⚠️ **Автоварн · матч #{result['match_id']}**\n"
-            f"Счёт: **{result['score_a']}:{result['score_b']}**\n"
-            + "\n".join(warning_lines)
-        )
-        await warning_channel.send(warning_text)
-
-        # Every actually issued warning is also recorded in the main log.
-        # If both IDs point to the same channel, the warning above is already
-        # the log entry and must not be duplicated.
-        if LOG_CHANNEL_ID and LOG_CHANNEL_ID != WARN_CHANNEL_ID:
-            try:
-                warning_log_channel = client.get_channel(LOG_CHANNEL_ID)
-                if warning_log_channel is None:
-                    warning_log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
-                await warning_log_channel.send(
-                    f"🧾 **Лог выданного автоварна**\n"
-                    f"Источник: <#{source_message.channel.id}>\n"
-                    f"{warning_text}"
-                )
-            except Exception:
-                log.exception(
-                    "Не удалось записать автоварн матча #%s в лог-канал %s",
-                    result.get("match_id"),
-                    LOG_CHANNEL_ID,
-                )
-
-        await send_original_card_to_log(
-            source_message,
-            warning_channel,
-            int(result["match_id"]),
-            fallback_title=f"📸 Скрин матча #{result['match_id']} для варна",
-        )
+            await send_warning_with_screenshot(
+                warning_channel,
+                warning_text,
+                int(result["match_id"]),
+                source_images,
+                source_urls,
+            )
+            if warning_log_channel is not None:
+                try:
+                    await send_warning_with_screenshot(
+                        warning_log_channel,
+                        warning_text,
+                        int(result["match_id"]),
+                        source_images,
+                        source_urls,
+                    )
+                except Exception:
+                    log.exception(
+                        "Не удалось записать автоварн матча #%s в лог-канал %s",
+                        result.get("match_id"),
+                        LOG_CHANNEL_ID,
+                    )
     except Exception:
         log.exception(
             "Не удалось отправить автоварн матча #%s в канал %s",
