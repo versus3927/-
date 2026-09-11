@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50-complete-forwarded-test-recovery-2026-09-11"
+BOT_VERSION = "v50.3-warning-must-mention-user-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -145,6 +145,18 @@ def nickname_similarity(first: object, second: object) -> float:
     # with player IDs and scoreboard values.
     if left.isdigit() or right.isdigit():
         return 0.0
+
+    # Gemini can confuse lowercase `y` and `v` in short game nicknames.
+    # `y2k` and `v2k` are therefore the same player when the numeric suffix is
+    # identical. The high score also lets warning delivery resolve the actual
+    # Discord member `#21 | y2k` instead of posting an untagged OCR nickname.
+    if (
+        len(left) == len(right) == 3
+        and left[1:] == right[1:]
+        and {left[0], right[0]} == {"y", "v"}
+        and any(character.isdigit() for character in left[1:])
+    ):
+        return 0.96
 
     left_without_edge_digits = re.sub(r"^\d+|\d+$", "", left)
     right_without_edge_digits = re.sub(r"^\d+|\d+$", "", right)
@@ -2522,13 +2534,12 @@ WARNING_REASON_LABELS = {
 
 
 def mark_zero_stat_warning_reasons(result: dict) -> int:
-    """Apply warning rules without confusing a nickname miss with stat dodge.
+    """Apply warning rules, giving low-kill statistics highest priority.
 
-    An already detected nickname reason is authoritative. A matched scoreboard
-    row is a statistics reset when it has fewer than four kills. A bare
-    synthetic 0/0/13 means that the player disappeared from the final table,
-    so it is also a statistics reset. Nickname mismatch is used only when an
-    unmatched visible row proves that the player played under another nick.
+    Zero through four kills, including exactly four, is always "statistics
+    reset" even if an earlier matching stage tentatively marked the nickname.
+    This prevents a 4-kill player such as `de jure` from receiving the wrong
+    warning reason.
     """
     marked = 0
     for player in [*result.get("team_a", []), *result.get("team_b", [])]:
@@ -2539,14 +2550,14 @@ def mark_zero_stat_warning_reasons(result: dict) -> int:
         except (TypeError, ValueError):
             continue
 
-        if player.get("warning_reason"):
+        previous_reason = player.get("warning_reason")
+        if (kills, assists, deaths) == (0, 0, 13) or 0 <= kills <= 4:
+            player["warning_reason"] = "додж статистики"
+            if previous_reason != "додж статистики":
+                marked += 1
             continue
-        if (kills, assists, deaths) == (0, 0, 13):
-            player["warning_reason"] = "додж статистики"
-            marked += 1
-        elif 0 <= kills < 4:
-            player["warning_reason"] = "додж статистики"
-            marked += 1
+        if previous_reason:
+            continue
     return marked
 
 
@@ -3138,6 +3149,18 @@ async def send_zero_stat_warnings(
                 identity_candidates,
                 ordered_user_id,
             )
+            if user_id is None:
+                # A warning without a real Discord mention is not a warning to
+                # the player. Never post a plain nickname as a fallback.
+                log.error(
+                    "Варн матча #%s не отправлен: не найден Discord ID "
+                    "игрока #%s %s",
+                    result.get("match_id"),
+                    player.get("id"),
+                    player.get("nickname"),
+                )
+                continue
+
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
                     "Варн матча #%s пропущен для Pro League пользователя %s",
@@ -3162,11 +3185,7 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
-            target = (
-                f"<@{user_id}>"
-                if user_id is not None
-                else f"`{player.get('nickname') or 'ник не найден'}`"
-            )
+            target = f"<@{user_id}>"
             reason_text = WARNING_REASON_LABELS.get(
                 player["warning_reason"],
                 "Обнуление игровой статистики",
