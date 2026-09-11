@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v42-correct-missing-player-warning-reason-2026-09-11"
+BOT_VERSION = "v44-visible-player-stat-recovery-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1426,6 +1426,7 @@ def result_from_card_and_visual_audit(
         visual_players: list[dict],
         order: tuple[Optional[int], ...],
     ) -> list[dict]:
+        resolved_order = list(order)
         unmatched_card_indices = [
             index for index, visual_index in enumerate(order)
             if visual_index is None
@@ -1437,6 +1438,40 @@ def result_from_card_and_visual_audit(
             index for index in range(len(visual_players))
             if index not in used_visual_indices
         ]
+        forced_wrong_nickname_indices: set[int] = set()
+
+        # If all five scoreboard rows are visible, nobody may receive a fake
+        # 0/0/13. Reliably matched rows establish the team; assign all remaining
+        # rows one-to-one by the best global nickname score. These players keep
+        # their real screenshot K/A/D and receive only a nickname-mismatch
+        # reason when their names genuinely differ.
+        if (
+            len(visual_players) == 5
+            and unmatched_card_indices
+            and len(unmatched_card_indices) == len(unused_visual_indices)
+        ):
+            best_visual_order = max(
+                permutations(unused_visual_indices),
+                key=lambda candidate_order: sum(
+                    nickname_similarity(
+                        card_players[card_index].get("nickname", ""),
+                        visual_players[visual_index].get("nickname", ""),
+                    )
+                    for card_index, visual_index in zip(
+                        unmatched_card_indices,
+                        candidate_order,
+                    )
+                ),
+            )
+            for card_index, visual_index in zip(
+                unmatched_card_indices,
+                best_visual_order,
+            ):
+                resolved_order[card_index] = visual_index
+                forced_wrong_nickname_indices.add(card_index)
+            unmatched_card_indices = []
+            unused_visual_indices = []
+
         # Every unused visible row means that one unmatched roster player was
         # shown under a different nickname. Any remaining unmatched roster
         # slots were not visible on the screenshot at all. Pair only for the
@@ -1458,7 +1493,7 @@ def result_from_card_and_visual_audit(
 
         merged: list[dict] = []
         for card_index, (card_player, visual_index) in enumerate(
-            zip(card_players, order)
+            zip(card_players, resolved_order)
         ):
             if visual_index is None:
                 merged.append(
@@ -1484,6 +1519,8 @@ def result_from_card_and_visual_audit(
             if kills == 0 and assists == 0 and deaths == 0:
                 deaths = 13
                 warning_reason = "додж статистики"
+            elif card_index in forced_wrong_nickname_indices:
+                warning_reason = "неправильный ник"
             merged_player = {
                 # The card itself is authoritative for registration IDs.
                 "id": int(card_player["id"]),
@@ -2552,26 +2589,27 @@ def discord_user_id_for_player(
 
 def card_roster_discord_ids(
     source_message: discord.Message,
-) -> dict[str, list[int]]:
-    """Read raw Discord mention IDs from Team A/B in their roster order."""
+) -> dict[str, list[Optional[int]]]:
+    """Read Discord IDs while preserving every Team A/B roster position."""
     raw_text = plain_message_text(source_message)
     header_a = re.search(r"(?:Команда|Team)\s*A[^\n]*", raw_text, re.I)
     header_b = re.search(r"(?:Команда|Team)\s*B[^\n]*", raw_text, re.I)
     if not header_a or not header_b or header_b.start() <= header_a.start():
         return {"team_a": [], "team_b": []}
 
-    def mention_ids(section: str) -> list[int]:
-        collected: list[int] = []
+    def mention_ids(section: str) -> list[Optional[int]]:
+        collected: list[Optional[int]] = []
         for line in section.splitlines():
-            # A roster line always carries a registration number next to the
-            # mention. Service lines such as a bot ping (`@Система`) do not,
-            # so ignoring them prevents tagging the wrong account.
-            if not re.search(r"\d{1,5}", re.sub(r"<@!?\d{15,22}>", " ", line)):
+            # Preserve one slot per actual roster line. Previously plain-name
+            # rows were omitted, shifting all later mentions to the wrong
+            # players and sometimes producing @неизвестный-пользователь.
+            without_mentions = re.sub(r"<@!?\d{15,22}>", " ", line)
+            if not re.search(r"(?<!\d)#?\s*\d{1,5}(?!\d)", without_mentions):
                 continue
-            for value in re.findall(r"<@!?(\d{15,22})>", line):
-                user_id = int(value)
-                if user_id not in collected:
-                    collected.append(user_id)
+            mention = re.search(r"<@!?(\d{15,22})>", line)
+            collected.append(int(mention.group(1)) if mention else None)
+            if len(collected) == 5:
+                break
         return collected[:5]
 
     return {
@@ -2940,19 +2978,6 @@ async def send_zero_stat_warnings(
                 identity_candidates,
                 ordered_user_id,
             )
-            if user_id is None or member is None:
-                # Never post an untagged warning: without a Member object the
-                # account cannot be identified reliably and league roles
-                # cannot be checked safely.
-                log.warning(
-                    "Варн матча #%s пропущен: не найден Discord-профиль "
-                    "для #%s %s",
-                    result.get("match_id"),
-                    player.get("id"),
-                    player.get("nickname"),
-                )
-                continue
-
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
                     "Варн матча #%s пропущен для Pro League пользователя %s",
@@ -2969,7 +2994,7 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
-            if not member_has_warning_eligible_league_role(member):
+            if member is not None and not member_has_warning_eligible_league_role(member):
                 log.info(
                     "Варн матча #%s пропущен для %s: нет роли Prospect/Division",
                     result.get("match_id"),
@@ -2977,10 +3002,14 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
-            target = f"<@{user_id}>"
+            target = (
+                f"<@{user_id}>"
+                if user_id is not None
+                else f"`{player.get('nickname') or 'ник не найден'}`"
+            )
             reason_text = WARNING_REASON_LABELS.get(
                 player["warning_reason"],
-                "Додж статистики",
+                "Обнуление игровой статистики",
             )
             warning_text = f"{target}\n{reason_text} - #{result['match_id']}"
 
@@ -3255,14 +3284,52 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             )
             modal_text: Optional[str] = None
             if complete_card is not None:
-                # Complete cards keep their exact card K/A/D. AI is used only
-                # when needed to identify which card team was CT/T.
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     raw_images = await asyncio.gather(
                         *(download_image(session, url) for url in urls[:4])
                     )
-                result = await recognize_match(raw_images, context)
+                complete_has_placeholders = any(
+                    (
+                        int(player.get("kills", -1)),
+                        int(player.get("assists", -1)),
+                        int(player.get("deaths", -1)),
+                    ) == (0, 0, 13)
+                    for player in [
+                        *complete_card.get("team_a", []),
+                        *complete_card.get("team_b", []),
+                    ]
+                )
+                if complete_has_placeholders:
+                    # 0/0/13 in a generated card is only a placeholder. Always
+                    # re-read the original scoreboard independently. This
+                    # prevents visible players from being registered as zero
+                    # because a clan tag or OCR variation broke the first pass.
+                    audit = await recognize_match(
+                        raw_images,
+                        visual_audit=True,
+                    )
+                    result = result_from_card_and_visual_audit(context, audit)
+                    if result is None:
+                        diagnostics = full_match_diagnostics(context)
+                        log.error(
+                            "Матч #%s остановлен: не удалось безопасно "
+                            "восстановить строки 0/0/13 со скриншота. audit=%r\n%s",
+                            reserved_match_id or "?",
+                            audit,
+                            diagnostics,
+                        )
+                        await send_processing_error_log(
+                            reserved_match_id or "?",
+                            message,
+                            "Не удалось безопасно восстановить игроков 0/0/13 со скриншота.",
+                            diagnostics,
+                        )
+                        return
+                else:
+                    # With no placeholders, the card's exact K/A/D stays
+                    # authoritative; AI is needed only for CT/T mapping.
+                    result = await recognize_match(raw_images, context)
             elif review_card or has_players_button:
                 card_rosters = parse_card_roster_identities(context)
                 if card_rosters is not None:
