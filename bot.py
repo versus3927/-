@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v41-global-old-clan-tag-filter-2026-09-11"
+BOT_VERSION = "v42-correct-missing-player-warning-reason-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2318,7 +2318,7 @@ Build a registration result:
 
 
 WARNING_REASON_LABELS = {
-    "нет на скриншоте": "Отсутствие на финальном скриншоте",
+    "нет на скриншоте": "Обнуление игровой статистики",
     "неправильный ник": "Несоответствие игрового никнейма.",
     "додж статистики": "Обнуление игровой статистики",
 }
@@ -2327,10 +2327,11 @@ WARNING_REASON_LABELS = {
 def mark_zero_stat_warning_reasons(result: dict) -> int:
     """Apply warning rules without confusing a nickname miss with stat dodge.
 
-    An already detected nickname/absence reason is authoritative.  A matched
-    scoreboard row is a statistics dodge only when it has fewer than four
-    kills (including a genuine 0/0/0 row).  A bare synthetic 0/0/13 with no
-    source marker means that the nickname could not be matched.
+    An already detected nickname reason is authoritative. A matched scoreboard
+    row is a statistics reset when it has fewer than four kills. A bare
+    synthetic 0/0/13 means that the player disappeared from the final table,
+    so it is also a statistics reset. Nickname mismatch is used only when an
+    unmatched visible row proves that the player played under another nick.
     """
     marked = 0
     for player in [*result.get("team_a", []), *result.get("team_b", [])]:
@@ -2344,7 +2345,7 @@ def mark_zero_stat_warning_reasons(result: dict) -> int:
         if player.get("warning_reason"):
             continue
         if (kills, assists, deaths) == (0, 0, 13):
-            player["warning_reason"] = "неправильный ник"
+            player["warning_reason"] = "додж статистики"
             marked += 1
         elif 0 <= kills < 4:
             player["warning_reason"] = "додж статистики"
