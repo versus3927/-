@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v39-clan-tag-cleanup-and-warning-copy-2026-09-11"
+BOT_VERSION = "v41-global-old-clan-tag-filter-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -105,11 +105,21 @@ def normalize_nickname(value: object) -> str:
 
 
 def strip_leading_clan_tags(value: str) -> str:
-    """Drop faded clan tags like [CLION] or plain `CLION` before the real nick."""
+    """Drop clan/league prefixes before the real nickname on every code path."""
     text = str(value).strip()
     previous = None
     while previous != text:
         previous = text
+        # OLD is a league/clan tag, never part of the game nickname. Remove it
+        # globally in all common renderings, regardless of case or decoration:
+        # `OLD | Nick`, `old Nick`, `[OLD] Nick`, `🔴 OLD — Nick`.
+        text = re.sub(
+            r"^\s*[^\w\[({]*[\[({]?\s*OLD\s*[\])}]?"
+            r"(?=\s|[|:·•\-–—])\s*(?:[|:·•\-–—]+\s*)?",
+            "",
+            text,
+            flags=re.I,
+        )
         text = re.sub(r"^\s*[\[({][^\])}]{1,20}[\])}]\s*", "", text)
         # Discord may render a role/clan prefix without brackets, for example
         # `CLION 1331` or `CLION | 1331`. Only an all-uppercase/digit prefix is
@@ -1905,6 +1915,20 @@ async def recognize_match(
     if score_only and visual_audit:
         raise ValueError("score_only и visual_audit нельзя включать одновременно")
     card_result = None if (score_only or visual_audit) else parse_complete_card(message_text)
+    card_has_placeholder_stats = bool(
+        card_result
+        and any(
+            (
+                int(player.get("kills", -1)),
+                int(player.get("assists", -1)),
+                int(player.get("deaths", -1)),
+            ) == (0, 0, 13)
+            for player in [
+                *card_result.get("team_a", []),
+                *card_result.get("team_b", []),
+            ]
+        )
+    )
     if (
         card_result is not None
         and card_result.get("ct_team") in ("A", "B")
@@ -1914,6 +1938,7 @@ async def recognize_match(
             int(card_result.get("score_a", 0) or 0),
             int(card_result.get("score_b", 0) or 0),
         ) >= 13
+        and not card_has_placeholder_stats
     ):
         log.info(
             "Матч #%s разобран напрямую без запроса к ИИ",
@@ -2039,6 +2064,7 @@ Build a registration result:
 - After matching a raw numeric mention to its scoreboard row, read the complete leading 2-, 3-, or 4-digit registration number immediately before the nickname (often displayed as `#89 Nick`, `[89] Nick`, or `89 | Nick`). Use that number as id. Never use the row number 1-5 and never take digits from the long Discord mention.
 - Explicit side labels in the card are authoritative. `Команда A - T` and `Команда B - CT` means ct_team=B; `Команда A - CT` means ct_team=A. Never reverse explicit labels based on assumptions.
 - K/A/D printed in a review card is authoritative. Copy it exactly for every roster slot; use the image only to recover the nickname and short ID for numeric mentions.
+- IMPORTANT EXCEPTION: `0/0/13` printed in the Discord card is a missing-match placeholder, not authoritative statistics. If that roster nickname exists on the attached scoreboard, replace the placeholder with the exact visible K/A/D from the screenshot. Ignore clan tags such as `OLD |`, `[OLD]`, `[NOOBS]` and similar prefixes while matching. Example: card `OLD | Hatefull — 0/0/13` plus scoreboard `Hatefull — 22/3/13` must return Hatefull as 22/3/13, never 0/0/13.
 - When several numeric-only roster entries exist, solve them globally: compare all visible K/A/D values and all still-unmatched scoreboard rows, and never assign one scoreboard row twice. Use team membership, roster order and remaining unmatched rows as tie-breakers.
 - Fuzzy nickname matching is REQUIRED. Ignore case, spaces, punctuation, clan tags, decorative prefixes/suffixes and extra text. A roster nickname contained inside a scoreboard nickname is a match: for example `versus`, `versusproto`, `[TAG]versus` and `versus_123` refer to the same player when there is no conflicting roster nickname.
 - Match obvious Cyrillic/Latin phonetic spellings too. For example Latin `versus` may appear as Cyrillic `версус`.
@@ -2223,6 +2249,57 @@ Build a registration result:
             "со строками таблицы по K/A/D; команда не будет отправлена."
         )
     if card_result is not None:
+        # A complete Discord card can still contain synthetic 0/0/13 rows
+        # when its own nickname parser treated a clan tag (for example OLD)
+        # as part of the nickname. Recover only those placeholders from the
+        # screenshot-backed AI result; keep every other card row untouched.
+        recovered_placeholders = 0
+        for team_key in ("team_a", "team_b"):
+            visual_candidates = list(result.get(team_key, []))
+            for card_player in card_result.get(team_key, []):
+                card_stats = (
+                    int(card_player.get("kills", -1)),
+                    int(card_player.get("assists", -1)),
+                    int(card_player.get("deaths", -1)),
+                )
+                if card_stats != (0, 0, 13):
+                    continue
+                ranked = sorted(
+                    (
+                        (
+                            nickname_similarity(
+                                card_player.get("nickname", ""),
+                                candidate.get("nickname", ""),
+                            ),
+                            candidate,
+                        )
+                        for candidate in visual_candidates
+                    ),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                if not ranked or ranked[0][0] < 0.72:
+                    continue
+                if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.08:
+                    continue
+                candidate = ranked[0][1]
+                recovered_stats = (
+                    int(candidate.get("kills", -1)),
+                    int(candidate.get("assists", -1)),
+                    int(candidate.get("deaths", -1)),
+                )
+                if recovered_stats == (0, 0, 13) or min(recovered_stats) < 0:
+                    continue
+                card_player["nickname"] = strip_leading_clan_tags(
+                    str(candidate.get("nickname") or card_player.get("nickname", ""))
+                )
+                card_player["kills"], card_player["assists"], card_player["deaths"] = recovered_stats
+                card_player.pop("warning_reason", None)
+                recovered_placeholders += 1
+        if recovered_placeholders:
+            card_result["notes"] += (
+                f" Восстановлено строк 0/0/13 со скриншота: {recovered_placeholders}."
+            )
         if result.get("is_surrender"):
             # Keep exact player K/A/D from the complete Discord card, but use
             # the normalized 13:X surrender score read from the screenshot.
