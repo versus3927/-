@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v48-forwarded-card-original-helper-and-visual-stats-2026-09-11"
+BOT_VERSION = "v51-emoji-roster-lines-and-old-audit-prompt-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -578,6 +578,61 @@ async def find_original_match_card(
     forwarded_message: discord.Message,
 ) -> Optional[discord.Message]:
     """Find the live original card whose forwarded snapshot lost its button."""
+    def is_original_candidate(candidate: object) -> bool:
+        if candidate is None or getattr(candidate, "id", None) == forwarded_message.id:
+            return False
+        text = plain_message_text(candidate)
+        found = re.search(r"(?:матч|матча)\s*#\s*(\d+)", text, re.I)
+        return bool(
+            found
+            and int(found.group(1)) == int(match_id)
+            and find_get_players_button(candidate) is not None
+        )
+
+    # Discord forwards normally preserve a message reference. Fetch that
+    # exact source before falling back to channel-history scanning.
+    references: list[object] = []
+    for part in message_parts(forwarded_message):
+        for reference in (
+            getattr(part, "reference", None),
+            getattr(part, "message_reference", None),
+        ):
+            if reference is not None and reference not in references:
+                references.append(reference)
+
+    for reference in references:
+        for candidate in (
+            getattr(reference, "resolved", None),
+            getattr(reference, "cached_message", None),
+        ):
+            if is_original_candidate(candidate):
+                return candidate
+
+        channel_id = getattr(reference, "channel_id", None)
+        message_id = getattr(reference, "message_id", None)
+        if not channel_id or not message_id:
+            continue
+        try:
+            channel = client.get_channel(int(channel_id))
+            if channel is None:
+                channel = await client.fetch_channel(int(channel_id))
+            candidate = await channel.fetch_message(int(message_id))
+            if is_original_candidate(candidate):
+                log.info(
+                    "Матч #%s: оригинальная карточка %s получена по ссылке forward",
+                    match_id,
+                    message_id,
+                )
+                return candidate
+        except Exception:
+            log.warning(
+                "Матч #%s: не удалось получить оригинал forward %s/%s",
+                match_id,
+                channel_id,
+                message_id,
+                exc_info=True,
+            )
+
     preferred_ids = {
         *NORMAL_CHANNEL_IDS,
         *PRIORITY_CHANNEL_IDS,
@@ -604,16 +659,30 @@ async def find_original_match_card(
             ) and channel not in channels:
                 channels.append(channel)
 
+    # Last-resort search: the original channel may have an arbitrary name.
+    # Check a short recent window in every other visible text channel rather
+    # than failing and trying to use incomplete long Discord IDs.
+    for guild in getattr(client, "guilds", None) or []:
+        for channel in getattr(guild, "text_channels", None) or []:
+            if channel not in channels:
+                channels.append(channel)
+
     for channel in channels:
         try:
-            async for candidate in channel.history(limit=min(BACKFILL_LIMIT, 500)):
+            channel_id = getattr(channel, "id", None)
+            channel_name = str(getattr(channel, "name", "") or "").casefold()
+            is_likely_source = (
+                channel_id in preferred_ids
+                or "основ" in channel_name
+                or "приоритет" in channel_name
+                or "result" in channel_name
+                or "результ" in channel_name
+            )
+            history_limit = min(BACKFILL_LIMIT, 500) if is_likely_source else 100
+            async for candidate in channel.history(limit=history_limit):
                 if candidate.id == forwarded_message.id:
                     continue
-                text = plain_message_text(candidate)
-                found = re.search(r"(?:матч|матча)\s*#\s*(\d+)", text, re.I)
-                if not found or int(found.group(1)) != int(match_id):
-                    continue
-                if find_get_players_button(candidate) is not None:
+                if is_original_candidate(candidate):
                     log.info(
                         "Матч #%s: найдена оригинальная карточка %s в канале %s",
                         match_id,
@@ -1355,8 +1424,10 @@ def parse_card_roster_identities(
         players: list[dict] = []
         for raw_line in section.splitlines():
             line = raw_line.strip().strip("`*_")
-            found = re.match(
-                r"^[•·-]?\s*@?\s*#\s*(\d{1,5})\s*(?:\|\s*)?(.+?)\s*$",
+            # Status icons such as ❓/⚠️ may appear before @#ID. Search for the
+            # first real short ID instead of requiring it at column zero.
+            found = re.search(
+                r"(?<!\d)#\s*(\d{1,5})(?!\d)\s*(?:\|\s*)?(.+?)\s*$",
                 line,
             )
             if not found:
@@ -2162,7 +2233,7 @@ Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the c
 If the result says `СДАЛИСЬ`/surrendered, set is_surrender=true. Set winner_side to the side that DID NOT surrender. The `СДАЛИСЬ` label belongs to the side that surrendered, so the opposite side is the winner. For a normal completed game set is_surrender=false and winner_side=null. Keep score_left/score_right as the raw numbers visibly printed; the program will convert the winner to 13.
 Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least four card players are reliably matched in total.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
-For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
+For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`; `OLD | Shkiper`, `[OLD] Shkiper` and `🔴 OLD — Shkiper` all mean nickname `Shkiper`. OLD is always a clan/league tag when it appears as a separated prefix; never include it in the nickname.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
 Set confidence below 0.90 if any score or K/A/D digit is unclear. Return only valid JSON."""
     elif score_only:
