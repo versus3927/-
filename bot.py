@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v38-warning-tags-and-league-eligibility-2026-09-10"
+BOT_VERSION = "v39-clan-tag-cleanup-and-warning-copy-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -755,7 +755,8 @@ def parse_players_modal(modal_text: str) -> Optional[dict[str, list[dict]]]:
         if not named and not numeric:
             continue
         if named:
-            player_id, nickname = int(named.group(1)), named.group(2).strip()
+            player_id = int(named.group(1))
+            nickname = strip_leading_clan_tags(named.group(2).strip())
             kills, assists, deaths = map(int, named.group(3, 4, 5))
         else:
             player_id, nickname = int(numeric.group(1)), ""
@@ -1739,7 +1740,9 @@ def parse_complete_card(message_text: str) -> Optional[dict]:
             team.append(
                 {
                     "id": int(found.group(1)),
-                    "nickname": found.group(2).strip(" `*_.,"),
+                    "nickname": strip_leading_clan_tags(
+                        found.group(2).strip(" `*_.,")
+                    ),
                     "kills": kills,
                     "assists": assists,
                     "deaths": deaths,
@@ -2163,6 +2166,15 @@ Build a registration result:
         output_text = output_text.split("\n", 1)[1]
         output_text = output_text.rsplit("```", 1)[0].strip()
     result = json.loads(output_text)
+    # Apply the same clan-tag cleanup to every recognition route.  Tags such
+    # as `OLD | Shkiper`, `[NOOBS] TRIXI67` and `[XAskу] apathy` identify the
+    # clan/league, not any part of the player's nickname.
+    for team_key in ("team_a", "team_b", "left_players", "right_players"):
+        for player in result.get(team_key, []) or []:
+            if isinstance(player, dict) and player.get("nickname"):
+                player["nickname"] = strip_leading_clan_tags(
+                    str(player["nickname"])
+                )
     if result.get("is_surrender"):
         if visual_audit:
             winner_side = result.get("winner_side")
@@ -2230,8 +2242,8 @@ Build a registration result:
 
 WARNING_REASON_LABELS = {
     "нет на скриншоте": "Отсутствие на финальном скриншоте",
-    "неправильный ник": "Неверный игровой никнейм",
-    "додж статистики": "Додж статистики",
+    "неправильный ник": "Несоответствие игрового никнейма.",
+    "додж статистики": "Обнуление игровой статистики",
 }
 
 
