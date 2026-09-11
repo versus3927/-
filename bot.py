@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v47-forwarded-card-cross-guild-ids-2026-09-11"
+BOT_VERSION = "v48-forwarded-card-original-helper-and-visual-stats-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -570,6 +570,64 @@ def find_get_players_button(message: discord.Message):
 
         stack.extend(getattr(component, "children", None) or [])
         stack.extend(getattr(component, "components", None) or [])
+    return None
+
+
+async def find_original_match_card(
+    match_id: int,
+    forwarded_message: discord.Message,
+) -> Optional[discord.Message]:
+    """Find the live original card whose forwarded snapshot lost its button."""
+    preferred_ids = {
+        *NORMAL_CHANNEL_IDS,
+        *PRIORITY_CHANNEL_IDS,
+        *active_channel_ids,
+    }
+    channels: list[object] = []
+    for channel_id in preferred_ids:
+        channel = client.get_channel(channel_id)
+        if channel is not None and channel not in channels:
+            channels.append(channel)
+
+    # Also inspect likely registration channels on shared guilds. This is
+    # needed when a test card is forwarded into another server and its source
+    # channel is not part of the currently selected autorun mode.
+    for guild in getattr(client, "guilds", None) or []:
+        for channel in getattr(guild, "text_channels", None) or []:
+            name = str(getattr(channel, "name", "") or "").casefold()
+            if (
+                getattr(channel, "id", None) in preferred_ids
+                or "основ" in name
+                or "приоритет" in name
+                or "result" in name
+                or "результ" in name
+            ) and channel not in channels:
+                channels.append(channel)
+
+    for channel in channels:
+        try:
+            async for candidate in channel.history(limit=min(BACKFILL_LIMIT, 500)):
+                if candidate.id == forwarded_message.id:
+                    continue
+                text = plain_message_text(candidate)
+                found = re.search(r"(?:матч|матча)\s*#\s*(\d+)", text, re.I)
+                if not found or int(found.group(1)) != int(match_id):
+                    continue
+                if find_get_players_button(candidate) is not None:
+                    log.info(
+                        "Матч #%s: найдена оригинальная карточка %s в канале %s",
+                        match_id,
+                        candidate.id,
+                        getattr(channel, "id", "?"),
+                    )
+                    return candidate
+        except Exception:
+            log.warning(
+                "Матч #%s: не удалось проверить канал %s для поиска оригинала",
+                match_id,
+                getattr(channel, "id", "?"),
+                exc_info=True,
+            )
     return None
 
 
@@ -3383,7 +3441,22 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 else:
                     # Keep support for old review cards whose IDs/statistics
                     # can be recovered only through the helper button.
-                    modal_text, _helper_image_urls = await get_players_response(message)
+                    helper_message = message
+                    if (
+                        is_forwarded_message(message)
+                        and find_get_players_button(message) is None
+                        and reserved_match_id is not None
+                    ):
+                        original_message = await find_original_match_card(
+                            reserved_match_id,
+                            message,
+                        )
+                        if original_message is not None:
+                            helper_message = original_message
+
+                    modal_text, _helper_image_urls = await get_players_response(
+                        helper_message
+                    )
                     if not modal_text:
                         diagnostics = full_match_diagnostics(context)
                         log.error(
@@ -3400,7 +3473,23 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                             diagnostics,
                         )
                         return
-                    result = result_from_review_card_and_modal(context, modal_text)
+                    # Even when the helper returns 0/0/0, the original
+                    # screenshot remains authoritative. If that nickname is
+                    # visible, use its real K/A/D and never emit fake 0/0/13.
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        raw_images = await asyncio.gather(
+                            *(download_image(session, url) for url in urls[:4])
+                        )
+                    audit = await recognize_match(
+                        raw_images,
+                        visual_audit=True,
+                    )
+                    result = result_from_review_card_and_modal(
+                        context,
+                        modal_text,
+                        visual_audit=audit,
+                    )
                     if result is None:
                         diagnostics = full_match_diagnostics(context, modal_text)
                         await send_processing_error_log(
