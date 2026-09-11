@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50.3-warning-must-mention-user-2026-09-12"
+BOT_VERSION = "v50.4-no-false-fallback-nickname-warnings-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1691,8 +1691,10 @@ def result_from_card_and_visual_audit(
             if kills == 0 and assists == 0 and deaths == 0:
                 deaths = 13
                 warning_reason = "додж статистики"
-            elif card_index in forced_wrong_nickname_indices:
-                warning_reason = "неправильный ник"
+            # A fallback assignment is not evidence of a wrong nickname.
+            # OCR can miss or distort an otherwise correct name such as
+            # `shizik`. Low-stat warnings are applied later from the real K/D,
+            # but this fallback alone must never create a nickname warning.
             merged_player = {
                 # The card itself is authoritative for registration IDs.
                 "id": int(card_player["id"]),
