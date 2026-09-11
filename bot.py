@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v45-scoreboard-is-source-of-truth-2026-09-11"
+BOT_VERSION = "v47-forwarded-card-cross-guild-ids-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -480,20 +480,53 @@ def is_forwarded_message(message: discord.Message) -> bool:
 
 
 async def resolve_member_mentions(text: str, message: discord.Message) -> str:
-    """Replace long raw mentions with visible server display names."""
+    """Replace mentions with the best display name from every shared guild.
+
+    Forwarded cards may be posted in a different server. The destination
+    server often shows only `@Shkiper`, while the original league server keeps
+    the registration identity as `#124 | OLD | Shkiper`. Prefer the latter so
+    test mode can build a real =g command without clicking the lost button.
+    """
     mention_ids = list(dict.fromkeys(
         int(value) for value in re.findall(r"<@!?(\d{15,22})>", text)
     ))
-    guild = getattr(message, "guild", None)
     known = {int(member.id): member for member in (message.mentions or [])}
     for member_id in mention_ids:
-        member = known.get(member_id) or (guild.get_member(member_id) if guild else None)
-        if member is None and guild is not None:
-            try:
-                member = await guild.fetch_member(member_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                member = None
-        display_name = str(getattr(member, "display_name", "") or "").strip()
+        candidates: list[object] = []
+        if member_id in known:
+            candidates.append(known[member_id])
+
+        guilds: list[object] = []
+        for guild in (
+            getattr(message, "guild", None),
+            *(getattr(client, "guilds", None) or []),
+        ):
+            if guild is not None and guild not in guilds:
+                guilds.append(guild)
+
+        for guild in guilds:
+            member = guild.get_member(member_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(member_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+            if member is not None and member not in candidates:
+                candidates.append(member)
+
+        display_names = [
+            str(getattr(member, "display_name", "") or "").strip()
+            for member in candidates
+            if str(getattr(member, "display_name", "") or "").strip()
+        ]
+        display_name = next(
+            (
+                name for name in display_names
+                if re.search(r"(?<!\d)#\s*\d{1,5}(?!\d)", name)
+                or re.search(r"(?:^|\D)\d{1,5}\s*\|", name)
+            ),
+            display_names[0] if display_names else "",
+        )
         if display_name:
             text = re.sub(rf"<@!?{member_id}>", f"@{display_name}", text)
     return text
@@ -3603,8 +3636,6 @@ async def process_message_once(
     if message.id in processed_message_ids:
         return False
     if test_only:
-        if client.user and message.author.id == client.user.id:
-            return False
         if not is_forwarded_message(message) or not image_urls(message):
             return False
     elif not allowed_for_parsing(message) or not image_urls(message):
@@ -3881,13 +3912,11 @@ async def on_message(message: discord.Message) -> None:
         )
         return
 
-    # A forwarded game card outside the active registration channels is a
-    # test request. It is recognized by the unchanged parser and receives
-    # only the generated registration command as a reply.
-    if (
-        is_forwarded_message(message)
-        and message.channel.id not in active_channel_ids
-    ):
+    # Any forwarded game card is a safe test request, including a card posted
+    # by the self-bot account in the main command channel or in an active
+    # registration channel. It only prints the generated =g command: no stats
+    # are saved, no confirmation is awaited and no source message is deleted.
+    if is_forwarded_message(message) and image_urls(message):
         await process_message_once(message, test_only=True)
         return
 
