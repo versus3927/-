@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v44-visible-player-stat-recovery-2026-09-11"
+BOT_VERSION = "v45-scoreboard-is-source-of-truth-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -3289,47 +3289,30 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     raw_images = await asyncio.gather(
                         *(download_image(session, url) for url in urls[:4])
                     )
-                complete_has_placeholders = any(
-                    (
-                        int(player.get("kills", -1)),
-                        int(player.get("assists", -1)),
-                        int(player.get("deaths", -1)),
-                    ) == (0, 0, 13)
-                    for player in [
-                        *complete_card.get("team_a", []),
-                        *complete_card.get("team_b", []),
-                    ]
+                # The original scoreboard is always the source of truth. A
+                # generated card can contain not only fake 0/0/13 rows but an
+                # incorrect score such as 0:13 while the screenshot says 9:13.
+                audit = await recognize_match(
+                    raw_images,
+                    visual_audit=True,
                 )
-                if complete_has_placeholders:
-                    # 0/0/13 in a generated card is only a placeholder. Always
-                    # re-read the original scoreboard independently. This
-                    # prevents visible players from being registered as zero
-                    # because a clan tag or OCR variation broke the first pass.
-                    audit = await recognize_match(
-                        raw_images,
-                        visual_audit=True,
+                result = result_from_card_and_visual_audit(context, audit)
+                if result is None:
+                    diagnostics = full_match_diagnostics(context)
+                    log.error(
+                        "Матч #%s остановлен: карточка не прошла независимую "
+                        "проверку по исходному скриншоту. audit=%r\n%s",
+                        reserved_match_id or "?",
+                        audit,
+                        diagnostics,
                     )
-                    result = result_from_card_and_visual_audit(context, audit)
-                    if result is None:
-                        diagnostics = full_match_diagnostics(context)
-                        log.error(
-                            "Матч #%s остановлен: не удалось безопасно "
-                            "восстановить строки 0/0/13 со скриншота. audit=%r\n%s",
-                            reserved_match_id or "?",
-                            audit,
-                            diagnostics,
-                        )
-                        await send_processing_error_log(
-                            reserved_match_id or "?",
-                            message,
-                            "Не удалось безопасно восстановить игроков 0/0/13 со скриншота.",
-                            diagnostics,
-                        )
-                        return
-                else:
-                    # With no placeholders, the card's exact K/A/D stays
-                    # authoritative; AI is needed only for CT/T mapping.
-                    result = await recognize_match(raw_images, context)
+                    await send_processing_error_log(
+                        reserved_match_id or "?",
+                        message,
+                        "Карточка не прошла проверку счёта и игроков по скриншоту.",
+                        diagnostics,
+                    )
+                    return
             elif review_card or has_players_button:
                 card_rosters = parse_card_roster_identities(context)
                 if card_rosters is not None:
