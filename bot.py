@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50.5-exclamation-nickname-mapping-2026-09-12"
+BOT_VERSION = "v50.6-halftime-side-swap-mapping-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1567,7 +1567,28 @@ def result_from_card_and_visual_audit(
     direct_names = direct_a[2] + direct_b[2]
     swapped_names = swapped_a[2] + swapped_b[2]
 
-    if (direct_count, direct_names) >= (swapped_count, swapped_names):
+    # After the halftime side switch, Team A/B can appear on the opposite
+    # scoreboard halves. When the card's A:B score exactly matches the visible
+    # scores in reverse order, that score mapping is authoritative and must
+    # override a weaker nickname-only orientation decision.
+    card_score_hint = readable_score_from_context(message_text)
+    score_proves_direct = bool(
+        card_score_hint
+        and card_score_hint[0] == score_left
+        and card_score_hint[1] == score_right
+    )
+    score_proves_swapped = bool(
+        card_score_hint
+        and card_score_hint[0] == score_right
+        and card_score_hint[1] == score_left
+        and score_left != score_right
+    )
+    score_proves_orientation = score_proves_direct or score_proves_swapped
+
+    if score_proves_direct or (
+        not score_proves_swapped
+        and (direct_count, direct_names) >= (swapped_count, swapped_names)
+    ):
         chosen_count, other_count = direct_count, swapped_count
         chosen_names, other_names = direct_names, swapped_names
         alignment_a, alignment_b = direct_a, direct_b
@@ -1587,6 +1608,8 @@ def result_from_card_and_visual_audit(
         or min(alignment_a[1], alignment_b[1]) < 1
         or min(alignment_a[3], alignment_b[3]) < 0.72
         or (
+            not score_proves_orientation
+            and
             chosen_count == other_count
             and chosen_names - other_names < 0.08
         )
