@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50.6-halftime-side-swap-mapping-2026-09-12"
+BOT_VERSION = "v50-complete-forwarded-test-recovery-2026-09-11"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -99,13 +99,6 @@ def normalize_nickname(value: object) -> str:
         text,
         flags=re.I,
     )
-    # Special league convention: a Discord server nickname consisting only
-    # of `!` is displayed in STANDOFF 2 as `!1`. Treat both forms as the same
-    # player so the visible scoreboard row supplies real K/A/D instead of the
-    # missing-player fallback 0/0/13.
-    compact_text = re.sub(r"\s+", "", text)
-    if compact_text in {"!", "!1"}:
-        return "specialbangone"
     text = unicodedata.normalize("NFKD", text).casefold()
     text = text.translate(_CYRILLIC_TO_LATIN)
     return "".join(character for character in text if character.isalnum())
@@ -152,18 +145,6 @@ def nickname_similarity(first: object, second: object) -> float:
     # with player IDs and scoreboard values.
     if left.isdigit() or right.isdigit():
         return 0.0
-
-    # Gemini can confuse lowercase `y` and `v` in short game nicknames.
-    # `y2k` and `v2k` are therefore the same player when the numeric suffix is
-    # identical. The high score also lets warning delivery resolve the actual
-    # Discord member `#21 | y2k` instead of posting an untagged OCR nickname.
-    if (
-        len(left) == len(right) == 3
-        and left[1:] == right[1:]
-        and {left[0], right[0]} == {"y", "v"}
-        and any(character.isdigit() for character in left[1:])
-    ):
-        return 0.96
 
     left_without_edge_digits = re.sub(r"^\d+|\d+$", "", left)
     right_without_edge_digits = re.sub(r"^\d+|\d+$", "", right)
@@ -1567,28 +1548,7 @@ def result_from_card_and_visual_audit(
     direct_names = direct_a[2] + direct_b[2]
     swapped_names = swapped_a[2] + swapped_b[2]
 
-    # After the halftime side switch, Team A/B can appear on the opposite
-    # scoreboard halves. When the card's A:B score exactly matches the visible
-    # scores in reverse order, that score mapping is authoritative and must
-    # override a weaker nickname-only orientation decision.
-    card_score_hint = readable_score_from_context(message_text)
-    score_proves_direct = bool(
-        card_score_hint
-        and card_score_hint[0] == score_left
-        and card_score_hint[1] == score_right
-    )
-    score_proves_swapped = bool(
-        card_score_hint
-        and card_score_hint[0] == score_right
-        and card_score_hint[1] == score_left
-        and score_left != score_right
-    )
-    score_proves_orientation = score_proves_direct or score_proves_swapped
-
-    if score_proves_direct or (
-        not score_proves_swapped
-        and (direct_count, direct_names) >= (swapped_count, swapped_names)
-    ):
+    if (direct_count, direct_names) >= (swapped_count, swapped_names):
         chosen_count, other_count = direct_count, swapped_count
         chosen_names, other_names = direct_names, swapped_names
         alignment_a, alignment_b = direct_a, direct_b
@@ -1608,8 +1568,6 @@ def result_from_card_and_visual_audit(
         or min(alignment_a[1], alignment_b[1]) < 1
         or min(alignment_a[3], alignment_b[3]) < 0.72
         or (
-            not score_proves_orientation
-            and
             chosen_count == other_count
             and chosen_names - other_names < 0.08
         )
@@ -1721,10 +1679,8 @@ def result_from_card_and_visual_audit(
             if kills == 0 and assists == 0 and deaths == 0:
                 deaths = 13
                 warning_reason = "додж статистики"
-            # A fallback assignment is not evidence of a wrong nickname.
-            # OCR can miss or distort an otherwise correct name such as
-            # `shizik`. Low-stat warnings are applied later from the real K/D,
-            # but this fallback alone must never create a nickname warning.
+            elif card_index in forced_wrong_nickname_indices:
+                warning_reason = "неправильный ник"
             merged_player = {
                 # The card itself is authoritative for registration IDs.
                 "id": int(card_player["id"]),
@@ -2566,12 +2522,13 @@ WARNING_REASON_LABELS = {
 
 
 def mark_zero_stat_warning_reasons(result: dict) -> int:
-    """Apply warning rules, giving low-kill statistics highest priority.
+    """Apply warning rules without confusing a nickname miss with stat dodge.
 
-    Zero through four kills, including exactly four, is always "statistics
-    reset" even if an earlier matching stage tentatively marked the nickname.
-    This prevents a 4-kill player such as `de jure` from receiving the wrong
-    warning reason.
+    An already detected nickname reason is authoritative. A matched scoreboard
+    row is a statistics reset when it has fewer than four kills. A bare
+    synthetic 0/0/13 means that the player disappeared from the final table,
+    so it is also a statistics reset. Nickname mismatch is used only when an
+    unmatched visible row proves that the player played under another nick.
     """
     marked = 0
     for player in [*result.get("team_a", []), *result.get("team_b", [])]:
@@ -2582,14 +2539,14 @@ def mark_zero_stat_warning_reasons(result: dict) -> int:
         except (TypeError, ValueError):
             continue
 
-        previous_reason = player.get("warning_reason")
-        if (kills, assists, deaths) == (0, 0, 13) or 0 <= kills <= 4:
+        if player.get("warning_reason"):
+            continue
+        if (kills, assists, deaths) == (0, 0, 13):
             player["warning_reason"] = "додж статистики"
-            if previous_reason != "додж статистики":
-                marked += 1
-            continue
-        if previous_reason:
-            continue
+            marked += 1
+        elif 0 <= kills < 4:
+            player["warning_reason"] = "додж статистики"
+            marked += 1
     return marked
 
 
@@ -3181,18 +3138,6 @@ async def send_zero_stat_warnings(
                 identity_candidates,
                 ordered_user_id,
             )
-            if user_id is None:
-                # A warning without a real Discord mention is not a warning to
-                # the player. Never post a plain nickname as a fallback.
-                log.error(
-                    "Варн матча #%s не отправлен: не найден Discord ID "
-                    "игрока #%s %s",
-                    result.get("match_id"),
-                    player.get("id"),
-                    player.get("nickname"),
-                )
-                continue
-
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
                     "Варн матча #%s пропущен для Pro League пользователя %s",
@@ -3217,7 +3162,11 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
-            target = f"<@{user_id}>"
+            target = (
+                f"<@{user_id}>"
+                if user_id is not None
+                else f"`{player.get('nickname') or 'ник не найден'}`"
+            )
             reason_text = WARNING_REASON_LABELS.get(
                 player["warning_reason"],
                 "Обнуление игровой статистики",
