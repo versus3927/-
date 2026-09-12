@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50-final6-process-edited-result-cards-2026-09-12"
+BOT_VERSION = "v50-final10-never-delete-before-confirmation-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -925,7 +925,18 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
             asyncio.create_task(client.wait_for("interaction", check=interaction_check)),
         ]
         try:
-            click_result = await button.click()
+            try:
+                click_result = await button.click()
+            except (AttributeError, TypeError) as exc:
+                # Forwarded/snapshot components can be MissingSentinel objects
+                # without Discord message state. This is a recoverable helper
+                # failure, not a reason to crash or delete the source card.
+                log.warning(
+                    "Матч #%s: кнопка «Получить игроков» недоступна в snapshot: %s",
+                    expected_match_id or "?",
+                    exc,
+                )
+                return None, []
             observed_roots: list[object] = [button, message]
             if click_result is not None:
                 observed_roots.append(click_result)
@@ -2766,7 +2777,7 @@ async def send_original_card_to_log(
             except Exception:
                 log.warning(
                     "Не удалось переслать исходную карточку матча #%s; "
-                    "используется резервная копия",
+                    "используется ��������зервная копия",
                     match_id,
                     exc_info=True,
                 )
@@ -3577,23 +3588,18 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
     processing_completed = False
     async with message.channel.typing():
         try:
-            # If this match was already confirmed earlier, no recognition or
-            # second registration is needed. Remove every repeated result
-            # card for it from the registration channel immediately.
+            # A saved record prevents duplicate registration, but never proves
+            # that this particular source message is safe to delete. Source
+            # cards are removed only in the confirmed «Готово» path below.
             if (
                 not test_only
                 and
                 reserved_match_id is not None
                 and await registration_exists(reserved_match_id)
             ):
-                deleted = await delete_duplicate_match_cards(
-                    message,
-                    reserved_match_id,
-                )
                 log.info(
-                    "Матч #%s уже зарегистрирован; удалено карточек-дублей: %s",
+                    "Матч #%s уже есть в истории; исходное сообщение сохранено.",
                     reserved_match_id,
-                    deleted,
                 )
                 processing_completed = True
                 return
@@ -3618,9 +3624,52 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             )
             modal_text: Optional[str] = None
 
+            async def discard_live_tab_card(audit: dict) -> bool:
+                """Reject a live TAB without ever deleting an unregistered card."""
+                if not audit.get("has_live_gameplay_hud"):
+                    return False
+                log.info(
+                    "Матч #%s определён как открытый TAB, а не финальный экран.",
+                    reserved_match_id or "?",
+                )
+                # Test previews are intentionally non-destructive and must
+                # still return the generated =g command. Bypass only the final-
+                # screen gate for this preview; real registration is unchanged.
+                if test_only:
+                    audit["is_scoreboard"] = True
+                    audit["is_final_result"] = True
+                    audit["has_live_gameplay_hud"] = False
+                    audit["notes"] = (
+                        str(audit.get("notes", ""))
+                        + " Тестовый предпросмотр открытого TAB; в рабочем "
+                        "канале такая карточка пропускается и сохраняется."
+                    ).strip()
+                    return False
+                # Safety invariant: source cards are deleted only after the
+                # registration bot confirms the match with «Готово». A visual
+                # classifier can be wrong, so a rejected live-TAB card stays.
+                log.info(
+                    "Матч #%s пропущен как live TAB; исходное сообщение сохранено.",
+                    reserved_match_id or "?",
+                )
+                return True
+
             async def try_players_helper_fallback(audit: dict) -> Optional[dict]:
-                """Use authoritative helper IDs/stats when OCR names are weak."""
+                """Use the helper only after proving this is a final result."""
                 nonlocal modal_text
+                # Never click «Получить игроков» for an opened live TAB. The
+                # helper is only a fallback for weak OCR on a final screen.
+                if (
+                    not audit.get("is_scoreboard")
+                    or not audit.get("is_final_result")
+                    or audit.get("has_live_gameplay_hud")
+                ):
+                    log.info(
+                        "Матч #%s: «Получить игроков» не нажата — финальный "
+                        "экран не подтверждён.",
+                        reserved_match_id or "?",
+                    )
+                    return None
                 helper_message = message
                 if (
                     is_forwarded_message(message)
@@ -3667,6 +3716,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     message_text=context,
                     visual_audit=True,
                 )
+                if await discard_live_tab_card(audit):
+                    processing_completed = True
+                    return
                 result = result_from_card_and_visual_audit(context, audit)
                 if result is None:
                     result = await try_players_helper_fallback(audit)
@@ -3702,6 +3754,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                         message_text=context,
                         visual_audit=True,
                     )
+                    if await discard_live_tab_card(audit):
+                        processing_completed = True
+                        return
                     result = result_from_card_and_visual_audit(context, audit)
                     if result is None:
                         result = await try_players_helper_fallback(audit)
@@ -3726,6 +3781,22 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 else:
                     # Keep support for old review cards whose IDs/statistics
                     # can be recovered only through the helper button.
+                    # Inspect the screenshot FIRST: a live TAB card must be
+                    # deleted without ever clicking «Получить игроков».
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        raw_images = await asyncio.gather(
+                            *(download_image(session, url) for url in urls[:4])
+                        )
+                    audit = await recognize_match(
+                        raw_images,
+                        message_text=context,
+                        visual_audit=True,
+                    )
+                    if await discard_live_tab_card(audit):
+                        processing_completed = True
+                        return
+
                     helper_message = message
                     if (
                         is_forwarded_message(message)
@@ -3761,16 +3832,6 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     # Even when the helper returns 0/0/0, the original
                     # screenshot remains authoritative. If that nickname is
                     # visible, use its real K/A/D and never emit fake 0/0/13.
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in urls[:4])
-                        )
-                    audit = await recognize_match(
-                        raw_images,
-                        message_text=context,
-                        visual_audit=True,
-                    )
                     result = result_from_review_card_and_modal(
                         context,
                         modal_text,
@@ -3873,7 +3934,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 )
                 await send_processing_error_log(
                     result.get("match_id") or reserved_match_id or "?", message,
-                    f"Низкая уверенность распознавания: {confidence:.2f}.", diagnostics,
+                    f"Низк��я уверенность распознавания: {confidence:.2f}.", diagnostics,
                 )
                 return
 
@@ -3914,12 +3975,10 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 return
 
             match_id = int(result["match_id"])
-            if not await record_registration(match_id):
-                deleted = await delete_duplicate_match_cards(message, match_id)
+            if await registration_exists(match_id):
                 log.info(
-                    "Матч #%s уже зарегистрирован — удалено карточек-дублей: %s",
+                    "Матч #%s уже есть в истории; исходное сообщение сохранено.",
                     match_id,
-                    deleted,
                 )
                 processing_completed = True
                 return
@@ -3931,7 +3990,6 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 match_id,
             )
             if not confirmed:
-                await forget_registration(match_id)
                 log.warning(
                     "Матч #%s не подтверждён; исходная карточка сохранена. Ответ: %s",
                     match_id,
@@ -3948,6 +4006,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     )
                 return
 
+            # Persist only after the external registration bot has explicitly
+            # confirmed success. Nothing before this line may delete the source.
+            await record_registration(match_id)
             await send_registration_log(result, message, command_text)
             await send_zero_stat_warnings(result, message)
             if DELETE_AFTER_REGISTRATION:
@@ -4239,7 +4300,7 @@ async def on_message(message: discord.Message) -> None:
         deleted, scanned, failed = await delete_all_registration_confirmations(
             registration_channel_ids
         )
-        suffix = f" Ошибок каналов: **{failed}**." if failed else ""
+        suffix = f" Ошибо�� каналов: **{failed}**." if failed else ""
         await message.channel.send(
             f"✅ Очистка завершена. Каналов проверено: **{scanned}**, "
             f"сообщений удалено: **{deleted}**.{suffix}"
