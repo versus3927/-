@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50-complete-forwarded-test-recovery-2026-09-11"
+BOT_VERSION = "v50-final-clan-tags-all-formats-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -120,6 +120,20 @@ def strip_leading_clan_tags(value: str) -> str:
             text,
             flags=re.I,
         )
+        # A visible separator is authoritative for arbitrary clan/league tags,
+        # including mixed-case forms which cannot safely be recognized by
+        # capitalization alone: `MCRW|ReNiTe`, `noob | Yaksty`,
+        # `sley｜Future`, and chained `OLD | MCRW | Shkiper`.
+        pipe_tag = re.match(
+            r"^\s*([^|｜¦]{1,24}?)\s*[|｜¦]\s*(\S.*)$",
+            text,
+        )
+        if pipe_tag:
+            prefix = pipe_tag.group(1).strip(" [](){}<>@#`*_.,:;·•-–—")
+            nickname = pipe_tag.group(2).strip()
+            if prefix and nickname:
+                text = nickname
+                continue
         text = re.sub(r"^\s*[\[({][^\])}]{1,20}[\])}]\s*", "", text)
         # Discord may render a role/clan prefix without brackets, for example
         # `CLION 1331` or `CLION | 1331`. Only an all-uppercase/digit prefix is
@@ -1425,7 +1439,9 @@ def parse_card_roster_identities(
         for raw_line in section.splitlines():
             line = raw_line.strip().strip("`*_")
             found = re.match(
-                r"^[•·-]?\s*@?\s*#\s*(\d{1,5})\s*(?:\|\s*)?(.+?)\s*$",
+                # Status/emoji prefixes are decoration, not nickname text:
+                # `❓ @#124 | OLD | Shkiper`.
+                r"^[^0-9\n]{0,32}#\s*(\d{1,5})\s*(?:\|\s*)?(.+?)\s*$",
                 line,
             )
             if not found:
@@ -2231,7 +2247,7 @@ Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the c
 If the result says `СДАЛИСЬ`/surrendered, set is_surrender=true. Set winner_side to the side that DID NOT surrender. The `СДАЛИСЬ` label belongs to the side that surrendered, so the opposite side is the winner. For a normal completed game set is_surrender=false and winner_side=null. Keep score_left/score_right as the raw numbers visibly printed; the program will convert the winner to 13.
 Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least four card players are reliably matched in total.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
-For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`.
+For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`. `OLD` is always a clan/league tag, never the player's nickname: `OLD|Shkiper`, `OLD | Shkiper`, `[OLD] Shkiper`, and `🔴 OLD — Shkiper` all mean nickname `Shkiper`.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
 Set confidence below 0.90 if any score or K/A/D digit is unclear. Return only valid JSON."""
     elif score_only:
