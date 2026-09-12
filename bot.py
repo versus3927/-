@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50.4-no-false-fallback-nickname-warnings-2026-09-12"
+BOT_VERSION = "v50.5-exclamation-nickname-mapping-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -99,6 +99,13 @@ def normalize_nickname(value: object) -> str:
         text,
         flags=re.I,
     )
+    # Special league convention: a Discord server nickname consisting only
+    # of `!` is displayed in STANDOFF 2 as `!1`. Treat both forms as the same
+    # player so the visible scoreboard row supplies real K/A/D instead of the
+    # missing-player fallback 0/0/13.
+    compact_text = re.sub(r"\s+", "", text)
+    if compact_text in {"!", "!1"}:
+        return "specialbangone"
     text = unicodedata.normalize("NFKD", text).casefold()
     text = text.translate(_CYRILLIC_TO_LATIN)
     return "".join(character for character in text if character.isalnum())
