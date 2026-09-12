@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50-final-clan-tags-all-formats-2026-09-12"
+BOT_VERSION = "v50-final5-helper-fallback-and-roster-guidance-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -170,6 +170,11 @@ def nickname_similarity(first: object, second: object) -> float:
         return 0.99
 
     shorter, longer = sorted((left, right), key=len)
+    # Short roster names can have decorative text appended on the scoreboard:
+    # `McL` -> `[xtng] McL Bo$$`. Three characters are accepted only as the
+    # beginning of the cleaned visible name; longer names may occur anywhere.
+    if len(shorter) == 3 and longer.startswith(shorter):
+        return 0.93 + 0.07 * len(shorter) / len(longer)
     if len(shorter) >= 4 and shorter in longer:
         return 0.94 + 0.06 * len(shorter) / len(longer)
     return SequenceMatcher(None, left, right).ratio()
@@ -493,6 +498,31 @@ def is_forwarded_message(message: discord.Message) -> bool:
     return bool(getattr(flags, "forwarded", False))
 
 
+def is_test_result_card(message: discord.Message) -> bool:
+    """Recognize a manually posted test card even if forward metadata is lost.
+
+    Some Discord/discord.py-self combinations render the visible `Переслано`
+    card but expose neither message_snapshots nor the forwarded flag. A result
+    card outside the active registration channels is therefore a safe test,
+    except in the configured log/warning channels where the bot writes copies.
+    """
+    channel_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+    if channel_id in active_channel_ids or channel_id in {
+        LOG_CHANNEL_ID,
+        WARN_CHANNEL_ID,
+    }:
+        return False
+    if not image_urls(message):
+        return False
+    return bool(
+        re.search(
+            r"Результат\s+матча\s*#\s*\d+",
+            plain_message_text(message),
+            re.I,
+        )
+    )
+
+
 async def resolve_member_mentions(text: str, message: discord.Message) -> str:
     """Replace mentions with the best display name from every shared guild.
 
@@ -533,14 +563,54 @@ async def resolve_member_mentions(text: str, message: discord.Message) -> str:
             for member in candidates
             if str(getattr(member, "display_name", "") or "").strip()
         ]
-        display_name = next(
-            (
-                name for name in display_names
-                if re.search(r"(?<!\d)#\s*\d{1,5}(?!\d)", name)
-                or re.search(r"(?:^|\D)\d{1,5}\s*\|", name)
-            ),
-            display_names[0] if display_names else "",
+        def registration_id(name: str) -> Optional[int]:
+            found = re.search(r"(?<!\d)#\s*(\d{1,5})(?!\d)", name)
+            if not found:
+                found = re.search(r"(?:^|\D)(\d{1,5})\s*\|", name)
+            return int(found.group(1)) if found else None
+
+        current_guild = getattr(message, "guild", None)
+        current_member = (
+            current_guild.get_member(member_id)
+            if current_guild is not None
+            else None
         )
+        current_name = str(
+            getattr(current_member, "display_name", "") or ""
+        ).strip()
+        known_name = str(
+            getattr(known.get(member_id), "display_name", "") or ""
+        ).strip()
+        if known_name and registration_id(known_name) is not None:
+            # message.mentions belongs to the card's own guild and therefore
+            # has priority over every cross-guild profile.
+            display_name = known_name
+        elif current_name and registration_id(current_name) is not None:
+            # A real source card must always keep the ID visible in its own
+            # server. Never replace it with another mutual server's ID.
+            display_name = current_name
+        else:
+            id_names = [
+                (registration_id(name), name)
+                for name in display_names
+                if registration_id(name) is not None
+            ]
+            unique_ids = {item[0] for item in id_names}
+            if len(unique_ids) == 1:
+                display_name = id_names[0][1]
+            elif len(unique_ids) > 1:
+                # On forwarded tests the same Discord account can have
+                # different registration IDs on mutual servers. Leaving the
+                # mention unresolved forces the safe original-card lookup
+                # instead of silently registering a wrong ID such as #1057.
+                log.warning(
+                    "Неоднозначный регистрационный ID для Discord %s: %s",
+                    member_id,
+                    sorted(unique_ids),
+                )
+                display_name = ""
+            else:
+                display_name = display_names[0] if display_names else ""
         if display_name:
             text = re.sub(rf"<@!?{member_id}>", f"@{display_name}", text)
     return text
@@ -1026,6 +1096,75 @@ def result_from_players_modal(
     }
 
 
+def result_from_nonzero_modal_and_final_score(
+    message_text: str,
+    modal_text: str,
+    audit: dict,
+) -> Optional[dict]:
+    """Safe fallback when names are weak but helper K/A/D is complete.
+
+    The helper groups players by their starting CT/T side. A completed match
+    has already crossed halftime, so the final scoreboard displays those
+    groups on the opposite side. We use the final screenshot only for the
+    score and the helper for all ten IDs and non-zero K/A/D rows.
+    """
+    parsed = parse_players_modal(modal_text)
+    match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
+    if (
+        parsed is None
+        or match is None
+        or not audit.get("is_scoreboard")
+        or not audit.get("is_final_result")
+        or audit.get("has_live_gameplay_hud")
+    ):
+        return None
+    try:
+        score_left = int(audit["score_left"])
+        score_right = int(audit["score_right"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    side_left = str(audit.get("side_left") or "").upper()
+    side_right = str(audit.get("side_right") or "").upper()
+    if {side_left, side_right} != {"CT", "T"}:
+        return None
+
+    players = [*parsed["CT"], *parsed["T"]]
+    # A 0/0/0 helper row is not authoritative and must still be recovered by
+    # nickname from the screenshot. Never use this fallback when any exists.
+    if any(
+        (
+            int(player.get("kills", 0) or 0),
+            int(player.get("assists", 0) or 0),
+            int(player.get("deaths", 0) or 0),
+        ) == (0, 0, 0)
+        for player in players
+    ):
+        return None
+
+    # Starting CT is displayed on final T after the mandatory halftime swap.
+    if side_left == "T":
+        score_ct, score_t = score_left, score_right
+    else:
+        score_ct, score_t = score_right, score_left
+    return {
+        "is_match_result": True,
+        "match_id": int(match.group(1)),
+        "score_a": score_ct,
+        "score_b": score_t,
+        "ct_team": "A",
+        "team_a": parsed["CT"],
+        "team_b": parsed["T"],
+        "overall_confidence": min(
+            1.0,
+            float(audit.get("overall_confidence", 0) or 0),
+        ),
+        "notes": (
+            "Резерв: все ID/K/A/D и стартовые CT/T взяты из «Получить "
+            "игроков»; финальный счёт взят со скриншота с учётом смены сторон."
+        ),
+    }
+
+
 def result_from_visual_audit(
     message_text: str,
     modal_text: str,
@@ -1034,7 +1173,13 @@ def result_from_visual_audit(
     """Accept a review card only when its modal exactly matches the screenshot."""
     parsed = parse_players_modal(modal_text)
     match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
-    if parsed is None or match is None or not audit.get("is_scoreboard"):
+    if (
+        parsed is None
+        or match is None
+        or not audit.get("is_scoreboard")
+        or not audit.get("is_final_result")
+        or audit.get("has_live_gameplay_hud")
+    ):
         return None
 
     try:
@@ -1163,21 +1308,10 @@ def result_from_visual_audit(
             visual_side_a = str(audit.get("side_right") or "").upper()
             visual_side_b = str(audit.get("side_left") or "").upper()
 
-        expected_side_a = "CT" if ct_team == "A" else "T"
-        expected_side_b = "T" if ct_team == "A" else "CT"
-        if (
-            visual_side_a in {"CT", "T"}
-            and visual_side_a != expected_side_a
-        ) or (
-            visual_side_b in {"CT", "T"}
-            and visual_side_b != expected_side_b
-        ):
-            log.error(
-                "Матч #%s: стороны скриншота %s/%s противоречат ID окна "
-                "игроков (Team A=%s).",
-                match.group(1), visual_side_a, visual_side_b, expected_side_a,
-            )
-            return None
+        # «Получить игроков» contains the starting CT/T groups, while the final
+        # scoreboard normally shows the sides after the halftime switch. The
+        # visible CT/T labels must therefore never invalidate an otherwise
+        # reliable roster/ID/statistics mapping.
 
         if (
             chosen_names / 2 < 0.78
@@ -1483,7 +1617,13 @@ def result_from_card_and_visual_audit(
     """Build a result from card IDs/nicks and the original scoreboard only."""
     rosters = parse_card_roster_identities(message_text)
     match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
-    if rosters is None or match is None or not audit.get("is_scoreboard"):
+    if (
+        rosters is None
+        or match is None
+        or not audit.get("is_scoreboard")
+        or not audit.get("is_final_result")
+        or audit.get("has_live_gameplay_hud")
+    ):
         return None
 
     try:
@@ -1736,6 +1876,12 @@ def result_from_review_card_and_modal(
     visual_audit: Optional[dict] = None,
 ) -> Optional[dict]:
     """Use short IDs from `Получить игроков`; fuzzy-match names and absent rows."""
+    if visual_audit is not None and (
+        not visual_audit.get("is_scoreboard")
+        or not visual_audit.get("is_final_result")
+        or visual_audit.get("has_live_gameplay_hud")
+    ):
+        return None
     modal = parse_players_modal(modal_text)
     slots = parse_card_roster_slots(message_text)
     match = re.search(r"Результат\s+матча\s*#\s*(\d+)", message_text, re.I)
@@ -1774,7 +1920,12 @@ def result_from_review_card_and_modal(
     side_b = "T" if side_a == "CT" else "CT"
 
     visual_players: list[dict] = []
-    if visual_audit and visual_audit.get("is_scoreboard"):
+    if (
+        visual_audit
+        and visual_audit.get("is_scoreboard")
+        and visual_audit.get("is_final_result")
+        and not visual_audit.get("has_live_gameplay_hud")
+    ):
         visual_players = [
             *list(visual_audit.get("left_players", [])),
             *list(visual_audit.get("right_players", [])),
@@ -2226,6 +2377,8 @@ async def recognize_match(
             "type": "object",
             "properties": {
                 "is_scoreboard": {"type": "boolean"},
+                "is_final_result": {"type": "boolean"},
+                "has_live_gameplay_hud": {"type": "boolean"},
                 "is_surrender": {"type": "boolean"},
                 "winner_side": {"type": ["string", "null"], "enum": ["LEFT", "RIGHT", None]},
                 "score_left": {"type": ["integer", "null"], "minimum": 0, "maximum": 99},
@@ -2237,21 +2390,25 @@ async def recognize_match(
                 "overall_confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "notes": {"type": "string"},
             },
-            "required": ["is_scoreboard", "is_surrender", "winner_side", "score_left", "score_right", "side_left", "side_right", "left_players", "right_players", "overall_confidence", "notes"],
+            "required": ["is_scoreboard", "is_final_result", "has_live_gameplay_hud", "is_surrender", "winner_side", "score_left", "score_right", "side_left", "side_right", "left_players", "right_players", "overall_confidence", "notes"],
             "additionalProperties": False,
         }
 
     if visual_audit:
         prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
+This bot accepts ONLY the final post-match results screen. Set is_final_result=true only when the match has ended and the image is the dedicated final statistics/result screen. An opened TAB scoreboard during live gameplay is NOT a final result, even if it temporarily shows `ПОБЕДА`, a 13 score, or full player statistics.
+Set has_live_gameplay_hud=true when active-match elements are visible around/through the table, including a weapon or hands, health/armor/ammo HUD, crosshair, live kill feed, pause icon, spectator controls, minimap/radar, or an in-game TAB overlay. If any such live elements are present, set is_final_result=false and is_scoreboard=false. Never register that image.
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
 If the result says `СДАЛИСЬ`/surrendered, set is_surrender=true. Set winner_side to the side that DID NOT surrender. The `СДАЛИСЬ` label belongs to the side that surrendered, so the opposite side is the winner. For a normal completed game set is_surrender=false and winner_side=null. Keep score_left/score_right as the raw numbers visibly printed; the program will convert the winner to 13.
 Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least four card players are reliably matched in total.
 Russian columns У, П, С mean kills, assists, deaths. On the T/ATTACK side a MONEY column appears before У/П/С; ignore money. Ignore score/points and ping after deaths.
 For nicknames, ignore the faded clan/tag prefix before the actual nickname. Examples: `[CLION] Zerro` and `CLION | Zerro` mean nickname `Zerro`; `[swean] Кредо` means nickname `Кредо`. `OLD` is always a clan/league tag, never the player's nickname: `OLD|Shkiper`, `OLD | Shkiper`, `[OLD] Shkiper`, and `🔴 OLD — Shkiper` all mean nickname `Shkiper`.
+The appended Discord card text contains the ten roster nicknames. Use those names only as spelling/OCR candidates for visually compatible scoreboard rows. This is especially important for short or decorated names such as card `McL` versus scoreboard `[xtng] McL Bo$$`, `clutch` versus `[xtng] clutch lv david`, and `fellmy` versus `fellmy Bo$$`. Never copy K/A/D or scores from the text.
 Do not infer, increment, normalize, or copy statistics from Discord text. Only the attached game screenshot is evidence.
 Set confidence below 0.90 if any score or K/A/D digit is unclear. Return only valid JSON."""
     elif score_only:
         prompt = """Read ONLY the final score of this FACEIT/CS2 match from the attached result screenshot.
+Reject an opened TAB scoreboard from a match that is still being played. Gameplay HUD, weapon/hands, health/armor/ammo, crosshair, live kill feed, pause icon, spectator controls, or minimap means this is not a final result: set is_match_result=false.
 The Discord card text identifies Team A and Team B. Return score_a and score_b as rounds won by those exact teams, mapping the scoreboard sides to A/B by player nicknames when needed.
 Ignore any helper template containing `<счёт A> <счёт B>`: those are placeholders, not a score.
 Read the large final scoreboard/result score from the image. Typical valid results are 13:0 through overtime scores.
@@ -2260,6 +2417,7 @@ Set is_match_result=true when a final match scoreboard is visible. Return the vi
 For this score-only request return team_a=[] and team_b=[], ct_team=null. overall_confidence describes confidence in the two score numbers. Explain briefly in notes."""
     else:
         prompt = """You receive one or more screenshots of the SAME FACEIT/CS2 match result.
+Accept ONLY a dedicated final post-match result screen. If the table is merely opened with TAB during live gameplay and the image also shows a weapon/hands, health/armor/ammo, crosshair, live kill feed, pause icon, spectator controls, or minimap, set is_match_result=false and do not build a registration, even when the table shows 13 or `ПОБЕДА`.
 The Discord result card contains match number and two rosters: Team A and Team B, with numeric IDs like #37 and nicknames. The small CS2 scoreboard contains each nickname and columns K, A, D.
 Build a registration result:
 - match_id: number after 'Результ����т матча #'.
@@ -3459,6 +3617,42 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 BOT_VERSION,
             )
             modal_text: Optional[str] = None
+
+            async def try_players_helper_fallback(audit: dict) -> Optional[dict]:
+                """Use authoritative helper IDs/stats when OCR names are weak."""
+                nonlocal modal_text
+                helper_message = message
+                if (
+                    is_forwarded_message(message)
+                    and find_get_players_button(message) is None
+                    and reserved_match_id is not None
+                ):
+                    original_message = await find_original_match_card(
+                        reserved_match_id,
+                        message,
+                    )
+                    if original_message is not None:
+                        helper_message = original_message
+                if find_get_players_button(helper_message) is None:
+                    return None
+                modal_text, _helper_image_urls = await get_players_response(
+                    helper_message
+                )
+                if not modal_text:
+                    return None
+                helper_result = result_from_visual_audit(
+                    context,
+                    modal_text,
+                    audit,
+                )
+                if helper_result is not None:
+                    return helper_result
+                return result_from_nonzero_modal_and_final_score(
+                    context,
+                    modal_text,
+                    audit,
+                )
+
             if complete_card is not None:
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -3470,9 +3664,12 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 # incorrect score such as 0:13 while the screenshot says 9:13.
                 audit = await recognize_match(
                     raw_images,
+                    message_text=context,
                     visual_audit=True,
                 )
                 result = result_from_card_and_visual_audit(context, audit)
+                if result is None:
+                    result = await try_players_helper_fallback(audit)
                 if result is None:
                     diagnostics = full_match_diagnostics(context)
                     log.error(
@@ -3502,9 +3699,12 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                         )
                     audit = await recognize_match(
                         raw_images,
+                        message_text=context,
                         visual_audit=True,
                     )
                     result = result_from_card_and_visual_audit(context, audit)
+                    if result is None:
+                        result = await try_players_helper_fallback(audit)
                     if result is None:
                         diagnostics = full_match_diagnostics(context)
                         log.error(
@@ -3568,6 +3768,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                         )
                     audit = await recognize_match(
                         raw_images,
+                        message_text=context,
                         visual_audit=True,
                     )
                     result = result_from_review_card_and_modal(
@@ -3810,7 +4011,10 @@ async def process_message_once(
     if message.id in processed_message_ids:
         return False
     if test_only:
-        if not is_forwarded_message(message) or not image_urls(message):
+        if (
+            not (is_forwarded_message(message) or is_test_result_card(message))
+            or not image_urls(message)
+        ):
             return False
     elif not allowed_for_parsing(message) or not image_urls(message):
         return False
@@ -4090,7 +4294,10 @@ async def on_message(message: discord.Message) -> None:
     # by the self-bot account in the main command channel or in an active
     # registration channel. It only prints the generated =g command: no stats
     # are saved, no confirmation is awaited and no source message is deleted.
-    if is_forwarded_message(message) and image_urls(message):
+    if (
+        (is_forwarded_message(message) or is_test_result_card(message))
+        and image_urls(message)
+    ):
         await process_message_once(message, test_only=True)
         return
 
