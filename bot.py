@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50-final5-helper-fallback-and-roster-guidance-2026-09-12"
+BOT_VERSION = "v50-final6-process-edited-result-cards-2026-09-12"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -1956,7 +1956,7 @@ def result_from_review_card_and_modal(
             if player.get("id") is not None:
                 player_id = int(player["id"])
                 # IDs rendered inside Discord display names can be stale.
-                # Trust them only when that ID is present in «Получить игроков».
+                # Trust them only when that ID is present in «Получить игроков��.
                 if player_id in unused:
                     assigned[i] = player_id
                     unused.remove(player_id)
@@ -4081,6 +4081,40 @@ async def backfill_channels(channel_ids: set[int], before_time) -> int:
 @client.event
 async def on_ready() -> None:
     log.info("Селф-бот успешно авторизован: %s | версия %s", client.user, BOT_VERSION)
+
+
+@client.event
+async def on_message_edit(
+    before: discord.Message,
+    after: discord.Message,
+) -> None:
+    """Retry a result card after the tournament bot edits it in place.
+
+    Some cards are first posted with incomplete/failed OCR and later updated
+    after «распознавание прошло со второй попытки». Discord does not emit a
+    second on_message event for that update, so without this handler the ready
+    card remains ignored until a manual restart/backfill.
+    """
+    if not is_active:
+        return
+    channel_id = int(getattr(getattr(after, "channel", None), "id", 0) or 0)
+    if channel_id not in active_channel_ids:
+        return
+    if not image_urls(after):
+        return
+    after_text = plain_message_text(after)
+    if not re.search(r"Результат\s+матча\s*#\s*\d+", after_text, re.I):
+        return
+    before_text = plain_message_text(before)
+    if before_text == after_text and image_urls(before) == image_urls(after):
+        return
+
+    # The same Discord message ID was already inspected before the source bot
+    # completed its second recognition attempt. Treat the edited card as new.
+    processed_message_ids.discard(after.id)
+    await asyncio.sleep(1.0)
+    log.info("Повторно обрабатываю обновлённую карточку сообщения %s", after.id)
+    await process_message_once(after)
 
 
 @client.event
