@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v54-visible-skips-and-cleanup-command-2026-09-13"
+BOT_VERSION = "v56-delete-live-tab-cards-2026-09-13"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2249,6 +2249,44 @@ def readable_score_from_context(message_text: str) -> Optional[tuple[int, int]]:
     return values[0], values[1]
 
 
+def visual_audit_summary(audit: Optional[dict]) -> str:
+    """What the model read from the scoreboard, for Discord error logs."""
+    if not isinstance(audit, dict):
+        return "ЧТО МОДЕЛЬ ПРОЧИТАЛА НА ТАБЛО: нет данных"
+
+    def flag(key: str) -> str:
+        return "да" if audit.get(key) else "нет"
+
+    lines = [
+        "ЧТО МОДЕЛЬ ПРОЧИТАЛА НА ТАБЛО:",
+        f"  финальный экран={flag('is_final_result')} "
+        f"табло={flag('is_scoreboard')} "
+        f"живая игра/TAB={flag('has_live_gameplay_hud')} "
+        f"сдача={flag('is_surrender')}",
+        f"  уверенность={audit.get('overall_confidence')} "
+        f"счёт слева:справа={audit.get('score_left')}:{audit.get('score_right')} "
+        f"стороны={audit.get('side_left')}/{audit.get('side_right')}",
+    ]
+    for title, key in (("СЛЕВА", "left_players"), ("СПРАВА", "right_players")):
+        players = audit.get(key) or []
+        lines.append(f"  {title}: игроков {len(players)}")
+        for player in players[:5]:
+            if isinstance(player, dict):
+                lines.append(
+                    f"    ник={player.get('nickname', '')} "
+                    f"K/A/D={player.get('kills')}/{player.get('assists')}/"
+                    f"{player.get('deaths')}"
+                )
+    notes = str(audit.get("notes") or "").strip()
+    if notes:
+        lines.append(f"  пояснение модели: {notes[:600]}")
+    lines.append(
+        "  нужно для регистрации: финальный экран=да, живая игра/TAB=нет, "
+        "уверенность ≥ 0.90, совпало ≥ 4 ников и хотя бы 1 на каждой стороне"
+    )
+    return "\n".join(lines)
+
+
 def full_match_diagnostics(
     message_text: str,
     modal_text: Optional[str] = None,
@@ -4204,6 +4242,43 @@ async def send_registration_and_wait(
     return sent_registration, confirmed, response_text[:500]
 
 
+async def delete_live_tab_card(
+    message: discord.Message,
+    match_id: Optional[int],
+) -> None:
+    """Copy a rejected live-TAB card to logs, then delete it from the channel."""
+    if LOG_CHANNEL_ID:
+        try:
+            log_channel = client.get_channel(LOG_CHANNEL_ID)
+            if log_channel is None:
+                log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
+            await send_original_card_to_log(
+                message,
+                log_channel,
+                int(match_id or 0),
+                fallback_title=f"🖼 Карточка игры #{match_id or '?'} с открытым TAB",
+            )
+        except Exception:
+            log.exception(
+                "Не удалось скопировать TAB-карточку матча #%s в лог",
+                match_id,
+            )
+    try:
+        await message.delete()
+        log.info("Матч #%s: карточка с открытым TAB удалена", match_id)
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        log.warning("Нет права удалить TAB-карточку матча #%s", match_id)
+        await notify_log_channel(
+            f"⚠️ Матч #{match_id or '?'}: нет права удалить карточку с открытым "
+            f"TAB в <#{message.channel.id}> — аккаунту нужно право "
+            "«Управлять сообщениями»."
+        )
+    except Exception:
+        log.exception("Не удалось удалить TAB-карточку матча #%s", match_id)
+
+
 async def process_upload(message: discord.Message, test_only: bool = False) -> None:
     urls = image_urls(message)
     if not urls:
@@ -4265,7 +4340,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             modal_text: Optional[str] = None
 
             async def discard_live_tab_card(audit: dict) -> bool:
-                """Reject a live TAB without ever deleting an unregistered card."""
+                """Reject a live TAB card: log it, copy it to logs, delete it."""
                 if not audit.get("has_live_gameplay_hud"):
                     return False
                 log.info(
@@ -4282,23 +4357,25 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     audit["notes"] = (
                         str(audit.get("notes", ""))
                         + " Тестовый предпросмотр открытого TAB; в рабочем "
-                        "канале такая карточка пропускается и сохраняется."
+                        "канале такая карточка пропускается и удаляется."
                     ).strip()
                     return False
-                # Safety invariant: source cards are deleted only after the
-                # registration bot confirms the match with «Готово». A visual
-                # classifier can be wrong, so a rejected live-TAB card stays.
+                # A card whose screenshot is an opened TAB is removed. The
+                # reason, the model's reading and a copy of the card go to logs
+                # first, so a wrongly rejected game can be registered by hand.
                 log.info(
-                    "Матч #%s пропущен как live TAB; исходное сообщение сохранено.",
+                    "Матч #%s пропущен как live TAB; карточка удаляется.",
                     reserved_match_id or "?",
                 )
                 await send_processing_error_log(
                     reserved_match_id or "?",
                     message,
                     "Скриншот распознан как открытый TAB во время игры, а не "
-                    "финальный экран — игра не зарегистрирована, карточка сохранена.",
-                    str(audit.get("notes") or "Пояснение модели отсутствует."),
+                    "финальный экран — игра не зарегистрирована, карточка "
+                    "удалена (копия ниже).",
+                    visual_audit_summary(audit),
                 )
+                await delete_live_tab_card(message, reserved_match_id)
                 return True
 
             async def try_players_helper_fallback(audit: dict) -> Optional[dict]:
@@ -4370,7 +4447,11 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 if result is None:
                     result = await try_players_helper_fallback(audit)
                 if result is None:
-                    diagnostics = full_match_diagnostics(context)
+                    diagnostics = (
+                        full_match_diagnostics(context)
+                        + "\n\n"
+                        + visual_audit_summary(audit)
+                    )
                     log.error(
                         "Матч #%s остановлен: карточка не прошла независимую "
                         "проверку по исходному скриншоту. audit=%r\n%s",
@@ -4408,7 +4489,11 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     if result is None:
                         result = await try_players_helper_fallback(audit)
                     if result is None:
-                        diagnostics = full_match_diagnostics(context)
+                        diagnostics = (
+                            full_match_diagnostics(context)
+                            + "\n\n"
+                            + visual_audit_summary(audit)
+                        )
                         log.error(
                             "Матч #%s: не удалось сопоставить ID/ники карточки "
                             "с исходным табло. score_hint=%s context=%r "
