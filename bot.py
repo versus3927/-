@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v52-registration-cleanup-after-confirmation-2026-09-13"
+BOT_VERSION = "v54-visible-skips-and-cleanup-command-2026-09-13"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -2004,7 +2004,7 @@ def result_from_review_card_and_modal(
             if player.get("id") is not None:
                 player_id = int(player["id"])
                 # IDs rendered inside Discord display names can be stale.
-                # Trust them only when that ID is present in «Получить игроков��.
+                # Trust them only when that ID is present in «Получить игроков».
                 if player_id in unused:
                     assigned[i] = player_id
                     unused.remove(player_id)
@@ -2284,7 +2284,7 @@ def full_match_diagnostics(
 
     if result:
         add_players("КОМАНДА A:", list(result.get("team_a", [])))
-        add_players("К��МАНДА B:", list(result.get("team_b", [])))
+        add_players("КОМАНДА B:", list(result.get("team_b", [])))
     else:
         slots = parse_card_roster_slots(message_text)
         if slots:
@@ -2470,7 +2470,7 @@ For this score-only request return team_a=[] and team_b=[], ct_team=null. overal
 Accept ONLY a dedicated final post-match result screen. If the table is merely opened with TAB during live gameplay and the image also shows a weapon/hands, health/armor/ammo, crosshair, live kill feed, pause icon, spectator controls, or minimap, set is_match_result=false and do not build a registration, even when the table shows 13 or `ПОБЕДА`.
 The Discord result card contains match number and two rosters: Team A and Team B, with numeric IDs like #37 and nicknames. The small CS2 scoreboard contains each nickname and columns K, A, D.
 Build a registration result:
-- match_id: number after 'Результ����т матча #'.
+- match_id: number after 'Результат матча #'.
 - Team A must always be returned in team_a; Team B in team_b.
 - score_a and score_b are rounds won by Team A and Team B. The CS2 scoreboard may label sides ATTACK/DEFENSE or T/CT and teams can be on either side; map score to A/B by matching player nicknames.
 - Surrendered games are valid. If the screenshot says `СДАЛИСЬ`, set is_surrender=true, identify which side surrendered, and set winner_team to the opposite Team A/B roster. Register the winner with 13 rounds and keep the loser's displayed round count. Read and match every visible player's K/A/D exactly as in a normal match. For normal games set is_surrender=false and winner_team=null.
@@ -2820,7 +2820,7 @@ async def send_original_card_to_log(
             except Exception:
                 log.warning(
                     "Не удалось переслать исходную карточку матча #%s; "
-                    "используется ��������зервная копия",
+                    "используется резервная копия",
                     match_id,
                     exc_info=True,
                 )
@@ -3636,54 +3636,111 @@ async def delete_duplicate_match_cards(
     return deleted
 
 
+def normalize_reply_text(text: str) -> str:
+    """Drop markdown, custom emoji and invisible marks: `✅️ **Готово**`."""
+    text = re.sub(r"<a?:\w+:\d+>", " ", str(text))
+    text = re.sub(r"[\ufe0e\ufe0f\u200b-\u200d\u2060]", "", text)
+    return re.sub(r"[*_~`|>]+", "", text)
+
+
+def closed_match_id(text: str) -> Optional[int]:
+    """Match number of a `Готово — Матч #N закрыт со счётом X:Y` message.
+
+    «Готово» may stand anywhere and in any formatting; the former check wanted
+    it at the start of a line right after a plain ✅, so `✅ **Готово**` or a
+    custom emoji made `удалить рег соо` find nothing.
+    """
+    normalized = normalize_reply_text(text)
+    if not re.search(r"(?<!\w)готово(?!\w)", normalized, re.I):
+        return None
+    found = re.search(
+        r"Матч\s*#\s*(\d+)\s+закрыт\s+со\s+сч[её]том\s+"
+        r"\d{1,2}\s*[:\-–—]\s*\d{1,2}",
+        normalized,
+        re.I,
+    )
+    return int(found.group(1)) if found else None
+
+
 def is_registration_success_confirmation(message: discord.Message) -> bool:
     """Detect only `Готово — Матч #N закрыт со счётом X:Y` messages."""
-    text = registration_response_text(message)
-    has_ready_title = bool(
-        re.search(r"(?:^|\n)\s*(?:✅\s*)?Готово\b", text, re.I)
-    )
-    has_closed_match = bool(
-        re.search(
-            r"Матч\s*#\s*\d+\s+закрыт\s+со\s+сч[её]том\s+"
-            r"\d{1,2}\s*[:\-]\s*\d{1,2}",
-            text,
-            re.I,
+    return closed_match_id(registration_response_text(message)) is not None
+
+
+async def channel_history_texts(channel):
+    """Yield (message id, author id, full text) for a channel's whole history."""
+    logs_from = getattr(getattr(client, "http", None), "logs_from", None)
+    page = None
+    if callable(logs_from):
+        try:
+            page = await logs_from(channel.id, 100)
+        except Exception:
+            log.debug("logs_from недоступен, читаю историю канала", exc_info=True)
+            page = None
+    if isinstance(page, list):
+        while page:
+            for payload in page:
+                row = raw_message_row(payload)
+                if row is not None:
+                    yield row[0], row[1], row[2]
+            if len(page) < 100:
+                return
+            page = await logs_from(channel.id, 100, before=page[-1]["id"])
+        return
+    async for candidate in channel.history(limit=None):
+        yield (
+            int(candidate.id),
+            getattr(getattr(candidate, "author", None), "id", None),
+            registration_response_text(candidate),
         )
-    )
-    return has_ready_title and has_closed_match
 
 
 async def delete_all_registration_confirmations(
     channel_ids: set[int],
-) -> tuple[int, int, int]:
-    """Delete all successful registration confirmations in configured channels."""
+) -> tuple[int, int, int, list[str]]:
+    """Delete all successful registration confirmations in configured channels.
+
+    Returns deleted, scanned and failed channel counts, plus samples of
+    «Готово»-like messages that were not recognized, so Discord shows why
+    nothing was deleted.
+    """
     deleted = 0
     scanned_channels = 0
     failed_channels = 0
+    unmatched: list[str] = []
+    own_id = getattr(getattr(client, "user", None), "id", None)
     for channel_id in sorted(channel_ids):
         try:
             channel = client.get_channel(channel_id)
             if channel is None:
                 channel = await client.fetch_channel(channel_id)
             scanned_channels += 1
-            async for candidate in channel.history(limit=None):
-                if not is_registration_success_confirmation(candidate):
+            async for message_id, author_id, text in channel_history_texts(channel):
+                if own_id and author_id == own_id:
+                    continue
+                if closed_match_id(text) is None:
+                    if (
+                        len(unmatched) < 2
+                        and not is_result_card_text(text)
+                        and re.search(r"готово|закрыт\s+со", text, re.I)
+                    ):
+                        unmatched.append(text[:300])
                     continue
                 try:
-                    await candidate.delete()
+                    await delete_channel_message(channel, message_id)
                     deleted += 1
                 except discord.NotFound:
                     pass
                 except discord.Forbidden:
                     log.warning(
                         "Нет права удалить подтверждение %s в канале %s",
-                        candidate.id,
+                        message_id,
                         channel_id,
                     )
                 except Exception:
                     log.exception(
                         "Не удалось удалить подтверждение %s в канале %s",
-                        candidate.id,
+                        message_id,
                         channel_id,
                     )
         except Exception:
@@ -3692,7 +3749,7 @@ async def delete_all_registration_confirmations(
                 "Не удалось очистить подтверждения в канале %s",
                 channel_id,
             )
-    return deleted, scanned_channels, failed_channels
+    return deleted, scanned_channels, failed_channels, unmatched
 
 
 def registration_response_text(message: object) -> str:
@@ -3756,6 +3813,7 @@ def registration_response_verdict(
     references_command: bool,
 ) -> Optional[bool]:
     """True for «Готово», False for «Не вышло», None for unrelated messages."""
+    text = normalize_reply_text(text)
     lowered = text.lower()
     if "не вышло" in lowered:
         verdict = False
@@ -3781,6 +3839,93 @@ async def delete_channel_message(channel, message_id: int) -> None:
     await client.http.delete_message(channel.id, message_id)
 
 
+DISCORD_EPOCH_MS = 1420070400000
+
+
+def snowflake_seconds_ago(seconds: float) -> int:
+    """Smallest Discord message ID that can be created `seconds` ago or later."""
+    milliseconds = int(datetime.now(timezone.utc).timestamp() * 1000 - seconds * 1000)
+    return max(0, milliseconds - DISCORD_EPOCH_MS) << 22
+
+
+def is_result_card_text(text: str) -> bool:
+    return bool(re.search(r"Результат\s+матча\s*#\s*\d+", text, re.I))
+
+
+def raw_message_row(
+    payload: object,
+) -> Optional[tuple[int, Optional[int], str, Optional[int]]]:
+    """(id, author id, full text, replied message id) of a raw payload."""
+    if not isinstance(payload, dict):
+        return None
+    message_id = str(payload.get("id") or "")
+    author_id = str((payload.get("author") or {}).get("id") or "")
+    reference_id = str(
+        (payload.get("message_reference") or {}).get("message_id") or ""
+    )
+    if not message_id.isdigit():
+        return None
+    return (
+        int(message_id),
+        int(author_id) if author_id.isdigit() else None,
+        raw_message_text(payload),
+        int(reference_id) if reference_id.isdigit() else None,
+    )
+
+
+async def channel_messages_after(
+    channel,
+    after_message: discord.Message,
+    limit: int,
+) -> list[tuple[int, Optional[int], str, Optional[int]]]:
+    """(id, author id, full text, replied message id) of newer messages.
+
+    Raw payloads are preferred: they keep every text field even when the
+    library cannot parse a new message layout.
+    """
+    logs_from = getattr(getattr(client, "http", None), "logs_from", None)
+    if callable(logs_from):
+        try:
+            payloads = await logs_from(channel.id, limit, after=after_message.id)
+        except Exception:
+            log.debug("logs_from недоступен, читаю историю канала", exc_info=True)
+            payloads = None
+        if isinstance(payloads, list):
+            return [
+                row for row in map(raw_message_row, payloads) if row is not None
+            ]
+
+    rows = []
+    async for candidate in channel.history(limit=limit, after=after_message):
+        reference = getattr(candidate, "reference", None)
+        rows.append((
+            int(candidate.id),
+            getattr(getattr(candidate, "author", None), "id", None),
+            registration_response_text(candidate),
+            getattr(reference, "message_id", None),
+        ))
+    return rows
+
+
+def registration_row_verdict(
+    row: tuple[int, Optional[int], str, Optional[int]],
+    sent_registration: discord.Message,
+    match_id: int,
+) -> Optional[bool]:
+    """Verdict for one message read after =g; self messages and cards excluded."""
+    message_id, author_id, text, reference_id = row
+    own_id = getattr(getattr(client, "user", None), "id", None)
+    if own_id and author_id == own_id:
+        return None
+    if message_id <= int(sent_registration.id) or is_result_card_text(text):
+        return None
+    return registration_response_verdict(
+        text,
+        match_id,
+        reference_id == int(sent_registration.id),
+    )
+
+
 async def find_registration_response(
     channel,
     sent_registration: discord.Message,
@@ -3788,60 +3933,115 @@ async def find_registration_response(
     seen: list[str],
 ) -> Optional[tuple[int, bool, str]]:
     """Re-read the channel after =g: catches edited or undelivered replies."""
-    own_id = getattr(getattr(client, "user", None), "id", None)
-    logs_from = getattr(getattr(client, "http", None), "logs_from", None)
-    if callable(logs_from):
-        try:
-            payloads = await logs_from(channel.id, 25, after=sent_registration.id)
-        except Exception:
-            log.debug("logs_from недоступен, читаю историю канала", exc_info=True)
-            payloads = None
-        if isinstance(payloads, list):
-            for payload in payloads:
-                if not isinstance(payload, dict):
-                    continue
-                try:
-                    message_id = int(payload["id"])
-                    author_id = int((payload.get("author") or {}).get("id") or 0)
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if own_id and author_id == own_id:
-                    continue
-                text = raw_message_text(payload)
-                seen.append(text[:200])
-                reference_id = str(
-                    (payload.get("message_reference") or {}).get("message_id") or ""
-                )
-                verdict = registration_response_verdict(
-                    text,
-                    match_id,
-                    reference_id == str(sent_registration.id),
-                )
-                if verdict is not None:
-                    return message_id, verdict, text
-            return None
-
     try:
-        async for candidate in channel.history(limit=25, after=sent_registration):
-            if own_id and getattr(candidate.author, "id", None) == own_id:
-                continue
-            text = registration_response_text(candidate)
-            seen.append(text[:200])
-            reference = getattr(candidate, "reference", None)
-            verdict = registration_response_verdict(
-                text,
-                match_id,
-                bool(reference and reference.message_id == sent_registration.id),
-            )
-            if verdict is not None:
-                return candidate.id, verdict, text
+        rows = await channel_messages_after(channel, sent_registration, 25)
     except Exception:
         log.warning(
             "Не удалось перечитать канал в ожидании ответа по матчу #%s",
             match_id,
             exc_info=True,
         )
+        return None
+    own_id = getattr(getattr(client, "user", None), "id", None)
+    for row in rows:
+        if not own_id or row[1] != own_id:
+            seen.append(row[2][:200])
+        verdict = registration_row_verdict(row, sent_registration, match_id)
+        if verdict is not None:
+            return row[0], verdict, row[2]
     return None
+
+
+async def delete_match_confirmations(
+    channel,
+    match_id: int,
+    sent_registration: discord.Message,
+) -> int:
+    """Delete every «Готово» for this match posted after our =g command."""
+    try:
+        rows = await channel_messages_after(channel, sent_registration, 50)
+    except Exception:
+        log.warning(
+            "Матч #%s: не удалось перечитать канал для удаления «Готово»",
+            match_id,
+            exc_info=True,
+        )
+        return 0
+    deleted = 0
+    for row in rows:
+        if registration_row_verdict(row, sent_registration, match_id) is not True:
+            continue
+        try:
+            await delete_channel_message(channel, row[0])
+            deleted += 1
+            log.info("Матч #%s: удалено «Готово» (сообщение %s)", match_id, row[0])
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            log.warning("Нет права удалить «Готово» матча #%s", match_id)
+            await notify_log_channel(
+                f"⚠️ Матч #{match_id}: нет права удалить «Готово» в "
+                f"<#{channel.id}> — аккаунту нужно право «Управлять сообщениями»."
+            )
+            break
+        except Exception:
+            log.exception(
+                "Не удалось удалить «Готово» %s матча #%s",
+                row[0],
+                match_id,
+            )
+    return deleted
+
+
+async def delete_match_confirmations_later(
+    channel,
+    match_id: int,
+    sent_registration: discord.Message,
+    delay: float = 15.0,
+) -> None:
+    """Repeat the sweep for a «Готово» that arrives after cleanup."""
+    await asyncio.sleep(delay)
+    await delete_match_confirmations(channel, match_id, sent_registration)
+
+
+async def delete_confirmation_when_registered(message: discord.Message) -> None:
+    """Safety net: remove «Готово — Матч #N закрыт» once this bot registered N.
+
+    Covers replies that the =g wait did not bind to, such as a second
+    confirmation message. Only matches in registration history are touched,
+    so confirmations of games registered by people stay in the channel.
+    """
+    channel_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+    if channel_id not in NORMAL_CHANNEL_IDS | PRIORITY_CHANNEL_IDS:
+        return
+    author_id = getattr(getattr(message, "author", None), "id", None)
+    if client.user and author_id == client.user.id:
+        return
+    match_id = closed_match_id(registration_response_text(message))
+    if match_id is None:
+        return
+
+    # Let a running registration read this reply before it disappears.
+    await asyncio.sleep(3.0)
+    for _ in range(90):
+        if match_id not in processing_match_ids:
+            break
+        await asyncio.sleep(2.0)
+    if not await registration_exists(match_id):
+        return
+    try:
+        await message.delete()
+        log.info(
+            "Матч #%s: удалено «Готово» %s (страховочная очистка)",
+            match_id,
+            message.id,
+        )
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        log.warning("Нет права удалить «Готово» матча #%s", match_id)
+    except Exception:
+        log.exception("Не удалось удалить «Готово» матча #%s", match_id)
 
 
 async def send_registration_and_wait(
@@ -3858,6 +4058,7 @@ async def send_registration_and_wait(
     """
     loop = asyncio.get_running_loop()
     sent_ids: list[int] = []
+    earliest_reply_id = snowflake_seconds_ago(10.0)
 
     def reply_verdict(candidate: object) -> Optional[bool]:
         if getattr(getattr(candidate, "channel", None), "id", None) != channel.id:
@@ -3865,9 +4066,17 @@ async def send_registration_and_wait(
         author_id = getattr(getattr(candidate, "author", None), "id", None)
         if client.user and author_id == client.user.id:
             return None
+        # A reply is always newer than =g. The result card, edited by the
+        # tournament bot after the match is closed, must never be taken for
+        # «Готово»: that deleted the card and left the real reply behind.
+        if int(getattr(candidate, "id", 0) or 0) < earliest_reply_id:
+            return None
+        text = registration_response_text(candidate)
+        if is_result_card_text(text):
+            return None
         reference = getattr(candidate, "reference", None)
         return registration_response_verdict(
-            registration_response_text(candidate),
+            text,
             match_id,
             bool(
                 sent_ids
@@ -3933,14 +4142,21 @@ async def send_registration_and_wait(
                     return (
                         sent_registration,
                         False,
-                        "тайм-аут ожидания ответа регистрационного бота",
+                        "нет ответа за "
+                        f"{REGISTRATION_CONFIRM_TIMEOUT:g} с. Сообщения после "
+                        "команды: "
+                        + (" | ".join(seen[-3:]) if seen else "нет"),
                     )
                 next_history_check = loop.time() + 4.0
 
             pending = [waiter for waiter in waiters if not waiter.done()]
             wait_time = max(0.05, min(1.0, deadline - loop.time()))
             if pending:
-                await asyncio.wait(pending, timeout=wait_time)
+                await asyncio.wait(
+                    pending,
+                    timeout=wait_time,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             else:
                 await asyncio.sleep(wait_time)
     finally:
@@ -3964,6 +4180,11 @@ async def send_registration_and_wait(
                 await candidate.delete()
             else:
                 await delete_channel_message(channel, response_id)
+            log.info(
+                "Матч #%s: удалено «Готово» (сообщение %s)",
+                match_id,
+                response_id,
+            )
         except discord.NotFound:
             pass
         except discord.Forbidden:
@@ -4070,6 +4291,13 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 log.info(
                     "Матч #%s пропущен как live TAB; исходное сообщение сохранено.",
                     reserved_match_id or "?",
+                )
+                await send_processing_error_log(
+                    reserved_match_id or "?",
+                    message,
+                    "Скриншот распознан как открытый TAB во время игры, а не "
+                    "финальный экран — игра не зарегистрирована, карточка сохранена.",
+                    str(audit.get("notes") or "Пояснение модели отсутствует."),
                 )
                 return True
 
@@ -4353,7 +4581,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 )
                 await send_processing_error_log(
                     result.get("match_id") or reserved_match_id or "?", message,
-                    f"Низк��я уверенность распознавания: {confidence:.2f}.", diagnostics,
+                    f"Низкая уверенность распознавания: {confidence:.2f}.", diagnostics,
                 )
                 return
 
@@ -4416,6 +4644,16 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     match_id,
                     confirmation_text,
                 )
+                await send_processing_error_log(
+                    match_id,
+                    message,
+                    "Регистрационный бот не подтвердил матч «Готово» — "
+                    "карточка сохранена.",
+                    (
+                        f"Отправленная команда:\n{command_text}\n\n"
+                        f"Ответ: {confirmation_text}"
+                    ).replace("```", "ʼʼʼ"),
+                )
                 try:
                     await sent_registration.delete()
                 except discord.NotFound:
@@ -4457,14 +4695,28 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 match_id,
                 keep_current=not DELETE_SOURCE_AFTER_REGISTRATION,
             )
+            deleted_confirmations = await delete_match_confirmations(
+                message.channel,
+                match_id,
+                sent_registration,
+            )
+            run_in_background(
+                delete_match_confirmations_later(
+                    message.channel,
+                    match_id,
+                    sent_registration,
+                )
+            )
             log.info(
-                "Матч #%s подтверждён; удалено карточек-дублей: %s",
+                "Матч #%s подтверждён; удалено карточек-дублей: %s, "
+                "оставшихся «Готово»: %s",
                 match_id,
                 deleted_duplicates,
+                deleted_confirmations,
             )
             processing_completed = True
             log.info(
-                "Матч #%s ��спешно отправлен в канал %s",
+                "Матч #%s успешно отправлен в канал %s",
                 result["match_id"],
                 message.channel.id,
             )
@@ -4583,6 +4835,7 @@ async def on_message_edit(
     second on_message event for that update, so without this handler the ready
     card remains ignored until a manual restart/backfill.
     """
+    run_in_background(delete_confirmation_when_registered(after))
     if not is_active:
         return
     channel_id = int(getattr(getattr(after, "channel", None), "id", 0) or 0)
@@ -4609,6 +4862,7 @@ async def on_message_edit(
 async def on_message(message: discord.Message) -> None:
     global is_active
 
+    run_in_background(delete_confirmation_when_registered(message))
     command = message.content.strip().lower()
 
     if re.fullmatch(r"бот\s*,?\s*ты\s+тут\s*\?*", command, re.I):
@@ -4724,13 +4978,21 @@ async def on_message(message: discord.Message) -> None:
             "🧹 Удаляю сообщения `Готово — Матч #… закрыт со счётом…` "
             "во всех каналах регистрации."
         )
-        deleted, scanned, failed = await delete_all_registration_confirmations(
-            registration_channel_ids
+        deleted, scanned, failed, unmatched = (
+            await delete_all_registration_confirmations(registration_channel_ids)
         )
-        suffix = f" Ошибо�� каналов: **{failed}**." if failed else ""
+        suffix = f" Ошибок каналов: **{failed}**." if failed else ""
+        if not deleted and unmatched:
+            sample = unmatched[0].replace("```", "ʼʼʼ")
+            suffix += (
+                "\nПохожее сообщение не распознано как «Готово — Матч #… "
+                f"закрыт»:\n```text\n{sample}\n```"
+            )
         await message.channel.send(
-            f"✅ Очистка завершена. Каналов проверено: **{scanned}**, "
-            f"сообщений удалено: **{deleted}**.{suffix}"
+            (
+                f"✅ Очистка завершена. Каналов проверено: **{scanned}**, "
+                f"сообщений удалено: **{deleted}**.{suffix}"
+            )[:2000]
         )
         return
 
