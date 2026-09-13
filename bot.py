@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v51-warning-tags-for-every-player-2026-09-13"
+BOT_VERSION = "v52-registration-cleanup-after-confirmation-2026-09-13"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -3336,9 +3336,69 @@ async def send_warning_with_screenshot(
     await channel.send(fallback[:2000])
 
 
+_background_tasks: set[asyncio.Task] = set()
+
+
+def run_in_background(coroutine) -> None:
+    """Keep a reference to fire-and-forget work until it finishes."""
+    task = asyncio.create_task(coroutine)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def notify_log_channel(text: str) -> None:
+    """Post a short service notice to LOG_CHANNEL_ID; never raises."""
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        channel = client.get_channel(LOG_CHANNEL_ID)
+        if channel is None:
+            channel = await client.fetch_channel(LOG_CHANNEL_ID)
+        await channel.send(text[:2000])
+    except Exception:
+        log.exception(
+            "Не удалось отправить уведомление в лог-канал %s",
+            LOG_CHANNEL_ID,
+        )
+
+
+async def download_warning_images(
+    result: dict,
+    source_message: discord.Message,
+) -> tuple[list[bytes], list[str]]:
+    """Download the card screenshot for warnings while the card still exists."""
+    source_urls = image_urls(source_message)[:4]
+    source_images: list[bytes] = []
+    has_warnings = any(
+        player.get("warning_reason") in WARNING_REASON_LABELS
+        for player in [*result.get("team_a", []), *result.get("team_b", [])]
+    )
+    if not source_urls or not WARN_CHANNEL_ID or not has_warnings:
+        return source_images, source_urls
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for source_url in source_urls:
+                try:
+                    source_images.append(await download_image(session, source_url))
+                except Exception:
+                    log.warning(
+                        "Не удалось скачать изображение матча #%s для варна",
+                        result.get("match_id"),
+                        exc_info=True,
+                    )
+    except Exception:
+        log.exception(
+            "Не удалось подготовить изображения варнов матча #%s",
+            result.get("match_id"),
+        )
+    return source_images, source_urls
+
+
 async def send_zero_stat_warnings(
     result: dict,
     source_message: discord.Message,
+    prepared_images: Optional[tuple[list[bytes], list[str]]] = None,
 ) -> None:
     """Warn tagged non-Pro-League players who received an unmatched 0/0/13."""
     if not WARN_CHANNEL_ID:
@@ -3377,20 +3437,12 @@ async def send_zero_stat_warnings(
                     LOG_CHANNEL_ID,
                 )
 
-        source_urls = image_urls(source_message)[:4]
-        source_images: list[bytes] = []
-        if source_urls:
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for source_url in source_urls:
-                    try:
-                        source_images.append(await download_image(session, source_url))
-                    except Exception:
-                        log.warning(
-                            "Не удалось скачать изображение матча #%s для варна",
-                            result.get("match_id"),
-                            exc_info=True,
-                        )
+        if prepared_images is None:
+            prepared_images = await download_warning_images(
+                result,
+                source_message,
+            )
+        source_images, source_urls = prepared_images
 
         identity_candidates = warning_identity_candidates(
             source_message,
@@ -3547,6 +3599,7 @@ async def delete_duplicate_match_cards(
         )
 
     deleted = 0
+    forbidden = False
     for candidate in candidates.values():
         if keep_current and candidate.id == source_message.id:
             continue
@@ -3562,6 +3615,7 @@ async def delete_duplicate_match_cards(
         except discord.NotFound:
             pass
         except discord.Forbidden:
+            forbidden = True
             log.warning(
                 "Нет права удалить дубль сообщения %s матча #%s",
                 candidate.id,
@@ -3573,12 +3627,18 @@ async def delete_duplicate_match_cards(
                 candidate.id,
                 match_id,
             )
+    if forbidden:
+        await notify_log_channel(
+            f"⚠️ Матч #{match_id}: нет права удалить карточку в "
+            f"<#{source_message.channel.id}> — аккаунту нужно право "
+            "«Управлять сообщениями»."
+        )
     return deleted
 
 
 def is_registration_success_confirmation(message: discord.Message) -> bool:
     """Detect only `Готово — Матч #N закрыт со счётом X:Y` messages."""
-    text = plain_message_text(message)
+    text = registration_response_text(message)
     has_ready_title = bool(
         re.search(r"(?:^|\n)\s*(?:✅\s*)?Готово\b", text, re.I)
     )
@@ -3635,42 +3695,275 @@ async def delete_all_registration_confirmations(
     return deleted, scanned_channels, failed_channels
 
 
-async def wait_for_registration_confirmation(
+def registration_response_text(message: object) -> str:
+    """Every visible text of a reply: content, embeds and message components.
+
+    plain_message_text() reads only content, embed title, description and
+    fields. The registration bot can put «✅ Готово» into the embed author or
+    footer, or into text components, which made a real confirmation look like
+    a timeout: =g was removed while the card and «Готово» stayed.
+    """
+    chunks = [plain_message_text(message)]
+    for part in message_parts(message):
+        for embed in getattr(part, "embeds", None) or []:
+            for value in (
+                getattr(getattr(embed, "author", None), "name", None),
+                getattr(getattr(embed, "footer", None), "text", None),
+            ):
+                if isinstance(value, str) and value:
+                    chunks.append(value)
+        components = getattr(part, "components", None)
+        stack = list(components) if isinstance(components, (list, tuple)) else []
+        inspected = 0
+        while stack and inspected < 200:
+            component = stack.pop(0)
+            inspected += 1
+            for attribute in ("content", "text"):
+                value = getattr(component, attribute, None)
+                if isinstance(value, str) and value:
+                    chunks.append(value)
+            for attribute in ("children", "components", "items"):
+                children = getattr(component, attribute, None)
+                if isinstance(children, (list, tuple)):
+                    stack.extend(children)
+    return "\n".join(chunks)
+
+
+def raw_message_text(data: object, depth: int = 0) -> str:
+    """Flatten the strings of a raw message payload, reply target excluded."""
+    if depth > 8:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        return "\n".join(
+            raw_message_text(value, depth + 1)
+            for key, value in data.items()
+            if key not in {
+                "referenced_message", "author", "member", "mentions",
+                "id", "channel_id", "guild_id", "url", "proxy_url",
+                "icon_url", "proxy_icon_url",
+            }
+        )
+    if isinstance(data, list):
+        return "\n".join(raw_message_text(item, depth + 1) for item in data)
+    return ""
+
+
+def registration_response_verdict(
+    text: str,
+    match_id: int,
+    references_command: bool,
+) -> Optional[bool]:
+    """True for «Готово», False for «Не вышло», None for unrelated messages."""
+    lowered = text.lower()
+    if "не вышло" in lowered:
+        verdict = False
+    elif "готово" in lowered or re.search(
+        r"матч\s*#\s*\d+\s+закрыт\s+со\s+сч[её]том",
+        lowered,
+    ):
+        verdict = True
+    else:
+        return None
+    # `#348` must not accept a reply about `#3480`.
+    if references_command or re.search(rf"#\s*{match_id}(?!\d)", text):
+        return verdict
+    return None
+
+
+async def delete_channel_message(channel, message_id: int) -> None:
+    """Delete a message known only by its ID."""
+    get_partial_message = getattr(channel, "get_partial_message", None)
+    if callable(get_partial_message):
+        await get_partial_message(message_id).delete()
+        return
+    await client.http.delete_message(channel.id, message_id)
+
+
+async def find_registration_response(
+    channel,
     sent_registration: discord.Message,
     match_id: int,
-) -> tuple[bool, str]:
-    """Wait for the game bot's reply before deleting/counting the source card."""
-    def check(candidate: discord.Message) -> bool:
-        if candidate.channel.id != sent_registration.channel.id:
-            return False
-        if client.user and candidate.author.id == client.user.id:
-            return False
-        text = plain_message_text(candidate).lower()
-        if "готово" not in text and "не вышло" not in text:
-            return False
-        reference = getattr(candidate, "reference", None)
-        references_command = bool(
-            reference and reference.message_id == sent_registration.id
-        )
-        names_match = f"#{match_id}" in text
-        return references_command or names_match
+    seen: list[str],
+) -> Optional[tuple[int, bool, str]]:
+    """Re-read the channel after =g: catches edited or undelivered replies."""
+    own_id = getattr(getattr(client, "user", None), "id", None)
+    logs_from = getattr(getattr(client, "http", None), "logs_from", None)
+    if callable(logs_from):
+        try:
+            payloads = await logs_from(channel.id, 25, after=sent_registration.id)
+        except Exception:
+            log.debug("logs_from недоступен, читаю историю канала", exc_info=True)
+            payloads = None
+        if isinstance(payloads, list):
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                try:
+                    message_id = int(payload["id"])
+                    author_id = int((payload.get("author") or {}).get("id") or 0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if own_id and author_id == own_id:
+                    continue
+                text = raw_message_text(payload)
+                seen.append(text[:200])
+                reference_id = str(
+                    (payload.get("message_reference") or {}).get("message_id") or ""
+                )
+                verdict = registration_response_verdict(
+                    text,
+                    match_id,
+                    reference_id == str(sent_registration.id),
+                )
+                if verdict is not None:
+                    return message_id, verdict, text
+            return None
 
     try:
-        response = await client.wait_for(
-            "message",
-            check=check,
-            timeout=REGISTRATION_CONFIRM_TIMEOUT,
+        async for candidate in channel.history(limit=25, after=sent_registration):
+            if own_id and getattr(candidate.author, "id", None) == own_id:
+                continue
+            text = registration_response_text(candidate)
+            seen.append(text[:200])
+            reference = getattr(candidate, "reference", None)
+            verdict = registration_response_verdict(
+                text,
+                match_id,
+                bool(reference and reference.message_id == sent_registration.id),
+            )
+            if verdict is not None:
+                return candidate.id, verdict, text
+    except Exception:
+        log.warning(
+            "Не удалось перечитать канал в ожидании ответа по матчу #%s",
+            match_id,
+            exc_info=True,
         )
-    except asyncio.TimeoutError:
-        return False, "тайм-аут ожидания ответа регистрационного бота"
+    return None
 
-    response_text = plain_message_text(response)
-    confirmed = "готово" in response_text.lower()
+
+async def send_registration_and_wait(
+    channel,
+    command_text: str,
+    match_id: int,
+) -> tuple[discord.Message, bool, str]:
+    """Send =g and wait for the game bot's «Готово» or «Не вышло» reply.
+
+    Listeners are armed before the command is sent, so a fast reply cannot
+    slip in between. Edited replies arrive through message_edit, and the
+    channel is re-read in case the gateway did not deliver the reply at all.
+    A confirmed «Готово» is deleted right away; «Не вышло» is kept.
+    """
+    loop = asyncio.get_running_loop()
+    sent_ids: list[int] = []
+
+    def reply_verdict(candidate: object) -> Optional[bool]:
+        if getattr(getattr(candidate, "channel", None), "id", None) != channel.id:
+            return None
+        author_id = getattr(getattr(candidate, "author", None), "id", None)
+        if client.user and author_id == client.user.id:
+            return None
+        reference = getattr(candidate, "reference", None)
+        return registration_response_verdict(
+            registration_response_text(candidate),
+            match_id,
+            bool(
+                sent_ids
+                and reference
+                and getattr(reference, "message_id", None) == sent_ids[0]
+            ),
+        )
+
+    waiters = [
+        asyncio.ensure_future(client.wait_for(
+            "message",
+            check=lambda after: reply_verdict(after) is not None,
+        )),
+        asyncio.ensure_future(client.wait_for(
+            "message_edit",
+            check=lambda before, after: reply_verdict(after) is not None,
+        )),
+    ]
+    await asyncio.sleep(0)
+    seen: list[str] = []
+    response: Optional[tuple[Optional[object], int, bool, str]] = None
+    try:
+        sent_registration = await channel.send(command_text)
+        sent_ids.append(sent_registration.id)
+        deadline = loop.time() + REGISTRATION_CONFIRM_TIMEOUT
+        next_history_check = loop.time() + 4.0
+        while response is None:
+            for waiter in waiters:
+                if not waiter.done() or waiter.cancelled() or waiter.exception():
+                    continue
+                value = waiter.result()
+                candidate = value[-1] if isinstance(value, tuple) else value
+                verdict = reply_verdict(candidate)
+                if verdict is not None:
+                    response = (
+                        candidate,
+                        int(candidate.id),
+                        verdict,
+                        registration_response_text(candidate),
+                    )
+                    break
+            if response is not None:
+                break
+
+            now = loop.time()
+            if now >= next_history_check or now >= deadline:
+                found = await find_registration_response(
+                    channel,
+                    sent_registration,
+                    match_id,
+                    seen,
+                )
+                if found is not None:
+                    response = (None, *found)
+                    break
+                if now >= deadline:
+                    log.warning(
+                        "Матч #%s: ответ регистрационного бота не найден. "
+                        "Сообщения после команды: %r",
+                        match_id,
+                        seen[-10:],
+                    )
+                    return (
+                        sent_registration,
+                        False,
+                        "тайм-аут ожидания ответа регистрационного бота",
+                    )
+                next_history_check = loop.time() + 4.0
+
+            pending = [waiter for waiter in waiters if not waiter.done()]
+            wait_time = max(0.05, min(1.0, deadline - loop.time()))
+            if pending:
+                await asyncio.wait(pending, timeout=wait_time)
+            else:
+                await asyncio.sleep(wait_time)
+    finally:
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+            elif not waiter.cancelled():
+                waiter.exception()
+
+    candidate, response_id, confirmed, response_text = response
+    log.info(
+        "Матч #%s: ответ регистрационного бота — %s",
+        match_id,
+        "Готово" if confirmed else "Не вышло",
+    )
     if confirmed:
         # Remove the registration bot's visible `Готово` card after we have
         # read it. Failure responses are kept for diagnostics and retry.
         try:
-            await response.delete()
+            if candidate is not None and callable(getattr(candidate, "delete", None)):
+                await candidate.delete()
+            else:
+                await delete_channel_message(channel, response_id)
         except discord.NotFound:
             pass
         except discord.Forbidden:
@@ -3678,12 +3971,16 @@ async def wait_for_registration_confirmation(
                 "Нет права удалить подтверждение регистрации матча #%s",
                 match_id,
             )
+            await notify_log_channel(
+                f"⚠️ Матч #{match_id}: нет права удалить «Готово» в "
+                f"<#{channel.id}> — аккаунту нужно право «Управлять сообщениями»."
+            )
         except Exception:
             log.exception(
                 "Не удалось удалить подтверждение регистрации матча #%s",
                 match_id,
             )
-    return confirmed, response_text[:500]
+    return sent_registration, confirmed, response_text[:500]
 
 
 async def process_upload(message: discord.Message, test_only: bool = False) -> None:
@@ -4106,10 +4403,12 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 return
 
             await asyncio.sleep(SEND_DELAY)
-            sent_registration = await message.channel.send(command_text)
-            confirmed, confirmation_text = await wait_for_registration_confirmation(
-                sent_registration,
-                match_id,
+            sent_registration, confirmed, confirmation_text = (
+                await send_registration_and_wait(
+                    message.channel,
+                    command_text,
+                    match_id,
+                )
             )
             if not confirmed:
                 log.warning(
@@ -4132,7 +4431,13 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             # confirmed success. Nothing before this line may delete the source.
             await record_registration(match_id)
             await send_registration_log(result, message, command_text)
-            await send_zero_stat_warnings(result, message)
+            # Discord member lookups for warnings can take a long time. Take
+            # the screenshot now and send warnings in the background, so the
+            # confirmed card is cleaned up right away instead of after them.
+            warning_images = await download_warning_images(result, message)
+            run_in_background(
+                send_zero_stat_warnings(result, message, warning_images)
+            )
             if DELETE_AFTER_REGISTRATION:
                 await asyncio.sleep(DELETE_DELAY)
                 try:
