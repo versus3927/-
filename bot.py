@@ -22,7 +22,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v50-final6-process-edited-result-cards-2026-09-12"
+BOT_VERSION = "v51-warning-tags-for-every-player-2026-09-13"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -523,19 +523,44 @@ def is_test_result_card(message: discord.Message) -> bool:
     )
 
 
-async def resolve_member_mentions(text: str, message: discord.Message) -> str:
-    """Replace mentions with the best display name from every shared guild.
+# (source message ID, Discord user ID) -> display name picked for that card.
+# Warnings read the same mentions again after registration; reuse resolved
+# names instead of repeating fetch_member in every shared guild.
+_mention_display_name_cache: dict[tuple[int, int], str] = {}
+
+
+def registration_id_from_display_name(name: str) -> Optional[int]:
+    """Read the short registration number from `#124 | OLD | Shkiper`."""
+    found = re.search(r"(?<!\d)#\s*(\d{1,5})(?!\d)", name)
+    if not found:
+        found = re.search(r"(?:^|\D)(\d{1,5})\s*\|", name)
+    return int(found.group(1)) if found else None
+
+
+async def mention_display_names(
+    text: str,
+    message: discord.Message,
+) -> dict[int, str]:
+    """Pick the best display name for every `<@id>` mention in the text.
 
     Forwarded cards may be posted in a different server. The destination
     server often shows only `@Shkiper`, while the original league server keeps
     the registration identity as `#124 | OLD | Shkiper`. Prefer the latter so
     test mode can build a real =g command without clicking the lost button.
+    An empty name means that the mention must stay unresolved.
     """
     mention_ids = list(dict.fromkeys(
         int(value) for value in re.findall(r"<@!?(\d{15,22})>", text)
     ))
     known = {int(member.id): member for member in (message.mentions or [])}
+    message_id = int(getattr(message, "id", 0) or 0)
+    resolved: dict[int, str] = {}
     for member_id in mention_ids:
+        cached_name = _mention_display_name_cache.get((message_id, member_id))
+        if cached_name:
+            resolved[member_id] = cached_name
+            continue
+
         candidates: list[object] = []
         if member_id in known:
             candidates.append(known[member_id])
@@ -563,11 +588,6 @@ async def resolve_member_mentions(text: str, message: discord.Message) -> str:
             for member in candidates
             if str(getattr(member, "display_name", "") or "").strip()
         ]
-        def registration_id(name: str) -> Optional[int]:
-            found = re.search(r"(?<!\d)#\s*(\d{1,5})(?!\d)", name)
-            if not found:
-                found = re.search(r"(?:^|\D)(\d{1,5})\s*\|", name)
-            return int(found.group(1)) if found else None
 
         current_guild = getattr(message, "guild", None)
         current_member = (
@@ -581,19 +601,19 @@ async def resolve_member_mentions(text: str, message: discord.Message) -> str:
         known_name = str(
             getattr(known.get(member_id), "display_name", "") or ""
         ).strip()
-        if known_name and registration_id(known_name) is not None:
+        if known_name and registration_id_from_display_name(known_name) is not None:
             # message.mentions belongs to the card's own guild and therefore
             # has priority over every cross-guild profile.
             display_name = known_name
-        elif current_name and registration_id(current_name) is not None:
+        elif current_name and registration_id_from_display_name(current_name) is not None:
             # A real source card must always keep the ID visible in its own
             # server. Never replace it with another mutual server's ID.
             display_name = current_name
         else:
             id_names = [
-                (registration_id(name), name)
+                (registration_id_from_display_name(name), name)
                 for name in display_names
-                if registration_id(name) is not None
+                if registration_id_from_display_name(name) is not None
             ]
             unique_ids = {item[0] for item in id_names}
             if len(unique_ids) == 1:
@@ -611,6 +631,17 @@ async def resolve_member_mentions(text: str, message: discord.Message) -> str:
                 display_name = ""
             else:
                 display_name = display_names[0] if display_names else ""
+        resolved[member_id] = display_name
+        if display_name and message_id:
+            _mention_display_name_cache[(message_id, member_id)] = display_name
+            while len(_mention_display_name_cache) > 2000:
+                _mention_display_name_cache.pop(next(iter(_mention_display_name_cache)))
+    return resolved
+
+
+async def resolve_member_mentions(text: str, message: discord.Message) -> str:
+    """Replace mentions with the best display name from every shared guild."""
+    for member_id, display_name in (await mention_display_names(text, message)).items():
         if display_name:
             text = re.sub(rf"<@!?{member_id}>", f"@{display_name}", text)
     return text
@@ -925,7 +956,18 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
             asyncio.create_task(client.wait_for("interaction", check=interaction_check)),
         ]
         try:
-            click_result = await button.click()
+            try:
+                click_result = await button.click()
+            except (AttributeError, TypeError) as exc:
+                # Forwarded/snapshot components can be MissingSentinel objects
+                # without Discord message state. This is a recoverable helper
+                # failure, not a reason to crash or delete the source card.
+                log.warning(
+                    "Матч #%s: кнопка «Получить игроков» недоступна в snapshot: %s",
+                    expected_match_id or "?",
+                    exc,
+                )
+                return None, []
             observed_roots: list[object] = [button, message]
             if click_result is not None:
                 observed_roots.append(click_result)
@@ -1345,6 +1387,7 @@ def result_from_visual_audit(
                             visual_player.get("nickname")
                             or card_player.get("nickname", "")
                         ),
+                        "card_nickname": str(card_player.get("nickname", "")),
                         "kills": kills,
                         "assists": assists,
                         "deaths": deaths,
@@ -1410,6 +1453,7 @@ def result_from_visual_audit(
                 {
                     "id": int(modal_player["id"]),
                     "nickname": str(visual_player.get("nickname") or modal_player["nickname"]),
+                    "card_nickname": str(modal_player["nickname"]),
                     "kills": int(visual_player["kills"]),
                     "assists": int(visual_player["assists"]),
                     "deaths": int(visual_player["deaths"]),
@@ -1816,6 +1860,7 @@ def result_from_card_and_visual_audit(
                     {
                         "id": int(card_player["id"]),
                         "nickname": str(card_player.get("nickname", "")),
+                        "card_nickname": str(card_player.get("nickname", "")),
                         "kills": 0,
                         "assists": 0,
                         "deaths": 13,
@@ -1844,6 +1889,9 @@ def result_from_card_and_visual_audit(
                     visual_player.get("nickname")
                     or card_player.get("nickname", "")
                 ),
+                # A nickname-mismatch warning must tag the registered Discord
+                # player, whose name differs from the screenshot by definition.
+                "card_nickname": str(card_player.get("nickname", "")),
                 "kills": kills,
                 "assists": assists,
                 "deaths": deaths,
@@ -2064,6 +2112,8 @@ def reconcile_numeric_mentions(result: dict, message_text: str) -> bool:
             })
             if slot["nickname"] and not player.get("nickname"):
                 player["nickname"] = slot["nickname"]
+            if slot["nickname"]:
+                player.setdefault("card_nickname", slot["nickname"])
             reconciled.append(player)
 
         result[team_key] = reconciled
@@ -2661,6 +2711,10 @@ Build a registration result:
                 )
                 if recovered_stats == (0, 0, 13) or min(recovered_stats) < 0:
                     continue
+                card_player.setdefault(
+                    "card_nickname",
+                    str(card_player.get("nickname", "")),
+                )
                 card_player["nickname"] = strip_leading_clan_tags(
                     str(candidate.get("nickname") or card_player.get("nickname", ""))
                 )
@@ -2766,7 +2820,7 @@ async def send_original_card_to_log(
             except Exception:
                 log.warning(
                     "Не удалось переслать исходную карточку матча #%s; "
-                    "используется резервная копия",
+                    "используется ��������зервная копия",
                     match_id,
                     exc_info=True,
                 )
@@ -2881,48 +2935,89 @@ def mentioned_users(message: discord.Message) -> list[object]:
     return list(users.values())
 
 
+def player_identity_names(player: dict) -> list[str]:
+    """Registration (card) nickname first, screenshot nickname second."""
+    names: list[str] = []
+    for key in ("card_nickname", "nickname"):
+        value = str(player.get(key) or "").strip()
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def registration_user_ids_from_names(
+    display_names: dict[int, str],
+) -> dict[int, int]:
+    """Map short registration IDs to the Discord accounts mentioned in a card."""
+    owners: dict[int, set[int]] = {}
+    for member_id, name in display_names.items():
+        registration_id = registration_id_from_display_name(name)
+        if registration_id is not None:
+            owners.setdefault(registration_id, set()).add(member_id)
+    return {
+        registration_id: next(iter(member_ids))
+        for registration_id, member_ids in owners.items()
+        if len(member_ids) == 1
+    }
+
+
 def discord_user_id_for_player(
     source_message: discord.Message,
     player: dict,
 ) -> Optional[int]:
-    """Resolve the Discord account that belongs to one roster player."""
+    """Resolve a roster player whose raw card line holds `#ID` and a mention."""
     raw_text = plain_message_text(source_message)
     registration_id = int(player.get("id") or 0)
     if registration_id > 0:
         patterns = (
             rf"(?im)^\s*(?:[-•]\s*)?#?\s*{registration_id}\b[^\n]*?<@!?(\d{{15,22}})>",
-            rf"(?im)^\s*<@!?(\d{{15,22}})>[^\n]*?#?\s*{registration_id}\b",
+            # Status emoji may precede the ID: `❓ #124 | <@id>`.
+            rf"(?im)^[^\n]*?(?<!\d)#\s*{registration_id}(?!\d)[^\n]*?<@!?(\d{{15,22}})>",
+            # A bare number after a mention can be K/A/D (`<@id> — 12/3/4`),
+            # so only an explicit `#ID` may follow the mention.
+            rf"(?im)^\s*<@!?(\d{{15,22}})>[^\n]*?#\s*{registration_id}(?!\d)",
         )
         for pattern in patterns:
             found = re.search(pattern, raw_text)
             if found:
                 return int(found.group(1))
 
-    nickname = str(player.get("nickname") or "").strip()
-    nickname_digits = re.sub(r"\D", "", nickname)
-    if nickname_digits == nickname and 15 <= len(nickname_digits) <= 22:
-        return int(nickname_digits)
+    for nickname in player_identity_names(player):
+        nickname_digits = re.sub(r"\D", "", nickname)
+        if nickname_digits == nickname and 15 <= len(nickname_digits) <= 22:
+            return int(nickname_digits)
+    return None
 
-    best_user_id: Optional[int] = None
-    best_score = 0.0
-    for user in mentioned_users(source_message):
-        user_id = getattr(user, "id", None)
-        if not isinstance(user_id, int):
-            continue
-        names = {
-            str(getattr(user, "display_name", "") or ""),
-            str(getattr(user, "global_name", "") or ""),
-            str(getattr(user, "name", "") or ""),
-        }
-        score = max((nickname_similarity(nickname, name) for name in names), default=0.0)
-        if score > best_score:
-            best_score = score
-            best_user_id = user_id
-    return best_user_id if best_score >= 0.72 else None
+
+def mentioned_user_id_by_name(
+    source_message: discord.Message,
+    player: dict,
+) -> Optional[int]:
+    """Fuzzy-match a player's card nickname to the users mentioned in a card."""
+    for nickname in player_identity_names(player):
+        best_user_id: Optional[int] = None
+        best_score = 0.0
+        for user in mentioned_users(source_message):
+            user_id = getattr(user, "id", None)
+            if not isinstance(user_id, int):
+                continue
+            names = {
+                str(getattr(user, "display_name", "") or ""),
+                str(getattr(user, "global_name", "") or ""),
+                str(getattr(user, "name", "") or ""),
+            }
+            score = max((nickname_similarity(nickname, name) for name in names), default=0.0)
+            if score > best_score:
+                best_score = score
+                best_user_id = user_id
+        if best_score >= 0.72:
+            return best_user_id
+    return None
 
 
 def card_roster_discord_ids(
     source_message: discord.Message,
+    display_names: Optional[dict[int, str]] = None,
 ) -> dict[str, list[Optional[int]]]:
     """Read Discord IDs while preserving every Team A/B roster position."""
     raw_text = plain_message_text(source_message)
@@ -2930,6 +3025,7 @@ def card_roster_discord_ids(
     header_b = re.search(r"(?:Команда|Team)\s*B[^\n]*", raw_text, re.I)
     if not header_a or not header_b or header_b.start() <= header_a.start():
         return {"team_a": [], "team_b": []}
+    names = display_names or {}
 
     def mention_ids(section: str) -> list[Optional[int]]:
         collected: list[Optional[int]] = []
@@ -2938,13 +3034,27 @@ def card_roster_discord_ids(
             # rows were omitted, shifting all later mentions to the wrong
             # players and sometimes producing @неизвестный-пользователь.
             without_mentions = re.sub(r"<@!?\d{15,22}>", " ", line)
-            if not re.search(r"(?<!\d)#?\s*\d{1,5}(?!\d)", without_mentions):
-                continue
             mention = re.search(r"<@!?(\d{15,22})>", line)
-            collected.append(int(mention.group(1)) if mention else None)
+            mention_id = int(mention.group(1)) if mention else None
+            # `❓ <@id>` carries its registration number only inside the
+            # member name (`#124 | Nick`); it is still a roster slot.
+            # Service pings such as @Система have no number and stay ignored.
+            has_short_id = bool(
+                re.search(r"(?<!\d)#?\s*\d{1,5}(?!\d)", without_mentions)
+            )
+            has_named_id = (
+                mention_id is not None
+                and registration_id_from_display_name(names.get(mention_id, ""))
+                is not None
+            )
+            if not has_short_id and not has_named_id:
+                continue
+            collected.append(mention_id)
             if len(collected) == 5:
                 break
-        return collected[:5]
+        # A partial roster cannot prove positions: one unreadable line would
+        # move every later tag to another player.
+        return collected if len(collected) == 5 else []
 
     return {
         "team_a": mention_ids(raw_text[header_a.end():header_b.start()]),
@@ -2985,10 +3095,16 @@ async def query_warning_members(
     player: dict,
 ) -> list[object]:
     """Ask Discord for uncached members so a plain nickname can be tagged."""
-    nickname = strip_leading_clan_tags(str(player.get("nickname") or "")).strip()
-    registration_id = str(int(player.get("id") or 0))
+    registration_id = int(player.get("id") or 0)
+    values: list[str] = []
+    for name in player_identity_names(player):
+        nickname = strip_leading_clan_tags(name).strip()
+        values.extend((nickname, re.sub(r"^\d+|\d+$", "", nickname)))
+    if registration_id > 0:
+        # League nicknames start with the registration number: `#124 | Nick`.
+        values.extend((f"#{registration_id}", str(registration_id)))
     queries: list[str] = []
-    for value in (nickname, re.sub(r"^\d+|\d+$", "", nickname), registration_id):
+    for value in values:
         value = value.strip()
         if value and value not in queries:
             queries.append(value)
@@ -3091,70 +3207,46 @@ async def resolve_warning_identity(
     warning_channel,
     candidates: list[object],
     ordered_user_id: Optional[int] = None,
+    registration_user_id: Optional[int] = None,
 ) -> tuple[Optional[int], Optional[object]]:
-    """Resolve a card nickname such as `ezio` to `MCRW | ezio`'s profile."""
-    direct_user_id = discord_user_id_for_player(source_message, player)
-    if direct_user_id is not None:
+    """Resolve a roster player to the Discord account that must be tagged.
+
+    Exact card data wins: the mention whose name carries this registration ID,
+    then `#ID` and a mention on one raw line, then the roster position. Only
+    after that are names compared, and always the card nickname first,
+    because on a nickname mismatch the screenshot name (`csn`) belongs to no
+    Discord profile.
+    """
+    user_id = registration_user_id
+    if user_id is None:
+        user_id = discord_user_id_for_player(source_message, player)
+    if user_id is None:
+        user_id = ordered_user_id
+    if user_id is None:
+        user_id = mentioned_user_id_by_name(source_message, player)
+    if user_id is not None:
         member = await warning_member(
-            direct_user_id,
+            user_id,
             source_message,
             warning_channel,
         )
-        return direct_user_id, member
+        return user_id, member
 
-    if ordered_user_id is not None:
-        member = await warning_member(
-            ordered_user_id,
-            source_message,
-            warning_channel,
-        )
-        return ordered_user_id, member
-
-    nickname = str(player.get("nickname") or "").strip()
     registration_id = int(player.get("id") or 0)
-    ranked: list[tuple[float, int, object]] = []
-    for member in candidates:
-        member_id = getattr(member, "id", None)
-        if not isinstance(member_id, int):
-            continue
-        names = {
-            str(getattr(member, "display_name", "") or ""),
-            str(getattr(member, "nick", "") or ""),
-            str(getattr(member, "global_name", "") or ""),
-            str(getattr(member, "name", "") or ""),
-        }
-        score = max(
-            (nickname_similarity(nickname, name) for name in names),
-            default=0.0,
-        )
-        if registration_id > 0 and any(
-            re.search(rf"(?:^|\D){registration_id}(?:\D|$)", name)
-            for name in names
-            if name
-        ):
-            score = max(score, 1.0)
-        ranked.append((score, member_id, member))
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    if not ranked or ranked[0][0] < 0.90:
-        # Large servers do not always cache every member. Query Discord before
-        # falling back to a plain nickname, otherwise the warning cannot tag
-        # the user or safely check that user's league roles.
-        fetched = await query_warning_members(
-            source_message,
-            warning_channel,
-            player,
-        )
-        known_ids = {item[1] for item in ranked}
-        for fetched_member in fetched:
-            member_id = getattr(fetched_member, "id", None)
-            if not isinstance(member_id, int) or member_id in known_ids:
+    def rank(pool: list[object], nickname: str) -> list[tuple[float, int, object]]:
+        ranked: list[tuple[float, int, object]] = []
+        seen: set[int] = set()
+        for member in pool:
+            member_id = getattr(member, "id", None)
+            if not isinstance(member_id, int) or member_id in seen:
                 continue
+            seen.add(member_id)
             names = {
-                str(getattr(fetched_member, "display_name", "") or ""),
-                str(getattr(fetched_member, "nick", "") or ""),
-                str(getattr(fetched_member, "global_name", "") or ""),
-                str(getattr(fetched_member, "name", "") or ""),
+                str(getattr(member, "display_name", "") or ""),
+                str(getattr(member, "nick", "") or ""),
+                str(getattr(member, "global_name", "") or ""),
+                str(getattr(member, "name", "") or ""),
             }
             score = max(
                 (nickname_similarity(nickname, name) for name in names),
@@ -3166,21 +3258,38 @@ async def resolve_warning_identity(
                 if name
             ):
                 score = max(score, 1.0)
-            ranked.append((score, member_id, fetched_member))
+            ranked.append((score, member_id, member))
         ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked
 
-    if not ranked or ranked[0][0] < 0.90:
-        return None, None
-    if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.04:
-        log.warning(
-            "Неоднозначный Discord-профиль для #%s %s: %.3f и %.3f",
-            registration_id,
-            nickname,
-            ranked[0][0],
-            ranked[1][0],
-        )
-        return None, None
-    return ranked[0][1], ranked[0][2]
+    fetched: Optional[list[object]] = None
+    for nickname in player_identity_names(player) or [""]:
+        ranked = rank(candidates, nickname)
+        if not ranked or ranked[0][0] < 0.90:
+            # Large servers do not always cache every member. Query Discord
+            # before falling back to a plain nickname, otherwise the warning
+            # cannot tag the user or safely check that user's league roles.
+            if fetched is None:
+                fetched = await query_warning_members(
+                    source_message,
+                    warning_channel,
+                    player,
+                )
+            ranked = rank([*candidates, *fetched], nickname)
+
+        if not ranked or ranked[0][0] < 0.90:
+            continue
+        if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.04:
+            log.warning(
+                "Неоднозначный Discord-профиль для #%s %s: %.3f и %.3f",
+                registration_id,
+                nickname,
+                ranked[0][0],
+                ranked[1][0],
+            )
+            return None, None
+        return ranked[0][1], ranked[0][2]
+    return None, None
 
 
 async def send_warning_with_screenshot(
@@ -3287,7 +3396,15 @@ async def send_zero_stat_warnings(
             source_message,
             warning_channel,
         )
-        roster_discord_ids = card_roster_discord_ids(source_message)
+        mention_names = await mention_display_names(
+            plain_message_text(source_message),
+            source_message,
+        )
+        registration_user_ids = registration_user_ids_from_names(mention_names)
+        roster_discord_ids = card_roster_discord_ids(
+            source_message,
+            mention_names,
+        )
         log.info(
             "Матч #%s: кандидатов на варн %s (%s)",
             result.get("match_id"),
@@ -3305,12 +3422,19 @@ async def send_zero_stat_warnings(
                 if player_index < len(ordered_ids)
                 else None
             )
+            player_registration_id = int(player.get("id") or 0)
+            if ordered_user_id is not None and registration_id_from_display_name(
+                mention_names.get(ordered_user_id, "")
+            ) not in (None, player_registration_id):
+                # The mention at this position belongs to another roster ID.
+                ordered_user_id = None
             user_id, member = await resolve_warning_identity(
                 source_message,
                 player,
                 warning_channel,
                 identity_candidates,
                 ordered_user_id,
+                registration_user_ids.get(player_registration_id),
             )
             if user_id is not None and user_id in PRO_LEAGUE_USER_IDS:
                 log.info(
@@ -3336,10 +3460,19 @@ async def send_zero_stat_warnings(
                 )
                 continue
 
+            identity_names = player_identity_names(player)
+            if user_id is None:
+                log.warning(
+                    "Матч #%s: Discord-профиль игрока #%s (%s) не найден, "
+                    "варн будет без тега",
+                    result.get("match_id"),
+                    player.get("id"),
+                    " / ".join(identity_names) or "без ника",
+                )
             target = (
                 f"<@{user_id}>"
                 if user_id is not None
-                else f"`{player.get('nickname') or 'ник не найден'}`"
+                else f"`{identity_names[0] if identity_names else 'ник не найден'}`"
             )
             reason_text = WARNING_REASON_LABELS.get(
                 player["warning_reason"],
@@ -3577,23 +3710,18 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
     processing_completed = False
     async with message.channel.typing():
         try:
-            # If this match was already confirmed earlier, no recognition or
-            # second registration is needed. Remove every repeated result
-            # card for it from the registration channel immediately.
+            # A saved record prevents duplicate registration, but never proves
+            # that this particular source message is safe to delete. Source
+            # cards are removed only in the confirmed «Готово» path below.
             if (
                 not test_only
                 and
                 reserved_match_id is not None
                 and await registration_exists(reserved_match_id)
             ):
-                deleted = await delete_duplicate_match_cards(
-                    message,
-                    reserved_match_id,
-                )
                 log.info(
-                    "Матч #%s уже зарегистрирован; удалено карточек-дублей: %s",
+                    "Матч #%s уже есть в истории; исходное сообщение сохранено.",
                     reserved_match_id,
-                    deleted,
                 )
                 processing_completed = True
                 return
@@ -3618,9 +3746,52 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             )
             modal_text: Optional[str] = None
 
+            async def discard_live_tab_card(audit: dict) -> bool:
+                """Reject a live TAB without ever deleting an unregistered card."""
+                if not audit.get("has_live_gameplay_hud"):
+                    return False
+                log.info(
+                    "Матч #%s определён как открытый TAB, а не финальный экран.",
+                    reserved_match_id or "?",
+                )
+                # Test previews are intentionally non-destructive and must
+                # still return the generated =g command. Bypass only the final-
+                # screen gate for this preview; real registration is unchanged.
+                if test_only:
+                    audit["is_scoreboard"] = True
+                    audit["is_final_result"] = True
+                    audit["has_live_gameplay_hud"] = False
+                    audit["notes"] = (
+                        str(audit.get("notes", ""))
+                        + " Тестовый предпросмотр открытого TAB; в рабочем "
+                        "канале такая карточка пропускается и сохраняется."
+                    ).strip()
+                    return False
+                # Safety invariant: source cards are deleted only after the
+                # registration bot confirms the match with «Готово». A visual
+                # classifier can be wrong, so a rejected live-TAB card stays.
+                log.info(
+                    "Матч #%s пропущен как live TAB; исходное сообщение сохранено.",
+                    reserved_match_id or "?",
+                )
+                return True
+
             async def try_players_helper_fallback(audit: dict) -> Optional[dict]:
-                """Use authoritative helper IDs/stats when OCR names are weak."""
+                """Use the helper only after proving this is a final result."""
                 nonlocal modal_text
+                # Never click «Получить игроков» for an opened live TAB. The
+                # helper is only a fallback for weak OCR on a final screen.
+                if (
+                    not audit.get("is_scoreboard")
+                    or not audit.get("is_final_result")
+                    or audit.get("has_live_gameplay_hud")
+                ):
+                    log.info(
+                        "Матч #%s: «Получить игроков» не нажата — финальный "
+                        "экран не подтверждён.",
+                        reserved_match_id or "?",
+                    )
+                    return None
                 helper_message = message
                 if (
                     is_forwarded_message(message)
@@ -3667,6 +3838,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     message_text=context,
                     visual_audit=True,
                 )
+                if await discard_live_tab_card(audit):
+                    processing_completed = True
+                    return
                 result = result_from_card_and_visual_audit(context, audit)
                 if result is None:
                     result = await try_players_helper_fallback(audit)
@@ -3702,6 +3876,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                         message_text=context,
                         visual_audit=True,
                     )
+                    if await discard_live_tab_card(audit):
+                        processing_completed = True
+                        return
                     result = result_from_card_and_visual_audit(context, audit)
                     if result is None:
                         result = await try_players_helper_fallback(audit)
@@ -3726,6 +3903,22 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 else:
                     # Keep support for old review cards whose IDs/statistics
                     # can be recovered only through the helper button.
+                    # Inspect the screenshot FIRST: a live TAB card must be
+                    # deleted without ever clicking «Получить игроков».
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        raw_images = await asyncio.gather(
+                            *(download_image(session, url) for url in urls[:4])
+                        )
+                    audit = await recognize_match(
+                        raw_images,
+                        message_text=context,
+                        visual_audit=True,
+                    )
+                    if await discard_live_tab_card(audit):
+                        processing_completed = True
+                        return
+
                     helper_message = message
                     if (
                         is_forwarded_message(message)
@@ -3761,16 +3954,6 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     # Even when the helper returns 0/0/0, the original
                     # screenshot remains authoritative. If that nickname is
                     # visible, use its real K/A/D and never emit fake 0/0/13.
-                    timeout = aiohttp.ClientTimeout(total=30)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in urls[:4])
-                        )
-                    audit = await recognize_match(
-                        raw_images,
-                        message_text=context,
-                        visual_audit=True,
-                    )
                     result = result_from_review_card_and_modal(
                         context,
                         modal_text,
@@ -3873,7 +4056,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 )
                 await send_processing_error_log(
                     result.get("match_id") or reserved_match_id or "?", message,
-                    f"Низкая уверенность распознавания: {confidence:.2f}.", diagnostics,
+                    f"Низк��я уверенность распознавания: {confidence:.2f}.", diagnostics,
                 )
                 return
 
@@ -3914,12 +4097,10 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 return
 
             match_id = int(result["match_id"])
-            if not await record_registration(match_id):
-                deleted = await delete_duplicate_match_cards(message, match_id)
+            if await registration_exists(match_id):
                 log.info(
-                    "Матч #%s уже зарегистрирован — удалено карточек-дублей: %s",
+                    "Матч #%s уже есть в истории; исходное сообщение сохранено.",
                     match_id,
-                    deleted,
                 )
                 processing_completed = True
                 return
@@ -3931,7 +4112,6 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 match_id,
             )
             if not confirmed:
-                await forget_registration(match_id)
                 log.warning(
                     "Матч #%s не подтверждён; исходная карточка сохранена. Ответ: %s",
                     match_id,
@@ -3948,6 +4128,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     )
                 return
 
+            # Persist only after the external registration bot has explicitly
+            # confirmed success. Nothing before this line may delete the source.
+            await record_registration(match_id)
             await send_registration_log(result, message, command_text)
             await send_zero_stat_warnings(result, message)
             if DELETE_AFTER_REGISTRATION:
@@ -4239,7 +4422,7 @@ async def on_message(message: discord.Message) -> None:
         deleted, scanned, failed = await delete_all_registration_confirmations(
             registration_channel_ids
         )
-        suffix = f" Ошибок каналов: **{failed}**." if failed else ""
+        suffix = f" Ошибо�� каналов: **{failed}**." if failed else ""
         await message.channel.send(
             f"✅ Очистка завершена. Каналов проверено: **{scanned}**, "
             f"сообщений удалено: **{deleted}**.{suffix}"
