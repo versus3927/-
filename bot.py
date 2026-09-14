@@ -23,7 +23,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v57-ai-fallback-and-error-details-2026-09-14"
+BOT_VERSION = "v58-error-log-length-and-ai-limit-notice-2026-09-14"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -3029,15 +3029,20 @@ async def send_processing_error_log(
             log_channel = await client.fetch_channel(LOG_CHANNEL_ID)
         header = (
             f"❌ Ошибка регистрации игры #{match_id}\n"
-            f"Причина: {reason[:500]}\n"
+            f"Причина: {reason[:300]}\n"
             f"Источник: <#{source_message.channel.id}>\n"
         )
-        # Discord messages are limited to 2000 characters. Send the complete
-        # diagnostics in ordered chunks so no player row is lost.
-        chunks = [diagnostics[index:index + 1700] for index in range(0, len(diagnostics), 1700)] or ["Диагностика отсутствует"]
-        for index, chunk in enumerate(chunks):
-            prefix = header if index == 0 else f"❌ Игра #{match_id}, продолжение {index + 1}\n"
+        # Discord messages are limited to 2000 characters. Size every chunk
+        # by its own header so a long reason can never push a message over
+        # the limit, and send the diagnostics in order so no row is lost.
+        remaining = diagnostics or "Диагностика отсутствует"
+        part = 0
+        while remaining:
+            prefix = header if part == 0 else f"❌ Игра #{match_id}, продолжение {part + 1}\n"
+            room = 1990 - len(prefix) - len("```text\n\n```")
+            chunk, remaining = remaining[:room], remaining[room:]
             await log_channel.send(f"{prefix}```text\n{chunk}\n```")
+            part += 1
     except Exception:
         log.exception(
             "Не удалось отправить Discord-лог ошибки матча #%s в канал %s",
@@ -4917,9 +4922,20 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 "Ошибка обработки файла в process_upload.\n%s",
                 card_diagnostics,
             )
+            reason = f"Необработанное исключение: {error_text[:250]}"
+            if re.search(
+                r"HTTP 402|insufficient_balance|limit_exceeded|allowance exhausted",
+                error_text,
+                re.I,
+            ):
+                reason = (
+                    "У API-ключей ИИ закончился лимит токенов или баланс "
+                    "(HTTP 402) — увеличьте лимит ключа в панели ИИ-сервиса "
+                    "или укажите новый ключ в Railway."
+                )
             await send_processing_error_log(
                 reserved_match_id or "?", message,
-                f"Необработанное исключение: {error_text[:400]}",
+                reason,
                 (
                     f"ОШИБКА: {error_text[:1000]}\n\nГДЕ:\n{trace_tail}\n\n"
                     f"{card_diagnostics}"
