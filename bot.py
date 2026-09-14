@@ -23,7 +23,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v58-error-log-length-and-ai-limit-notice-2026-09-14"
+BOT_VERSION = "v60-ids-only-from-source-server-2026-09-14"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -515,12 +515,65 @@ def is_test_result_card(message: discord.Message) -> bool:
         return False
     if not image_urls(message):
         return False
+    # Cards posted by the tournament bot itself in other channels (history, a
+    # registration channel missing from the mode) are not tests: previewing
+    # them would post =g into that channel or fail there without access.
+    if getattr(getattr(message, "author", None), "bot", False):
+        return False
     return bool(
         re.search(
             r"Результат\s+матча\s*#\s*\d+",
             plain_message_text(message),
             re.I,
         )
+    )
+
+
+# Channels already reported as receiving review cards outside the mode.
+_unconfigured_card_channels: set[int] = set()
+
+
+def is_unconfigured_result_card(message: discord.Message) -> bool:
+    """A tournament-bot review card in a same-server channel outside the mode."""
+    if not is_active:
+        return False
+    channel_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+    if (
+        not channel_id
+        or channel_id in active_channel_ids
+        or channel_id in {LOG_CHANNEL_ID, WARN_CHANNEL_ID}
+        or channel_id in _unconfigured_card_channels
+    ):
+        return False
+    if not getattr(getattr(message, "author", None), "bot", False):
+        return False
+    if not image_urls(message) or not is_review_result_card(plain_message_text(message)):
+        return False
+    guild_id = getattr(getattr(message, "guild", None), "id", None)
+    active_guild_ids = {
+        getattr(getattr(client.get_channel(active_id), "guild", None), "id", None)
+        for active_id in active_channel_ids
+    }
+    return guild_id is not None and guild_id in active_guild_ids
+
+
+async def notify_unconfigured_card_channel(message: discord.Message) -> None:
+    """Tell #логи the ID of a channel that receives cards but is not in the mode."""
+    channel_id = int(message.channel.id)
+    found = re.search(r"Результат\s+матча\s*#\s*(\d+)", plain_message_text(message), re.I)
+
+    def ids(values: set[int]) -> str:
+        return ", ".join(str(value) for value in sorted(values)) or "не указаны"
+
+    await notify_log_channel(
+        f"ℹ️ Карточка матча #{found.group(1) if found else '?'} пришла в "
+        f"<#{channel_id}> (ID `{channel_id}`), но этот канал не входит в "
+        "запущенный режим — бот её не регистрирует.\n"
+        f"Если это канал регистрации, добавьте `{channel_id}` в "
+        "`NORMAL_CHANNEL_IDS` или `PRIORITY_CHANNEL_IDS` в Railway и напишите "
+        "`старт все`.\n"
+        f"Сейчас в Railway: обычные `{ids(NORMAL_CHANNEL_IDS)}`, "
+        f"приоритет `{ids(PRIORITY_CHANNEL_IDS)}`."
     )
 
 
@@ -538,23 +591,118 @@ def registration_id_from_display_name(name: str) -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
+def source_guild_ids(message: discord.Message) -> list[int]:
+    """Servers whose member nicknames may give registration IDs for a card.
+
+    A card posted in a league server uses that server. A forwarded card uses
+    the server it was forwarded from (the message reference); without one, the
+    servers of the registration channels. Every other shared server has
+    unrelated `#number | nick` names, such as another league's #49370.
+    """
+    guild_id = getattr(getattr(message, "guild", None), "id", None)
+    if not is_forwarded_message(message):
+        return [int(guild_id)] if guild_id else []
+    ids: list[int] = []
+    for part in message_parts(message):
+        for reference in (
+            getattr(part, "reference", None),
+            getattr(part, "message_reference", None),
+        ):
+            reference_guild_id = getattr(reference, "guild_id", None)
+            if reference_guild_id:
+                ids.append(int(reference_guild_id))
+    if not ids:
+        for channel_id in sorted(NORMAL_CHANNEL_IDS | PRIORITY_CHANNEL_IDS):
+            channel_guild_id = getattr(
+                getattr(client.get_channel(channel_id), "guild", None), "id", None
+            )
+            if channel_guild_id:
+                ids.append(int(channel_guild_id))
+    if not ids and guild_id:
+        ids.append(int(guild_id))
+    return list(dict.fromkeys(ids))
+
+
+def guild_by_id(guild_id: int, message: discord.Message):
+    for guild in (getattr(message, "guild", None), *(getattr(client, "guilds", None) or [])):
+        if guild is not None and getattr(guild, "id", None) == guild_id:
+            return guild
+    get_guild = getattr(client, "get_guild", None)
+    return get_guild(guild_id) if callable(get_guild) else None
+
+
+# (server ID, Discord user ID) -> server display name, for uncached members.
+_guild_member_name_cache: dict[tuple[int, int], str] = {}
+
+
+async def guild_member_display_name(guild, member_id: int) -> str:
+    """Display name of a member in one server: cache, HTTP, then gateway query."""
+    guild_id = int(getattr(guild, "id", 0) or 0)
+    cached_name = _guild_member_name_cache.get((guild_id, member_id))
+    if cached_name:
+        return cached_name
+    member = guild.get_member(member_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(member_id)
+        except Exception:
+            member = None
+    if member is None and callable(getattr(guild, "query_members", None)):
+        try:
+            for candidate in await guild.query_members(
+                user_ids=[member_id], limit=1, cache=True
+            ) or []:
+                if getattr(candidate, "id", None) == member_id:
+                    member = candidate
+        except Exception:
+            log.debug(
+                "Не удалось запросить участника %s на сервере %s",
+                member_id,
+                guild_id,
+                exc_info=True,
+            )
+    name = str(getattr(member, "display_name", "") or "").strip()
+    if name and guild_id:
+        _guild_member_name_cache[(guild_id, member_id)] = name
+        while len(_guild_member_name_cache) > 5000:
+            _guild_member_name_cache.pop(next(iter(_guild_member_name_cache)))
+    return name
+
+
+def without_registration_number(name: str) -> str:
+    """`#49370 | Nick` from a server that is not the card's source -> `Nick`."""
+    text = re.sub(r"(?<!\d)#\s*\d{1,5}(?!\d)\s*\|?\s*", "", str(name))
+    text = re.sub(r"^\s*\d{1,5}\s*\|\s*", "", text)
+    return text.strip(" |")
+
+
 async def mention_display_names(
     text: str,
     message: discord.Message,
 ) -> dict[int, str]:
     """Pick the best display name for every `<@id>` mention in the text.
 
-    Forwarded cards may be posted in a different server. The destination
-    server often shows only `@Shkiper`, while the original league server keeps
-    the registration identity as `#124 | OLD | Shkiper`. Prefer the latter so
-    test mode can build a real =g command without clicking the lost button.
-    An empty name means that the mention must stay unresolved.
+    Registration numbers come only from the card's source server (see
+    source_guild_ids): for a forwarded test card that is the league server it
+    was forwarded from, never the destination or another shared server.
+    Names from anywhere else keep just the nickname, without a `#number`.
+    A mention without a number stays a nickname; its ID then comes from
+    «Получить игроков» on the original card. An empty name means that the
+    mention must stay unresolved.
     """
     mention_ids = list(dict.fromkeys(
         int(value) for value in re.findall(r"<@!?(\d{15,22})>", text)
     ))
+    forwarded = is_forwarded_message(message)
     known = {int(member.id): member for member in (message.mentions or [])}
     message_id = int(getattr(message, "id", 0) or 0)
+    source_guilds = [
+        guild
+        for guild in (
+            guild_by_id(guild_id, message) for guild_id in source_guild_ids(message)
+        )
+        if guild is not None
+    ]
     resolved: dict[int, str] = {}
     for member_id in mention_ids:
         cached_name = _mention_display_name_cache.get((message_id, member_id))
@@ -562,76 +710,47 @@ async def mention_display_names(
             resolved[member_id] = cached_name
             continue
 
-        candidates: list[object] = []
-        if member_id in known:
-            candidates.append(known[member_id])
-
-        guilds: list[object] = []
-        for guild in (
-            getattr(message, "guild", None),
-            *(getattr(client, "guilds", None) or []),
-        ):
-            if guild is not None and guild not in guilds:
-                guilds.append(guild)
-
-        for guild in guilds:
-            member = guild.get_member(member_id)
-            if member is None:
-                try:
-                    member = await guild.fetch_member(member_id)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    member = None
-            if member is not None and member not in candidates:
-                candidates.append(member)
-
-        display_names = [
-            str(getattr(member, "display_name", "") or "").strip()
-            for member in candidates
-            if str(getattr(member, "display_name", "") or "").strip()
-        ]
-
-        current_guild = getattr(message, "guild", None)
-        current_member = (
-            current_guild.get_member(member_id)
-            if current_guild is not None
-            else None
-        )
-        current_name = str(
-            getattr(current_member, "display_name", "") or ""
-        ).strip()
         known_name = str(
             getattr(known.get(member_id), "display_name", "") or ""
         ).strip()
-        if known_name and registration_id_from_display_name(known_name) is not None:
-            # message.mentions belongs to the card's own guild and therefore
-            # has priority over every cross-guild profile.
-            display_name = known_name
-        elif current_name and registration_id_from_display_name(current_name) is not None:
-            # A real source card must always keep the ID visible in its own
-            # server. Never replace it with another mutual server's ID.
-            display_name = current_name
+        source_names: list[str] = []
+        if known_name and not forwarded:
+            # message.mentions of a card posted in its own server are members
+            # of that server and have priority over every lookup.
+            source_names.append(known_name)
+        if not (source_names and registration_id_from_display_name(source_names[0]) is not None):
+            for guild in source_guilds:
+                name = await guild_member_display_name(guild, member_id)
+                if name and name not in source_names:
+                    source_names.append(name)
+
+        id_names = [
+            (registration_id_from_display_name(name), name)
+            for name in source_names
+            if registration_id_from_display_name(name) is not None
+        ]
+        unique_ids = {item[0] for item in id_names}
+        if len(unique_ids) == 1:
+            display_name = id_names[0][1]
+        elif len(unique_ids) > 1:
+            # The same account can have different numbers in two league
+            # servers. Leaving the mention unresolved forces the safe
+            # «Получить игроков» lookup instead of guessing an ID.
+            log.warning(
+                "Неоднозначный регистрационный ID для Discord %s: %s",
+                member_id,
+                sorted(unique_ids),
+            )
+            display_name = ""
         else:
-            id_names = [
-                (registration_id_from_display_name(name), name)
-                for name in display_names
-                if registration_id_from_display_name(name) is not None
-            ]
-            unique_ids = {item[0] for item in id_names}
-            if len(unique_ids) == 1:
-                display_name = id_names[0][1]
-            elif len(unique_ids) > 1:
-                # On forwarded tests the same Discord account can have
-                # different registration IDs on mutual servers. Leaving the
-                # mention unresolved forces the safe original-card lookup
-                # instead of silently registering a wrong ID such as #1057.
-                log.warning(
-                    "Неоднозначный регистрационный ID для Discord %s: %s",
-                    member_id,
-                    sorted(unique_ids),
-                )
-                display_name = ""
-            else:
-                display_name = display_names[0] if display_names else ""
+            display_name = next(
+                (
+                    without_registration_number(name)
+                    for name in (*source_names, known_name)
+                    if name and without_registration_number(name)
+                ),
+                "",
+            )
         resolved[member_id] = display_name
         if display_name and message_id:
             _mention_display_name_cache[(message_id, member_id)] = display_name
@@ -4384,6 +4503,29 @@ async def delete_live_tab_card(
         log.exception("Не удалось удалить TAB-карточку матча #%s", match_id)
 
 
+@contextlib.asynccontextmanager
+async def safe_typing(channel):
+    """Show «печатает…» when Discord allows it; a refusal never stops a game."""
+    indicator = None
+    try:
+        indicator = channel.typing()
+        await indicator.__aenter__()
+    except Exception as exc:
+        indicator = None
+        log.warning(
+            "Не удалось показать «печатает…» в канале %s: %s: %s",
+            getattr(channel, "id", "?"),
+            type(exc).__name__,
+            exc,
+        )
+    try:
+        yield
+    finally:
+        if indicator is not None:
+            with contextlib.suppress(Exception):
+                await indicator.__aexit__(None, None, None)
+
+
 async def process_upload(message: discord.Message, test_only: bool = False) -> None:
     urls = image_urls(message)
     if not urls:
@@ -4406,7 +4548,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             processing_match_ids.add(reserved_match_id)
 
     processing_completed = False
-    async with message.channel.typing():
+    async with safe_typing(message.channel):
         try:
             # A saved record prevents duplicate registration, but never proves
             # that this particular source message is safe to delete. Source
@@ -4933,6 +5075,12 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     "(HTTP 402) — увеличьте лимит ключа в панели ИИ-сервиса "
                     "или укажите новый ключ в Railway."
                 )
+            if isinstance(exc, discord.Forbidden):
+                reason = (
+                    f"Discord запретил действие в <#{message.channel.id}> (403): "
+                    "у аккаунта нет доступа к каналу или права писать сообщения. "
+                    "Проверьте права аккаунта на сервере и ID каналов в Railway."
+                )
             await send_processing_error_log(
                 reserved_match_id or "?", message,
                 reason,
@@ -4972,13 +5120,40 @@ async def process_message_once(
     return True
 
 
-async def backfill_one_channel(channel_id: int, before_time) -> int:
-    """Read old image messages from one channel in chronological order."""
-    found = 0
+def describe_channel(channel: object, channel_id: int) -> str:
+    """`#name (server) · ID` for Discord replies."""
+    name = getattr(channel, "name", None)
+    guild_name = getattr(getattr(channel, "guild", None), "name", None)
+    if name and guild_name:
+        return f"#{name} ({guild_name}) · `{channel_id}`"
+    if name:
+        return f"#{name} · `{channel_id}`"
+    return f"канал `{channel_id}`"
+
+
+def channel_error_hint(exc: Exception) -> str:
+    if isinstance(exc, discord.NotFound):
+        return " — канала с таким ID нет; проверьте ID в Railway"
+    if isinstance(exc, discord.Forbidden):
+        return " — у аккаунта нет доступа к каналу или к истории сообщений"
+    return ""
+
+
+async def backfill_one_channel_report(channel_id: int, before_time) -> dict:
+    """Read old image messages from one channel and report what happened."""
+    report: dict = {
+        "label": f"канал `{channel_id}`",
+        "scanned": 0,
+        "found": 0,
+        "error": None,
+    }
+    stage = "открыть канал"
     try:
         channel = client.get_channel(channel_id)
         if channel is None:
             channel = await client.fetch_channel(channel_id)
+        report["label"] = describe_channel(channel, channel_id)
+        stage = "прочитать историю"
 
         log.info(
             "Читаю до %s старых сообщений из канала %s",
@@ -4991,6 +5166,7 @@ async def backfill_one_channel(channel_id: int, before_time) -> int:
             before=before_time,
             oldest_first=True,
         ):
+            report["scanned"] += 1
             if (
                 old_message.id not in processed_message_ids
                 and allowed_for_parsing(old_message)
@@ -5002,17 +5178,26 @@ async def backfill_one_channel(channel_id: int, before_time) -> int:
                 results = await asyncio.gather(
                     *(process_message_once(item) for item in batch)
                 )
-                found += sum(bool(result) for result in results)
+                report["found"] += sum(bool(result) for result in results)
                 batch.clear()
 
         if batch:
             results = await asyncio.gather(
                 *(process_message_once(item) for item in batch)
             )
-            found += sum(bool(result) for result in results)
-    except Exception:
+            report["found"] += sum(bool(result) for result in results)
+    except Exception as exc:
         log.exception("Не удалось прочитать историю канала %s", channel_id)
-    return found
+        report["error"] = (
+            f"не удалось {stage}: {type(exc).__name__}: {str(exc)[:200]}"
+            f"{channel_error_hint(exc)}"
+        )
+    return report
+
+
+async def backfill_one_channel(channel_id: int, before_time) -> int:
+    """Read old image messages from one channel in chronological order."""
+    return (await backfill_one_channel_report(channel_id, before_time))["found"]
 
 
 async def backfill_channels(channel_ids: set[int], before_time) -> int:
@@ -5275,9 +5460,27 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(
             f"✅ Запущен режим «{mode_name}». Читаю старые игры, затем новые."
         )
-        count = await backfill_channels(active_channel_ids, message.created_at)
+        reports = await asyncio.gather(
+            *(
+                backfill_one_channel_report(channel_id, message.created_at)
+                for channel_id in sorted(active_channel_ids)
+            )
+        )
+        count = sum(report["found"] for report in reports)
+        lines = []
+        for report in reports:
+            if report["error"]:
+                lines.append(f"• {report['label']}: ❌ {report['error']}")
+            else:
+                lines.append(
+                    f"• {report['label']}: прочитано сообщений "
+                    f"{report['scanned']}, новых карточек {report['found']}"
+                )
         await message.channel.send(
-            f"✅ Архив режима «{mode_name}» проверен. Найдено изображений: {count}."
+            (
+                f"✅ Архив режима «{mode_name}» проверен. Найдено изображений: {count}.\n"
+                + "\n".join(lines)
+            )[:2000]
         )
         return
 
@@ -5285,6 +5488,10 @@ async def on_message(message: discord.Message) -> None:
     # by the self-bot account in the main command channel or in an active
     # registration channel. It only prints the generated =g command: no stats
     # are saved, no confirmation is awaited and no source message is deleted.
+    if is_unconfigured_result_card(message):
+        _unconfigured_card_channels.add(int(message.channel.id))
+        run_in_background(notify_unconfigured_card_channel(message))
+
     if (
         (is_forwarded_message(message) or is_test_result_card(message))
         and image_urls(message)
