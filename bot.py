@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import traceback
 import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v56-delete-live-tab-cards-2026-09-13"
+BOT_VERSION = "v57-ai-fallback-and-error-details-2026-09-14"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -912,6 +913,15 @@ def extract_interaction_image_urls(root: object) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+# Why «Получить игроков» gave no player list, per match, for Discord logs.
+players_helper_errors: dict[int, str] = {}
+
+
+def players_helper_error_text(match_id: Optional[int]) -> str:
+    reason = players_helper_errors.get(match_id or 0)
+    return f"«ПОЛУЧИТЬ ИГРОКОВ»: {reason}\n\n" if reason else ""
+
+
 async def get_players_response(message: discord.Message) -> tuple[Optional[str], list[str]]:
     """Click `Получить игроков` and capture its private helper message."""
     button = find_get_players_button(message)
@@ -922,6 +932,7 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
         custom_id = str(getattr(button, "custom_id", "") or "")
         source_match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", await message_context(message), re.I)
         expected_match_id = int(source_match.group(1)) if source_match else None
+        players_helper_errors.pop(expected_match_id or 0, None)
 
         def modal_matches_expected(text: Optional[str]) -> bool:
             if not text:
@@ -958,14 +969,16 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
         try:
             try:
                 click_result = await button.click()
-            except (AttributeError, TypeError) as exc:
-                # Forwarded/snapshot components can be MissingSentinel objects
-                # without Discord message state. This is a recoverable helper
-                # failure, not a reason to crash or delete the source card.
+            except Exception as exc:
+                # Snapshot components without message state, Discord HTTP
+                # errors and rejected interactions are recoverable helper
+                # failures, not a reason to crash the whole card.
+                reason = f"кнопка не нажалась — {type(exc).__name__}: {exc}"
+                players_helper_errors[expected_match_id or 0] = reason[:500]
                 log.warning(
-                    "Матч #%s: кнопка «Получить игроков» недоступна в snapshot: %s",
+                    "Матч #%s: «Получить игроков»: %s",
                     expected_match_id or "?",
-                    exc,
+                    reason,
                 )
                 return None, []
             observed_roots: list[object] = [button, message]
@@ -976,6 +989,10 @@ async def get_players_response(message: discord.Message) -> tuple[Optional[str],
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
+                    players_helper_errors[expected_match_id or 0] = (
+                        "турнирный бот не прислал список игроков за "
+                        f"{PLAYER_MODAL_TIMEOUT:g} с"
+                    )
                     log.error(
                         "Матч #%s: тайм-аут захвата ephemeral-ответа «Получить игроков»; observed=%s",
                         expected_match_id or "?",
@@ -1500,6 +1517,52 @@ async def download_image(session: aiohttp.ClientSession, url: str) -> bytes:
     async with session.get(url) as response:
         response.raise_for_status()
         return await response.read()
+
+
+def image_proxy_urls(message: discord.Message) -> dict[str, str]:
+    """media.discordapp.net mirrors of card images, used when a link fails."""
+    proxies: dict[str, str] = {}
+    for part in message_parts(message):
+        media_items = list(getattr(part, "attachments", None) or [])
+        for embed in getattr(part, "embeds", None) or []:
+            media_items.extend(
+                (getattr(embed, "image", None), getattr(embed, "thumbnail", None))
+            )
+        for media in media_items:
+            url = getattr(media, "url", None)
+            proxy_url = getattr(media, "proxy_url", None)
+            if url and proxy_url and str(proxy_url) != str(url):
+                proxies[str(url)] = str(proxy_url)
+    return proxies
+
+
+async def download_card_images(session, message: discord.Message, urls: list[str]) -> list[bytes]:
+    """Download card images, skipping links that fail after the proxy retry."""
+    proxies = image_proxy_urls(message)
+    errors: list[str] = []
+
+    async def fetch(url: str) -> Optional[bytes]:
+        for candidate in (url, proxies.get(url)):
+            if not candidate:
+                continue
+            try:
+                return await download_image(session, candidate)
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {str(exc)[:200]}")
+        return None
+
+    downloaded = await asyncio.gather(*(fetch(url) for url in urls))
+    images = [image for image in downloaded if image is not None]
+    if not images:
+        raise RuntimeError(
+            "Не удалось скачать скриншот карточки: " + " | ".join(errors)[:800]
+        )
+    if errors:
+        log.warning(
+            "Часть изображений карточки не скачалась, продолжаю без них: %s",
+            " | ".join(errors)[:800],
+        )
+    return images
 
 
 def prepare_image(raw: bytes) -> tuple[str, str]:
@@ -2573,84 +2636,121 @@ Build a registration result:
 
     timeout = aiohttp.ClientTimeout(total=120)
     retryable_statuses = {429, 500, 502, 503, 504}
-    assigned_model, assigned_api_key, assigned_key_number = next_gemini_assignment()
-    # Одна игра всегда обрабатывается только одной моделью и одним ключом.
-    models = [assigned_model]
+    assigned_model, _assigned_api_key, assigned_key_number = next_gemini_assignment()
     log.info(
-        "Игра назначена только модели %s и ключу #%s",
+        "Игра назначена модели %s и ключу #%s",
         assigned_model,
         assigned_key_number,
     )
-    data: Optional[dict] = None
+    # The assigned pair goes first. When it fails (no balance, unknown model,
+    # network error, broken JSON) the game is not lost: every other configured
+    # model/key pair is tried once before giving up.
+    attempts: list[tuple[str, int]] = [(assigned_model, assigned_key_number - 1)]
+    for model_name in GEMINI_MODELS:
+        for key_index in range(len(GEMINI_API_KEYS)):
+            if (model_name, key_index) not in attempts:
+                attempts.append((model_name, key_index))
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for model in models:
-            if AI_API_STYLE == "openai":
-                url = f"{GEMINI_BASE_URL}/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {assigned_api_key}",
+    def request_for(model: str, api_key: str) -> tuple[str, dict, dict]:
+        if AI_API_STYLE == "openai":
+            return (
+                f"{GEMINI_BASE_URL}/chat/completions",
+                {
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                }
-                request_payload = {
+                },
+                {
                     "model": model,
                     "messages": [{"role": "user", "content": openai_content}],
                     "temperature": 0,
                     "response_format": {"type": "json_object"},
-                }
+                },
+            )
+        return (
+            f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent",
+            {"x-goog-api-key": api_key},
+            gemini_payload,
+        )
+
+    def parse_model_output(data: object) -> dict:
+        try:
+            if AI_API_STYLE == "openai":
+                output_text = data["choices"][0]["message"]["content"]
             else:
-                url = (
-                    f"{GEMINI_BASE_URL}/v1beta/models/"
-                    f"{model}:generateContent"
-                )
-                headers = {"x-goog-api-key": assigned_api_key}
-                request_payload = gemini_payload
+                output_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                f"ИИ не вернул результат распознавания: {str(data)[:200]}"
+            ) from exc
+        if isinstance(output_text, list):
+            output_text = "".join(
+                item.get("text", "") for item in output_text if isinstance(item, dict)
+            )
+        output_text = str(output_text).strip()
+        if output_text.startswith("```"):
+            output_text = output_text.split("\n", 1)[1]
+            output_text = output_text.rsplit("```", 1)[0].strip()
+        parsed = json.loads(output_text)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("ИИ вернул JSON не в виде объекта")
+        return parsed
 
-            for attempt in range(GEMINI_MAX_RETRIES):
-                async with session.post(
-                    url, json=request_payload, headers=headers
-                ) as response:
-                    body = await response.text()
-                    if response.status < 400:
-                        data = json.loads(body)
+    result: Optional[dict] = None
+    failures: list[str] = []
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt_number, (model, key_index) in enumerate(attempts):
+            url, headers, request_payload = request_for(
+                model,
+                GEMINI_API_KEYS[key_index],
+            )
+            # Transient errors are retried only on the assigned pair; every
+            # fallback pair gets one attempt.
+            tries = max(1, GEMINI_MAX_RETRIES) if attempt_number == 0 else 1
+            error = "нет ответа"
+            for retry in range(tries):
+                try:
+                    async with session.post(
+                        url, json=request_payload, headers=headers
+                    ) as response:
+                        status = response.status
+                        body = await response.text()
+                    if status < 400:
+                        result = parse_model_output(json.loads(body))
                         break
+                    error = f"HTTP {status}: {body[:300]}"
                     log.warning(
-                        "Gemini %s вернул HTTP %s: %s",
+                        "ИИ %s (ключ #%s) вернул %s",
                         model,
-                        response.status,
-                        body[:300],
+                        key_index + 1,
+                        error,
                     )
-                    if response.status not in retryable_statuses:
-                        raise RuntimeError(
-                            f"Gemini {model}: HTTP {response.status}: {body[:300]}"
-                        )
-                if attempt + 1 < GEMINI_MAX_RETRIES:
-                    await asyncio.sleep(3 * (2**attempt))
-            if data is not None:
+                    if status not in retryable_statuses:
+                        break
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    log.warning(
+                        "ИИ %s (ключ #%s): %s",
+                        model,
+                        key_index + 1,
+                        error,
+                    )
+                if retry + 1 < tries:
+                    await asyncio.sleep(3 * (2**retry))
+            if result is not None:
+                if attempt_number:
+                    log.info(
+                        "Скриншот распознан резервной парой: модель %s, ключ #%s",
+                        model,
+                        key_index + 1,
+                    )
                 break
+            failures.append(f"{model} / ключ #{key_index + 1}: {error}")
 
-    if data is None:
+    if result is None:
         raise RuntimeError(
-            f"Gemini {assigned_model} недоступен или исчерпан лимит после "
-            f"{GEMINI_MAX_RETRIES} попыток."
+            "ИИ не распознал скриншот ни одной моделью и ключом. "
+            + " | ".join(failures)[:1500]
         )
-
-    try:
-        if AI_API_STYLE == "openai":
-            output_text = data["choices"][0]["message"]["content"]
-        else:
-            output_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError("ИИ не вернул результат распознавания") from exc
-
-    if isinstance(output_text, list):
-        output_text = "".join(
-            item.get("text", "") for item in output_text if isinstance(item, dict)
-        )
-    output_text = str(output_text).strip()
-    if output_text.startswith("```"):
-        output_text = output_text.split("\n", 1)[1]
-        output_text = output_text.rsplit("```", 1)[0].strip()
-    result = json.loads(output_text)
     # Apply the same clan-tag cleanup to every recognition route.  Tags such
     # as `OLD | Shkiper`, `[NOOBS] TRIXI67` and `[XAskу] apathy` identify the
     # clan/league, not any part of the player's nickname.
@@ -4429,9 +4529,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             if complete_card is not None:
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    raw_images = await asyncio.gather(
-                        *(download_image(session, url) for url in urls[:4])
-                    )
+                    raw_images = await download_card_images(session, message, urls[:4])
                 # The original scoreboard is always the source of truth. A
                 # generated card can contain not only fake 0/0/13 rows but an
                 # incorrect score such as 0:13 while the screenshot says 9:13.
@@ -4474,9 +4572,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     # and K/A/D from the original scoreboard screenshot.
                     timeout = aiohttp.ClientTimeout(total=30)
                     async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in urls[:4])
-                        )
+                        raw_images = await download_card_images(session, message, urls[:4])
                     audit = await recognize_match(
                         raw_images,
                         message_text=context,
@@ -4517,9 +4613,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     # deleted without ever clicking «Получить игроков».
                     timeout = aiohttp.ClientTimeout(total=30)
                     async with aiohttp.ClientSession(timeout=timeout) as session:
-                        raw_images = await asyncio.gather(
-                            *(download_image(session, url) for url in urls[:4])
-                        )
+                        raw_images = await download_card_images(session, message, urls[:4])
                     audit = await recognize_match(
                         raw_images,
                         message_text=context,
@@ -4546,7 +4640,10 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                         helper_message
                     )
                     if not modal_text:
-                        diagnostics = full_match_diagnostics(context)
+                        diagnostics = (
+                            players_helper_error_text(reserved_match_id)
+                            + full_match_diagnostics(context)
+                        )
                         log.error(
                             "Матч #%s: не удалось открыть/прочитать «Получить игроков». "
                             "Прочитанный счёт=%s. context=%r\n%s",
@@ -4580,9 +4677,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             else:
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    raw_images = await asyncio.gather(
-                        *(download_image(session, url) for url in urls[:4])
-                    )
+                    raw_images = await download_card_images(session, message, urls[:4])
 
                 result = await recognize_match(raw_images, context)
 
@@ -4805,19 +4900,30 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 result["match_id"],
                 message.channel.id,
             )
-        except Exception:
-            diagnostics = full_match_diagnostics(
-                context,
-                locals().get("modal_text"),
-                locals().get("result"),
-            )
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}".strip()
+            try:
+                card_diagnostics = full_match_diagnostics(
+                    context,
+                    locals().get("modal_text"),
+                    locals().get("result"),
+                )
+            except Exception:
+                card_diagnostics = "Диагностика карточки недоступна."
+            trace_tail = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)[-4:]
+            )[-1500:]
             log.exception(
                 "Ошибка обработки файла в process_upload.\n%s",
-                diagnostics,
+                card_diagnostics,
             )
             await send_processing_error_log(
                 reserved_match_id or "?", message,
-                "Необработанное исключение в process_upload.", diagnostics,
+                f"Необработанное исключение: {error_text[:400]}",
+                (
+                    f"ОШИБКА: {error_text[:1000]}\n\nГДЕ:\n{trace_tail}\n\n"
+                    f"{card_diagnostics}"
+                ).replace("```", "ʼʼʼ"),
             )
         finally:
             if not processing_completed:
