@@ -5,6 +5,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import re
 import traceback
@@ -23,7 +24,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v60-ids-only-from-source-server-2026-09-14"
+BOT_VERSION = "v61-already-registered-cleanup-and-stats-chart-2026-09-14"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -267,19 +268,34 @@ async def registration_exists(match_id: int) -> bool:
         )
 
 
-async def record_registration(match_id: int) -> bool:
-    """Reserve a match ID; return False when it was already registered."""
+async def record_registration(
+    match_id: int,
+    posted_at: Optional[datetime] = None,
+    kind: str = "registered",
+) -> bool:
+    """Save a match; return False when it is already in history.
+
+    `posted_at` is when the game card came into the channel: statistics count
+    games by that time, so a backlog registered at once does not look like
+    many games in the last minutes. kind="already" marks a match the
+    registration bot reported as entered earlier; it is not counted.
+    """
     async with stats_lock:
         records = load_registration_records()
         if any(str(item.get("match_id")) == str(match_id) for item in records):
             return False
 
-        records.append(
-            {
-                "match_id": int(match_id),
-                "registered_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        record = {
+            "match_id": int(match_id),
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if isinstance(posted_at, datetime):
+            if posted_at.tzinfo is None:
+                posted_at = posted_at.replace(tzinfo=timezone.utc)
+            record["card_posted_at"] = posted_at.astimezone(timezone.utc).isoformat()
+        if kind != "registered":
+            record["kind"] = kind
+        records.append(record)
         try:
             directory = os.path.dirname(STATS_FILE)
             if directory:
@@ -312,58 +328,263 @@ async def forget_registration(match_id: int) -> None:
         os.replace(temporary_file, STATS_FILE)
 
 
-def registration_stats_text() -> str:
-    now = datetime.now(timezone.utc)
-    parsed: list[datetime] = []
-    for item in load_registration_records():
+def registration_moment(item: dict) -> Optional[datetime]:
+    """When the game card came in; older records only know the registration."""
+    for key in ("card_posted_at", "registered_at"):
         try:
-            value = datetime.fromisoformat(str(item["registered_at"]))
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            parsed.append(value.astimezone(timezone.utc))
+            value = datetime.fromisoformat(str(item[key]))
         except (KeyError, TypeError, ValueError):
             continue
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return None
 
+
+def counted_registrations() -> list[tuple[datetime, dict]]:
+    """Games this bot registered itself, with their card time, oldest first."""
+    rows: list[tuple[datetime, dict]] = []
+    for item in load_registration_records():
+        if item.get("kind", "registered") != "registered":
+            continue
+        moment = registration_moment(item)
+        if moment is not None:
+            rows.append((moment, item))
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
+def stats_timezone_label() -> str:
+    name = str(STATS_TIMEZONE)
+    return "МСК" if name == "Europe/Moscow" else name
+
+
+def registration_stats_text(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    rows = counted_registrations()
+    moments = [moment for moment, _ in rows]
     local_now = now.astimezone(STATS_TIMEZONE)
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_start_utc = today_start.astimezone(timezone.utc)
+    yesterday_start = today_start - timedelta(days=1)
 
     def since(delta: timedelta) -> int:
-        border = now - delta
-        return sum(moment >= border for moment in parsed)
+        return sum(now - delta <= moment <= now for moment in moments)
 
-    today_count = sum(moment >= today_start_utc for moment in parsed)
-    return (
-        "📊 **Статистика регистраций**\n"
-        f"Всего: **{len(parsed)}**\n"
-        f"Сегодня: **{today_count}**\n"
-        f"За 24 часа: **{since(timedelta(hours=24))}**\n"
-        f"За 10 часов: **{since(timedelta(hours=10))}**\n"
-        f"За 1 час: **{since(timedelta(hours=1))}**\n"
-        f"За 30 минут: **{since(timedelta(minutes=30))}**"
-    )
+    today_count = sum(today_start <= moment <= now for moment in moments)
+    yesterday_count = sum(yesterday_start <= moment < today_start for moment in moments)
+    legacy = sum("card_posted_at" not in item for _, item in rows)
+    lines = [
+        "📊 **Статистика регистраций**",
+        f"Всего: **{len(moments)}**",
+        f"Сегодня: **{today_count}**",
+        f"Вчера: **{yesterday_count}**",
+        f"За 24 часа: **{since(timedelta(hours=24))}**",
+        f"За 10 часов: **{since(timedelta(hours=10))}**",
+        f"За 1 час: **{since(timedelta(hours=1))}**",
+        f"За 30 минут: **{since(timedelta(minutes=30))}**",
+        f"Время игры — когда её карточка пришла в канал ({stats_timezone_label()}), "
+        "а не когда бот её зарегистрировал.",
+    ]
+    if legacy:
+        lines.append(
+            f"У {legacy} старых записей время карточки не сохранялось — "
+            "они учтены по времени регистрации."
+        )
+    return "\n".join(lines)
 
 
 def registration_status_counts() -> dict[str, int]:
     """Return compact registration counters for the status report."""
     now = datetime.now(timezone.utc)
-    valid_times: list[datetime] = []
-    for item in load_registration_records():
-        try:
-            value = datetime.fromisoformat(str(item["registered_at"]))
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            valid_times.append(value.astimezone(timezone.utc))
-        except (KeyError, TypeError, ValueError):
-            continue
+    moments = [moment for moment, _ in counted_registrations()]
     local_now = now.astimezone(STATS_TIMEZONE)
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_start_utc = today_start.astimezone(timezone.utc)
     return {
-        "total": len(valid_times),
-        "today": sum(value >= today_start_utc for value in valid_times),
-        "hour": sum(value >= now - timedelta(hours=1) for value in valid_times),
+        "total": len(moments),
+        "today": sum(today_start <= moment <= now for moment in moments),
+        "hour": sum(now - timedelta(hours=1) <= moment <= now for moment in moments),
     }
+
+
+STATS_DAYS = 14
+STATS_HOURS = 24
+STATS_MODE_EMOJI = {"days": "📅", "hours": "🕐"}
+# Stats message ID -> shown mode, so 📅/🕐 reactions can switch its chart.
+stats_messages: dict[int, str] = {}
+
+
+def registration_buckets(
+    mode: str,
+    now: Optional[datetime] = None,
+) -> list[tuple[str, int]]:
+    """(label, games) oldest first: the last 14 local days or 24 local hours."""
+    now = now or datetime.now(timezone.utc)
+    local_now = now.astimezone(STATS_TIMEZONE)
+    moments = [
+        moment.astimezone(STATS_TIMEZONE)
+        for moment, _ in counted_registrations()
+        if moment <= now
+    ]
+    if mode == "hours":
+        current = local_now.replace(minute=0, second=0, microsecond=0)
+        starts = [current - timedelta(hours=offset) for offset in range(STATS_HOURS - 1, -1, -1)]
+        step, label_format = timedelta(hours=1), "%H:00"
+    else:
+        today = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        starts = [today - timedelta(days=offset) for offset in range(STATS_DAYS - 1, -1, -1)]
+        step, label_format = timedelta(days=1), "%d.%m"
+    return [
+        (
+            start.strftime(label_format),
+            sum(start <= moment < start + step for moment in moments),
+        )
+        for start in starts
+    ]
+
+
+def nice_tick_step(peak: int) -> int:
+    """Clean y-axis step giving at most five gridlines above zero."""
+    for step in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000):
+        if peak <= step * 5:
+            return step
+    return 1000 * math.ceil(peak / 5000)
+
+
+def render_registration_chart(buckets: list[tuple[str, int]], mode: str) -> bytes:
+    """One-series bar chart PNG on a dark surface for Discord.
+
+    Text in the image is digits only (the built-in font has no Cyrillic);
+    the title and the exact numbers go into the message text.
+    """
+    from PIL import ImageDraw, ImageFont
+
+    surface, gridline, baseline, muted, ink, bar_color = (
+        "#1a1a19", "#2c2c2a", "#383835", "#898781", "#ffffff", "#3987e5",
+    )
+    width, height = 1000, 420
+    left, right, top, bottom = 56, 24, 40, 48
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    image = Image.new("RGB", (width, height), surface)
+    draw = ImageDraw.Draw(image)
+
+    def font(size: int):
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    tick_font, value_font = font(15), font(17)
+
+    def text_size(text: str, used_font) -> tuple[int, int]:
+        box = draw.textbbox((0, 0), text, font=used_font)
+        return box[2] - box[0], box[3] - box[1]
+
+    values = [count for _, count in buckets]
+    peak = max(values, default=0)
+    step = nice_tick_step(peak)
+    top_value = max(step, math.ceil(peak / step) * step)
+    base_y = top + plot_height
+
+    def y_of(value: float) -> int:
+        return round(base_y - plot_height * value / top_value)
+
+    for tick in range(step, top_value + 1, step):
+        y = y_of(tick)
+        draw.line([(left, y), (width - right, y)], fill=gridline, width=1)
+    for tick in range(0, top_value + 1, step):
+        label = str(tick)
+        label_width, label_height = text_size(label, tick_font)
+        draw.text(
+            (left - 10 - label_width, y_of(tick) - label_height // 2 - 3),
+            label,
+            fill=muted,
+            font=tick_font,
+        )
+
+    slot = plot_width / max(1, len(buckets))
+    bar_width = int(min(24, max(6, slot * 0.55)))
+    label_every = 1 if mode == "days" else 3
+    last_index = len(buckets) - 1
+    labelled = {last_index}
+    if peak > 0:
+        labelled.add(values.index(peak))
+    for index, (label, value) in enumerate(buckets):
+        center = left + slot * index + slot / 2
+        x0 = round(center - bar_width / 2)
+        x1 = x0 + bar_width
+        if value > 0:
+            y0 = y_of(value)
+            radius = max(0, min(4, (base_y - y0) // 2))
+            draw.rounded_rectangle([x0, y0, x1, base_y], radius=radius, fill=bar_color)
+            if base_y - y0 > radius:
+                # Square at the baseline, rounded only at the data end.
+                draw.rectangle([x0, base_y - radius, x1, base_y], fill=bar_color)
+        if index in labelled:
+            text = str(value)
+            text_width, text_height = text_size(text, value_font)
+            draw.text(
+                (center - text_width / 2, y_of(value) - text_height - 10),
+                text,
+                fill=ink,
+                font=value_font,
+            )
+        if index % label_every == 0 or index == last_index:
+            label_width, _ = text_size(label, tick_font)
+            draw.text(
+                (center - label_width / 2, base_y + 12),
+                label,
+                fill=muted,
+                font=tick_font,
+            )
+    draw.line([(left, base_y), (width - right, base_y)], fill=baseline, width=1)
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def registration_stats_message(mode: str) -> tuple[str, Optional[bytes]]:
+    """Stats text with the chosen period's table, and its chart PNG."""
+    buckets = registration_buckets(mode)
+    if mode == "hours":
+        title = f"🕐 По часам — последние {STATS_HOURS} часа"
+        per_row = 6
+    else:
+        title = f"📅 По дням — последние {STATS_DAYS} дней"
+        per_row = 7
+    rows = [buckets[index:index + per_row] for index in range(0, len(buckets), per_row)]
+    table = "\n".join(
+        "  ".join(f"{label} {count:>2}" for label, count in row) for row in rows
+    )
+    text = (
+        f"{registration_stats_text()}\n\n**{title}**\n```text\n{table}\n```"
+        "Переключить график: 📅 дни · 🕐 часы"
+    )[:2000]
+    try:
+        chart = render_registration_chart(buckets, mode)
+    except Exception:
+        log.exception("Не удалось построить график статистики")
+        chart = None
+    return text, chart
+
+
+async def send_registration_stats(channel, mode: str = "days") -> None:
+    """Post stats with a chart and 📅/🕐 reactions that switch the period."""
+    text, chart = registration_stats_message(mode)
+    if chart is None:
+        await channel.send(text)
+        return
+    sent = await channel.send(
+        text,
+        file=discord.File(io.BytesIO(chart), filename=f"registrations-{mode}.png"),
+    )
+    stats_messages[int(sent.id)] = mode
+    while len(stats_messages) > 50:
+        stats_messages.pop(next(iter(stats_messages)))
+    for emoji in STATS_MODE_EMOJI.values():
+        with contextlib.suppress(Exception):
+            await sent.add_reaction(emoji)
 
 
 def format_uptime(seconds: int) -> str:
@@ -4306,6 +4527,17 @@ async def delete_confirmation_when_registered(message: discord.Message) -> None:
         log.exception("Не удалось удалить «Готово» матча #%s", match_id)
 
 
+def is_already_registered_reply(text: str) -> bool:
+    """«Не вышло — Результат этого матча уже внесён» and similar replies."""
+    return bool(
+        re.search(
+            r"уже\s+(?:был[аио]?\s+)?(?:внес[её]н|зарегистрирован|закрыт)",
+            normalize_reply_text(text),
+            re.I,
+        )
+    )
+
+
 async def send_registration_and_wait(
     channel,
     command_text: str,
@@ -4463,6 +4695,27 @@ async def send_registration_and_wait(
                 "Не удалось удалить подтверждение регистрации матча #%s",
                 match_id,
             )
+    elif is_already_registered_reply(response_text):
+        # The match was entered earlier (by hand or by another run). The
+        # reply is clutter like «Готово» and leaves together with the card.
+        try:
+            if candidate is not None and callable(getattr(candidate, "delete", None)):
+                await candidate.delete()
+            else:
+                await delete_channel_message(channel, response_id)
+            log.info(
+                "Матч #%s: удалён ответ «уже внесён» (сообщение %s)",
+                match_id,
+                response_id,
+            )
+        except discord.NotFound:
+            pass
+        except Exception:
+            log.warning(
+                "Не удалось удалить ответ «уже внесён» матча #%s",
+                match_id,
+                exc_info=True,
+            )
     return sent_registration, confirmed, response_text[:500]
 
 
@@ -4550,18 +4803,24 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
     processing_completed = False
     async with safe_typing(message.channel):
         try:
-            # A saved record prevents duplicate registration, but never proves
-            # that this particular source message is safe to delete. Source
-            # cards are removed only in the confirmed «Готово» path below.
+            # A match already in history (registered by this bot, or reported
+            # «уже внесён» by the registration bot) needs no second =g: its
+            # repeated cards are deleted without a request to the AI.
             if (
                 not test_only
                 and
                 reserved_match_id is not None
                 and await registration_exists(reserved_match_id)
             ):
-                log.info(
-                    "Матч #%s уже есть в истории; исходное сообщение сохранено.",
+                deleted_cards = await delete_duplicate_match_cards(
+                    message,
                     reserved_match_id,
+                    keep_current=not DELETE_SOURCE_AFTER_REGISTRATION,
+                )
+                log.info(
+                    "Матч #%s уже есть в истории; удалено повторных карточек: %s.",
+                    reserved_match_id,
+                    deleted_cards,
                 )
                 processing_completed = True
                 return
@@ -4950,9 +5209,15 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
 
             match_id = int(result["match_id"])
             if await registration_exists(match_id):
-                log.info(
-                    "Матч #%s уже есть в истории; исходное сообщение сохранено.",
+                deleted_cards = await delete_duplicate_match_cards(
+                    message,
                     match_id,
+                    keep_current=not DELETE_SOURCE_AFTER_REGISTRATION,
+                )
+                log.info(
+                    "Матч #%s уже есть в истории; удалено повторных карточек: %s.",
+                    match_id,
+                    deleted_cards,
                 )
                 processing_completed = True
                 return
@@ -4965,6 +5230,30 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     match_id,
                 )
             )
+            if not confirmed and is_already_registered_reply(confirmation_text):
+                log.info(
+                    "Матч #%s уже внесён регистрационным ботом; карточка удаляется.",
+                    match_id,
+                )
+                await record_registration(
+                    match_id,
+                    posted_at=getattr(message, "created_at", None),
+                    kind="already",
+                )
+                with contextlib.suppress(Exception):
+                    await sent_registration.delete()
+                deleted_cards = await delete_duplicate_match_cards(
+                    message,
+                    match_id,
+                    keep_current=not DELETE_SOURCE_AFTER_REGISTRATION,
+                )
+                await notify_log_channel(
+                    f"🗑 Матч #{match_id} уже был внесён — регистрационный бот "
+                    f"ответил «уже внесён». Карточка удалена из <#{message.channel.id}> "
+                    f"(карточек: {deleted_cards}), в статистику не засчитан."
+                )
+                processing_completed = True
+                return
             if not confirmed:
                 log.warning(
                     "Матч #%s не подтверждён; исходная карточка сохранена. Ответ: %s",
@@ -4994,7 +5283,10 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
 
             # Persist only after the external registration bot has explicitly
             # confirmed success. Nothing before this line may delete the source.
-            await record_registration(match_id)
+            await record_registration(
+                match_id,
+                posted_at=getattr(message, "created_at", None),
+            )
             await send_registration_log(result, message, command_text)
             # Discord member lookups for warnings can take a long time. Take
             # the screenshot now and send warnings in the background, so the
@@ -5211,6 +5503,53 @@ async def backfill_channels(channel_ids: set[int], before_time) -> int:
 
 
 @client.event
+async def on_raw_reaction_add(payload) -> None:
+    """📅/🕐 under a stats message switch its chart between days and hours.
+
+    A user account cannot send buttons, so reactions do their job.
+    """
+    message_id = int(getattr(payload, "message_id", 0) or 0)
+    if message_id not in stats_messages:
+        return
+    user_id = getattr(payload, "user_id", None)
+    if client.user and user_id == client.user.id:
+        return
+    emoji = str(getattr(payload, "emoji", "") or "")
+    mode = next(
+        (name for name, symbol in STATS_MODE_EMOJI.items() if symbol == emoji),
+        None,
+    )
+    if mode is None:
+        return
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        channel = await client.fetch_channel(payload.channel_id)
+    message = await channel.fetch_message(message_id)
+    with contextlib.suppress(Exception):
+        await message.remove_reaction(payload.emoji, discord.Object(id=user_id))
+    if stats_messages.get(message_id) == mode:
+        return
+    text, chart = registration_stats_message(mode)
+    try:
+        if chart is None:
+            await message.edit(content=text)
+        else:
+            await message.edit(
+                content=text,
+                attachments=[
+                    discord.File(io.BytesIO(chart), filename=f"registrations-{mode}.png")
+                ],
+            )
+        stats_messages[message_id] = mode
+    except Exception:
+        log.warning(
+            "Не удалось переключить график статистики, отправляю новый",
+            exc_info=True,
+        )
+        await send_registration_stats(channel, mode)
+
+
+@client.event
 async def on_ready() -> None:
     log.info("Селф-бот успешно авторизован: %s | версия %s", client.user, BOT_VERSION)
 
@@ -5424,8 +5763,13 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send("Формат команды: `забыть 2548`")
         return
 
-    if command in ("стата", "статистика", "stats"):
-        await message.channel.send(registration_stats_text())
+    stats_command = re.fullmatch(
+        r"(?:стата|статистика|stats)(?:\s+(дни|часы|days|hours))?",
+        command,
+    )
+    if stats_command:
+        mode = "hours" if stats_command.group(1) in ("часы", "hours") else "days"
+        await send_registration_stats(message.channel, mode)
         return
 
     if command == "енд" or command.startswith("старт"):
