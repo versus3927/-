@@ -24,7 +24,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v61-already-registered-cleanup-and-stats-chart-2026-09-14"
+BOT_VERSION = "v62-commands-list-2026-09-14"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -5502,6 +5502,29 @@ async def backfill_channels(channel_ids: set[int], before_time) -> int:
     return sum(counts)
 
 
+COMMANDS_HELP_TEXT = """📋 **Команды автореги**
+
+**Авторег**
+`старт все` — регистрировать игры из обычного и приоритетного каналов: сначала старые карточки, потом новые
+`старт обычный` — только обычный канал
+`старт приоритет` — только приоритетный канал
+`енд` — остановить авторег
+После перезапуска бота на Railway снова напишите `старт все`.
+
+**Статистика и проверка**
+`стата` — статистика и график по дням за 14 дней; реакции 📅 / 🕐 переключают дни и часы
+`стата часы` — график по часам за 24 часа
+`бот ты тут?` — проверить, что бот работает, с HTML-отчётом о настройках
+
+**Обслуживание**
+`забыть 2548` — удалить матч из памяти бота, чтобы зарегистрировать его заново
+`удалить рег соо` — удалить все сообщения «Готово — Матч #… закрыт» в каналах регистрации
+`команды` — этот список
+
+**Проверка карточки без регистрации**
+Перешлите карточку матча в любой канал вне регистрации — бот ответит готовой командой `=g`, ничего не отправляя в лигу."""
+
+
 @client.event
 async def on_raw_reaction_add(payload) -> None:
     """📅/🕐 under a stats message switch its chart between days and hours.
@@ -5595,6 +5618,10 @@ async def on_message(message: discord.Message) -> None:
 
     run_in_background(delete_confirmation_when_registered(message))
     command = message.content.strip().lower()
+
+    if command == "команды":
+        await message.channel.send(COMMANDS_HELP_TEXT)
+        return
 
     if re.fullmatch(r"бот\s*,?\s*ты\s+тут\s*\?*", command, re.I):
         configured_user = None
