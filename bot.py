@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import time
 import traceback
 import unicodedata
 from collections import Counter
@@ -24,7 +25,7 @@ from PIL import Image
 
 load_dotenv()
 
-BOT_VERSION = "v62-commands-list-2026-09-14"
+BOT_VERSION = "v65-recover-zeroed-rows-2026-09-15"
 
 # Railway environment variables
 DISCORD_USER_TOKEN = os.environ["DISCORD_USER_TOKEN"]
@@ -44,9 +45,25 @@ if _single_gemini_key:
     _key_candidates.append(_single_gemini_key)
 
 GEMINI_API_KEYS = list(dict.fromkeys(_key_candidates))
+# Reserve keys: one Railway variable, keys separated by commas, spaces or new
+# lines. They are used only after every main key has failed; at most 10.
+GEMINI_RESERVE_KEYS_LIMIT = 10
+_reserve_candidates = [
+    key
+    for key in dict.fromkeys(
+        re.split(r"[\s,;]+", os.getenv("GEMINI_RESERVE_API_KEYS", ""))
+    )
+    if key and key not in GEMINI_API_KEYS
+]
+GEMINI_RESERVE_API_KEYS = _reserve_candidates[:GEMINI_RESERVE_KEYS_LIMIT]
+GEMINI_RESERVE_KEYS_IGNORED = len(_reserve_candidates) - len(GEMINI_RESERVE_API_KEYS)
+if not GEMINI_API_KEYS and GEMINI_RESERVE_API_KEYS:
+    # Nothing to reserve for: the reserve list becomes the main one.
+    GEMINI_API_KEYS, GEMINI_RESERVE_API_KEYS = GEMINI_RESERVE_API_KEYS, []
 if not GEMINI_API_KEYS:
     raise RuntimeError(
-        "Укажите GEMINI_API_KEY_1, GEMINI_API_KEY_2 или GEMINI_API_KEY в Railway."
+        "Укажите GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY или "
+        "GEMINI_RESERVE_API_KEYS в Railway."
     )
 
 AI_API_STYLE = os.getenv("AI_API_STYLE", "gemini").strip().lower()
@@ -694,6 +711,161 @@ def next_gemini_assignment() -> tuple[str, str, int]:
     key_index = index % len(GEMINI_API_KEYS)
     api_key = GEMINI_API_KEYS[key_index]
     return model, api_key, key_index + 1
+
+
+# Main keys rotate between games; reserve keys (GEMINI_RESERVE_API_KEYS) are
+# used in their order only after every main key failed. A key that answered
+# with a spent limit or balance rests for AI_KEY_REST_MINUTES, then is retried.
+AI_KEY_REST_SECONDS = max(1.0, float(os.getenv("AI_KEY_REST_MINUTES", "30"))) * 60
+AI_MAIN_KEY_SLOTS = [
+    {"key": key, "reserve": False, "number": number, "label": f"основной ключ #{number}"}
+    for number, key in enumerate(GEMINI_API_KEYS, 1)
+]
+AI_RESERVE_KEY_SLOTS = [
+    {"key": key, "reserve": True, "number": number, "label": f"резервный ключ #{number}"}
+    for number, key in enumerate(GEMINI_RESERVE_API_KEYS, 1)
+]
+ai_key_rest_until: dict[str, float] = {}
+ai_key_state = {"on_reserve": False, "all_exhausted": False}
+
+
+def ai_key_resting(slot: dict) -> bool:
+    return ai_key_rest_until.get(slot["key"], 0.0) > time.monotonic()
+
+
+def ai_key_order(assigned_main_index: int) -> list[dict]:
+    """Keys to try for one game, best first.
+
+    Working main keys starting from the one assigned to this game, then
+    working reserve keys in their order, then resting keys: their limit may
+    have been raised in the meantime.
+    """
+    start = assigned_main_index % len(AI_MAIN_KEY_SLOTS) if AI_MAIN_KEY_SLOTS else 0
+    everything = AI_MAIN_KEY_SLOTS[start:] + AI_MAIN_KEY_SLOTS[:start] + AI_RESERVE_KEY_SLOTS
+    return (
+        [slot for slot in everything if not ai_key_resting(slot)]
+        + [slot for slot in everything if ai_key_resting(slot)]
+    )
+
+
+def is_ai_key_exhausted(status: int, body: str) -> bool:
+    """A spent limit or balance, or a rejected key — not a short overload."""
+    if status == 402:
+        return True
+    if re.search(r"per\s*minute|rate[\s_-]*limit|overload|try again", body, re.I):
+        return False
+    if status in (401, 403):
+        return True
+    return bool(
+        re.search(
+            r"insufficient|balance|quota|limit_exceeded|allowance|exhausted|billing",
+            body,
+            re.I,
+        )
+    )
+
+
+def short_ai_error(error: str) -> str:
+    found = re.search(r'"message"\s*:\s*"([^"]{1,160})', error)
+    return (found.group(1) if found else error)[:160]
+
+
+def notify_ai_keys(text: str) -> None:
+    log.warning("API-ключи ИИ: %s", text.replace("\n", " "))
+    run_in_background(notify_log_channel(text))
+
+
+def working_reserve_keys() -> int:
+    return sum(not ai_key_resting(slot) for slot in AI_RESERVE_KEY_SLOTS)
+
+
+def ai_keys_summary() -> str:
+    """Key counts and state for `бот ты тут?`; never the keys themselves."""
+    resting = sum(ai_key_resting(slot) for slot in AI_MAIN_KEY_SLOTS + AI_RESERVE_KEY_SLOTS)
+    text = f"основных {len(AI_MAIN_KEY_SLOTS)}, резервных {len(AI_RESERVE_KEY_SLOTS)}"
+    if ai_key_state["on_reserve"]:
+        text += ", сейчас работают резервные"
+    if resting:
+        text += f", отдыхают после лимита: {resting}"
+    if GEMINI_RESERVE_KEYS_IGNORED:
+        text += (
+            f", лишних резервных не используется: {GEMINI_RESERVE_KEYS_IGNORED} "
+            f"(максимум {GEMINI_RESERVE_KEYS_LIMIT})"
+        )
+    return text
+
+
+def note_ai_key_exhausted(slot: dict, error: str) -> None:
+    """Rest a spent key; a spent reserve key is reported with what is left."""
+    newly_spent = not ai_key_resting(slot)
+    ai_key_rest_until[slot["key"]] = time.monotonic() + AI_KEY_REST_SECONDS
+    log.warning("ИИ: %s не работает — %s", slot["label"], short_ai_error(error))
+    if not newly_spent or not slot["reserve"]:
+        return
+    left, total = working_reserve_keys(), len(AI_RESERVE_KEY_SLOTS)
+    text = (
+        f"⚠️ Резервный API-ключ ИИ #{slot['number']} закончился "
+        f"({short_ai_error(error)}). Рабочих резервных ключей осталось: "
+        f"**{left} из {total}**."
+    )
+    if left <= 1:
+        text += (
+            "\nРезервные ключи заканчиваются — пополните лимит или добавьте "
+            "новые ключи в `GEMINI_RESERVE_API_KEYS` в Railway."
+        )
+    notify_ai_keys(text)
+
+
+def note_ai_key_success(slot: dict) -> None:
+    """Report the switch to reserve keys and the return to the main ones."""
+    ai_key_rest_until.pop(slot["key"], None)
+    if ai_key_state["all_exhausted"]:
+        ai_key_state["all_exhausted"] = False
+        notify_ai_keys(f"✅ ИИ снова отвечает ({slot['label']}).")
+    if slot["reserve"]:
+        if (
+            not ai_key_state["on_reserve"]
+            and AI_MAIN_KEY_SLOTS
+            and all(ai_key_resting(main) for main in AI_MAIN_KEY_SLOTS)
+        ):
+            ai_key_state["on_reserve"] = True
+            notify_ai_keys(
+                "🔄 Основные API-ключи ИИ закончились — перешёл на резервные "
+                f"(сейчас резервный ключ #{slot['number']}). Рабочих резервных "
+                f"ключей: **{working_reserve_keys()} из {len(AI_RESERVE_KEY_SLOTS)}**."
+            )
+    elif ai_key_state["on_reserve"]:
+        ai_key_state["on_reserve"] = False
+        notify_ai_keys(
+            f"✅ Основной API-ключ ИИ #{slot['number']} снова работает — "
+            "вернулся с резервных ключей на основные."
+        )
+
+
+def note_ai_all_failed() -> None:
+    """Report once when every configured key is spent."""
+    slots = AI_MAIN_KEY_SLOTS + AI_RESERVE_KEY_SLOTS
+    if not slots or not all(ai_key_resting(slot) for slot in slots):
+        return
+    if ai_key_state["all_exhausted"]:
+        return
+    ai_key_state["all_exhausted"] = True
+    if AI_RESERVE_KEY_SLOTS:
+        hint = (
+            "Пополните лимит ключей или добавьте новые в `GEMINI_RESERVE_API_KEYS` "
+            "в Railway (до 10 через запятую)."
+        )
+    else:
+        hint = (
+            "Добавьте резервные ключи в `GEMINI_RESERVE_API_KEYS` в Railway "
+            "(до 10 через запятую) или пополните лимит основных."
+        )
+    notify_ai_keys(
+        "🛑 Закончились все API-ключи ИИ: основных "
+        f"{len(AI_MAIN_KEY_SLOTS)}, резервных {len(AI_RESERVE_KEY_SLOTS)}. "
+        "Игры не регистрируются, карточки остаются в каналах.\n"
+        f"{hint} После этого напишите `старт все`."
+    )
 
 
 def allowed_for_parsing(message: discord.Message) -> bool:
@@ -2977,19 +3149,16 @@ Build a registration result:
     timeout = aiohttp.ClientTimeout(total=120)
     retryable_statuses = {429, 500, 502, 503, 504}
     assigned_model, _assigned_api_key, assigned_key_number = next_gemini_assignment()
+    models = [assigned_model, *(name for name in GEMINI_MODELS if name != assigned_model)]
+    key_slots = ai_key_order(assigned_key_number - 1)
     log.info(
-        "Игра назначена модели %s и ключу #%s",
+        "Игра назначена модели %s, первый ключ: %s",
         assigned_model,
-        assigned_key_number,
+        key_slots[0]["label"] if key_slots else "нет",
     )
-    # The assigned pair goes first. When it fails (no balance, unknown model,
-    # network error, broken JSON) the game is not lost: every other configured
-    # model/key pair is tried once before giving up.
-    attempts: list[tuple[str, int]] = [(assigned_model, assigned_key_number - 1)]
-    for model_name in GEMINI_MODELS:
-        for key_index in range(len(GEMINI_API_KEYS)):
-            if (model_name, key_index) not in attempts:
-                attempts.append((model_name, key_index))
+    # Keys are tried best first (see ai_key_order), each with every model. A
+    # key that reports a spent limit or balance is not tried with the other
+    # models: they share its balance.
 
     def request_for(model: str, api_key: str) -> tuple[str, dict, dict]:
         if AI_API_STYLE == "openai":
@@ -3036,61 +3205,70 @@ Build a registration result:
         return parsed
 
     result: Optional[dict] = None
+    used_slot: Optional[dict] = None
     failures: list[str] = []
+    attempt_number = 0
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt_number, (model, key_index) in enumerate(attempts):
-            url, headers, request_payload = request_for(
-                model,
-                GEMINI_API_KEYS[key_index],
-            )
-            # Transient errors are retried only on the assigned pair; every
-            # fallback pair gets one attempt.
-            tries = max(1, GEMINI_MAX_RETRIES) if attempt_number == 0 else 1
-            error = "нет ответа"
-            for retry in range(tries):
-                try:
-                    async with session.post(
-                        url, json=request_payload, headers=headers
-                    ) as response:
-                        status = response.status
-                        body = await response.text()
-                    if status < 400:
-                        result = parse_model_output(json.loads(body))
-                        break
-                    error = f"HTTP {status}: {body[:300]}"
-                    log.warning(
-                        "ИИ %s (ключ #%s) вернул %s",
-                        model,
-                        key_index + 1,
-                        error,
-                    )
-                    if status not in retryable_statuses:
-                        break
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {str(exc)[:300]}"
-                    log.warning(
-                        "ИИ %s (ключ #%s): %s",
-                        model,
-                        key_index + 1,
-                        error,
-                    )
-                if retry + 1 < tries:
-                    await asyncio.sleep(3 * (2**retry))
+        for slot in key_slots:
+            for model in models:
+                url, headers, request_payload = request_for(model, slot["key"])
+                # Transient errors are retried only on the first attempt of
+                # the game; every other key/model pair gets one attempt.
+                tries = max(1, GEMINI_MAX_RETRIES) if attempt_number == 0 else 1
+                attempt_number += 1
+                error = "нет ответа"
+                key_spent = False
+                for retry in range(tries):
+                    try:
+                        async with session.post(
+                            url, json=request_payload, headers=headers
+                        ) as response:
+                            status = response.status
+                            body = await response.text()
+                        if status < 400:
+                            result = parse_model_output(json.loads(body))
+                            break
+                        error = f"HTTP {status}: {body[:300]}"
+                        log.warning(
+                            "ИИ %s (%s) вернул %s",
+                            model,
+                            slot["label"],
+                            error,
+                        )
+                        if is_ai_key_exhausted(status, body):
+                            key_spent = True
+                            break
+                        if status not in retryable_statuses:
+                            break
+                    except Exception as exc:
+                        error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                        log.warning(
+                            "ИИ %s (%s): %s",
+                            model,
+                            slot["label"],
+                            error,
+                        )
+                    if retry + 1 < tries:
+                        await asyncio.sleep(3 * (2**retry))
+                if result is not None:
+                    used_slot = slot
+                    break
+                failures.append(f"{model} / {slot['label']}: {error}")
+                if key_spent:
+                    note_ai_key_exhausted(slot, error)
+                    break
             if result is not None:
-                if attempt_number:
-                    log.info(
-                        "Скриншот распознан резервной парой: модель %s, ключ #%s",
-                        model,
-                        key_index + 1,
-                    )
                 break
-            failures.append(f"{model} / ключ #{key_index + 1}: {error}")
 
-    if result is None:
+    if result is None or used_slot is None:
+        note_ai_all_failed()
         raise RuntimeError(
             "ИИ не распознал скриншот ни одной моделью и ключом. "
             + " | ".join(failures)[:1500]
         )
+    note_ai_key_success(used_slot)
+    if failures:
+        log.info("Скриншот распознан: %s, %s", model, used_slot["label"])
     # Apply the same clan-tag cleanup to every recognition route.  Tags such
     # as `OLD | Shkiper`, `[NOOBS] TRIXI67` and `[XAskу] apathy` identify the
     # clan/league, not any part of the player's nickname.
@@ -3227,14 +3405,330 @@ WARNING_REASON_LABELS = {
 }
 
 
+def zeroed_result_players(result: dict) -> list[dict]:
+    """Players whose final registration row is the synthetic 0/0/13."""
+    zeroed: list[dict] = []
+    for player in [*result.get("team_a", []), *result.get("team_b", [])]:
+        try:
+            stats = tuple(
+                int(player.get(key, -1))
+                for key in ("kills", "assists", "deaths")
+            )
+        except (TypeError, ValueError):
+            continue
+        if stats == (0, 0, 13):
+            zeroed.append(player)
+    return zeroed
+
+
+# A dense ten-row scoreboard is sometimes read one row short: the last row of
+# a side is the usual victim, and the card player behind it is then sent as
+# 0/0/13 with a warning. The statistics printed on the screenshot belong to
+# that player, so before the =g command is sent every 0/0/13 row is searched
+# again with a focused read of the same screenshot.
+RECOVERY_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "players": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "card_nickname": {"type": "string"},
+                    "found": {"type": "boolean"},
+                    "side": {
+                        "type": ["string", "null"],
+                        "enum": ["CT", "T", None],
+                    },
+                    "nickname": {"type": ["string", "null"]},
+                    "kills": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "maximum": 100,
+                    },
+                    "assists": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "maximum": 100,
+                    },
+                    "deaths": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "maximum": 100,
+                    },
+                },
+                "required": [
+                    "card_nickname",
+                    "found",
+                    "side",
+                    "nickname",
+                    "kills",
+                    "assists",
+                    "deaths",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["players", "notes"],
+    "additionalProperties": False,
+}
+
+RECOVERY_PROMPT = """You received this STANDOFF 2 final result scoreboard before, but the rows of the card players listed below were not found or came back empty. They are about to be registered with 0 kills, 0 assists and 13 deaths.
+Read the attached scoreboard ONE MORE TIME and find the row of every nickname below.
+The table shows one row per player, up to five rows on each side of the scoreboard. Go through BOTH sides row by row, from top to bottom, and check the LAST row of each side explicitly: exactly that row is missed most often. Do not report a row as absent while any row of that side is still unattributed.
+Russian columns У, П, С mean kills, assists, deaths. On the attack side a money column may stand before У/П/С: ignore money, and ignore score/points and ping after deaths. Copy only the digits printed next to the nickname.
+A row may show a clan/league tag before the nickname, such as `[GT] Taule`, `GT | Taule`, `OLD | Taule` or `🔴 GT — Taule`. Such a row belongs to the player whose nickname matches apart from that tag.
+The scoreboard nickname may also be longer than the card nickname (`McL` on the card versus `[xtng] McL Bo$$` on the board): accept the row when the card nickname is contained in the visible nickname.
+For every requested player return: card_nickname exactly as listed below; found=true with side CT or T, the visible nickname and its exact kills, assists and deaths; or found=false when no row of the whole table belongs to that nickname.
+Never return a 0/0/13 or 0/0/0 placeholder and never invent, copy or increment numbers: read the pixels of that exact row. If a digit of a found row is unreadable, return found=false and explain in notes.
+Return only valid JSON.
+
+Players to find:
+"""
+
+
+def parse_ai_json_answer(data: object) -> Optional[dict]:
+    """Read the JSON object out of an OpenAI- or Gemini-style answer."""
+    if AI_API_STYLE == "openai":
+        try:
+            output_text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    else:
+        try:
+            output_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    if isinstance(output_text, list):
+        output_text = "".join(
+            item.get("text", "") for item in output_text if isinstance(item, dict)
+        )
+    if not isinstance(output_text, str) or not output_text.strip():
+        return None
+    text = output_text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def request_ai_json(
+    prompt: str,
+    images: list[bytes],
+    schema: dict,
+) -> Optional[dict]:
+    """One JSON answer from the same model/key pool used for recognition."""
+    parts: list[dict] = [{"text": prompt}]
+    for raw in images[:4]:
+        image_b64, mime = prepare_image(raw)
+        parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
+    content: list[dict] = [
+        {
+            "type": "text",
+            "text": prompt
+            + "\nReturn ONLY valid JSON matching this schema:\n"
+            + json.dumps(schema, ensure_ascii=False),
+        }
+    ]
+    for image_part in parts[1:]:
+        inline = image_part["inline_data"]
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{inline['mime_type']};base64,{inline['data']}"
+                },
+            }
+        )
+
+    def request_for(model: str, api_key: str) -> tuple[str, dict, dict]:
+        if AI_API_STYLE == "openai":
+            return (
+                f"{GEMINI_BASE_URL}/chat/completions",
+                {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": content}],
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        return (
+            f"{GEMINI_BASE_URL}/v1beta/models/{model}:generateContent",
+            {"x-goog-api-key": api_key},
+            {
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": schema,
+                },
+            },
+        )
+
+    timeout = aiohttp.ClientTimeout(total=90)
+    assigned_model, _assigned_key, assigned_key_number = next_gemini_assignment()
+    models = [
+        assigned_model,
+        *(name for name in GEMINI_MODELS if name != assigned_model),
+    ]
+    key_slots = ai_key_order(assigned_key_number - 1)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for slot in key_slots:
+            for model in models:
+                url, headers, payload = request_for(model, slot["key"])
+                try:
+                    async with session.post(
+                        url, json=payload, headers=headers
+                    ) as response:
+                        status = response.status
+                        body = await response.text()
+                    if status >= 400:
+                        log.warning(
+                            "Повторное чтение строк 0/0/13: ИИ %s (%s) вернул "
+                            "HTTP %s: %s",
+                            model,
+                            slot["label"],
+                            status,
+                            body[:200],
+                        )
+                        if is_ai_key_exhausted(status, body):
+                            note_ai_key_exhausted(
+                                slot, f"HTTP {status}: {body[:300]}"
+                            )
+                            break
+                        continue
+                    parsed = parse_ai_json_answer(json.loads(body))
+                    if parsed is not None:
+                        note_ai_key_success(slot)
+                        return parsed
+                    log.warning(
+                        "Повторное чтение строк 0/0/13: ИИ %s (%s) вернул "
+                        "ответ без JSON",
+                        model,
+                        slot["label"],
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Повторное чтение строк 0/0/13: ИИ %s (%s) — %s: %s",
+                        model,
+                        slot["label"],
+                        type(exc).__name__,
+                        str(exc)[:200],
+                    )
+    return None
+
+
+async def recover_zeroed_rows(
+    images: list[bytes],
+    players: list[dict],
+) -> dict[str, tuple[int, int, int]]:
+    """Second focused read of the scoreboard for the players sent as 0/0/13."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for player in players:
+        nickname = str(
+            player.get("card_nickname") or player.get("nickname") or ""
+        ).strip()
+        normalized = normalize_nickname(nickname)
+        if not nickname or not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(nickname)
+    if not images or not names:
+        return {}
+    prompt = RECOVERY_PROMPT + "\n".join(f"- {name}" for name in names)
+    try:
+        answer = await request_ai_json(prompt, images, RECOVERY_ROW_SCHEMA)
+    except Exception:
+        log.exception("Повторное чтение строк 0/0/13 не удалось")
+        return {}
+    if not isinstance(answer, dict):
+        return {}
+    rows: dict[str, tuple[int, int, int]] = {}
+    for row in answer.get("players", []) or []:
+        if not isinstance(row, dict) or not row.get("found"):
+            continue
+        try:
+            stats = (
+                int(row["kills"]),
+                int(row["assists"]),
+                int(row["deaths"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if any(value < 0 or value > 100 for value in stats):
+            continue
+        # A placeholder row is not evidence: the real row was never read.
+        if stats in {(0, 0, 0), (0, 0, 13)}:
+            continue
+        nickname = str(row.get("card_nickname") or "").strip()
+        if not nickname:
+            continue
+        board_nickname = str(row.get("nickname") or "").strip()
+        if board_nickname and not nicknames_match(nickname, board_nickname):
+            log.warning(
+                "Повторное чтение 0/0/13: ник карточки %r и ник на табло %r "
+                "не совпали — строка не восстановлена.",
+                nickname,
+                board_nickname,
+            )
+            continue
+        rows[normalize_nickname(nickname)] = stats
+    return rows
+
+
+def apply_recovered_rows(
+    result: dict,
+    rows: dict[str, tuple[int, int, int]],
+) -> list[str]:
+    """Give the screenshot statistics back to players who were zeroed."""
+    recovered: list[str] = []
+    if not rows:
+        return recovered
+    for player in [*result.get("team_a", []), *result.get("team_b", [])]:
+        try:
+            current = tuple(
+                int(player.get(key, -1))
+                for key in ("kills", "assists", "deaths")
+            )
+        except (TypeError, ValueError):
+            continue
+        if current != (0, 0, 13):
+            continue
+        nickname = str(player.get("nickname") or "").strip()
+        card_nickname = str(player.get("card_nickname") or "").strip()
+        stats = rows.get(normalize_nickname(card_nickname or nickname))
+        if stats is None:
+            continue
+        if nickname and not player.get("card_nickname"):
+            player["card_nickname"] = nickname
+        player["kills"], player["assists"], player["deaths"] = stats
+        player.pop("warning_reason", None)
+        recovered.append(
+            f"#{player.get('id')} {card_nickname or nickname} → "
+            f"{stats[0]}/{stats[1]}/{stats[2]}"
+        )
+    return recovered
+
+
 def mark_zero_stat_warning_reasons(result: dict) -> int:
     """Apply warning rules without confusing a nickname miss with stat dodge.
 
-    An already detected nickname reason is authoritative. A matched scoreboard
-    row is a statistics reset when it has fewer than four kills. A bare
-    synthetic 0/0/13 means that the player disappeared from the final table,
-    so it is also a statistics reset. Nickname mismatch is used only when an
-    unmatched visible row proves that the player played under another nick.
+    An already detected nickname reason is authoritative. Only a row that is
+    really registered as 0/0/13 is a statistics reset: the player disappeared
+    from the final table, or his visible row came back empty. A low kill count
+    is not a reset — a scoreboard row such as 3/4/17 is a played match and must
+    never produce a warning. Nickname mismatch is used only when an unmatched
+    visible row proves that the player played under another nick.
     """
     marked = 0
     for player in [*result.get("team_a", []), *result.get("team_b", [])]:
@@ -3248,9 +3742,6 @@ def mark_zero_stat_warning_reasons(result: dict) -> int:
         if player.get("warning_reason"):
             continue
         if (kills, assists, deaths) == (0, 0, 13):
-            player["warning_reason"] = "додж статистики"
-            marked += 1
-        elif 0 <= kills < 4:
             player["warning_reason"] = "додж статистики"
             marked += 1
     return marked
@@ -3422,7 +3913,9 @@ def player_identity_names(player: dict) -> list[str]:
     """Registration (card) nickname first, screenshot nickname second."""
     names: list[str] = []
     for key in ("card_nickname", "nickname"):
-        value = str(player.get(key) or "").strip()
+        # Cards escape markdown in names (`Toma\_KFC`); Discord member search
+        # and the warning text need the real nickname.
+        value = re.sub(r"\\([\\`*_~|>])", r"\1", str(player.get(key) or "")).strip()
         if value and value not in names:
             names.append(value)
     return names
@@ -3580,12 +4073,13 @@ async def query_warning_members(
     """Ask Discord for uncached members so a plain nickname can be tagged."""
     registration_id = int(player.get("id") or 0)
     values: list[str] = []
+    if registration_id > 0:
+        # League nicknames start with the registration number: `#124 | Nick`.
+        # It is the most exact query, so it goes first.
+        values.extend((f"#{registration_id}", str(registration_id)))
     for name in player_identity_names(player):
         nickname = strip_leading_clan_tags(name).strip()
         values.extend((nickname, re.sub(r"^\d+|\d+$", "", nickname)))
-    if registration_id > 0:
-        # League nicknames start with the registration number: `#124 | Nick`.
-        values.extend((f"#{registration_id}", str(registration_id)))
     queries: list[str] = []
     for value in values:
         value = value.strip()
@@ -3593,15 +4087,7 @@ async def query_warning_members(
             queries.append(value)
 
     found: dict[int, object] = {}
-    guilds: list[object] = []
-    for guild in (
-        getattr(source_message, "guild", None),
-        getattr(warning_channel, "guild", None),
-    ):
-        if guild is not None and guild not in guilds:
-            guilds.append(guild)
-
-    for guild in guilds:
+    for guild in warning_guilds(source_message, warning_channel):
         query_members = getattr(guild, "query_members", None)
         if not callable(query_members):
             continue
@@ -3654,6 +4140,24 @@ async def warning_member(
     return None
 
 
+def warning_guilds(source_message: discord.Message, warning_channel) -> list[object]:
+    """The card's league server and the warnings server — never other servers.
+
+    Other shared servers have their own members with the same nicknames
+    (`saiko`, `ender`) or `#number` names: that made the match ambiguous and
+    left the warning untagged, or tagged a stranger.
+    """
+    guilds: list[object] = []
+    for guild_id in source_guild_ids(source_message):
+        guild = guild_by_id(guild_id, source_message)
+        if guild is not None and guild not in guilds:
+            guilds.append(guild)
+    warning_guild = getattr(warning_channel, "guild", None)
+    if warning_guild is not None and warning_guild not in guilds:
+        guilds.append(warning_guild)
+    return guilds
+
+
 def warning_identity_candidates(
     source_message: discord.Message,
     warning_channel,
@@ -3664,17 +4168,7 @@ def warning_identity_candidates(
         user_id = getattr(user, "id", None)
         if isinstance(user_id, int):
             candidates[user_id] = user
-
-    guilds: list[object] = []
-    for guild in (
-        getattr(source_message, "guild", None),
-        getattr(warning_channel, "guild", None),
-        *(getattr(client, "guilds", None) or []),
-    ):
-        if guild is not None and guild not in guilds:
-            guilds.append(guild)
-
-    for guild in guilds:
+    for guild in warning_guilds(source_message, warning_channel):
         for member in getattr(guild, "members", None) or []:
             member_id = getattr(member, "id", None)
             if isinstance(member_id, int):
@@ -3717,6 +4211,35 @@ async def resolve_warning_identity(
 
     registration_id = int(player.get("id") or 0)
 
+    def owners_of_registration_id(pool: list[object]) -> dict[int, object]:
+        """Members whose server name carries this player's `#ID`."""
+        owners: dict[int, object] = {}
+        for member in pool:
+            member_id = getattr(member, "id", None)
+            if not isinstance(member_id, int):
+                continue
+            for name in (
+                getattr(member, "display_name", None),
+                getattr(member, "nick", None),
+            ):
+                if name and registration_id_from_display_name(str(name)) == registration_id:
+                    owners[member_id] = member
+        return owners
+
+    fetched: Optional[list[object]] = None
+    owners: dict[int, object] = {}
+    if registration_id > 0:
+        owners = owners_of_registration_id(candidates)
+        if not owners:
+            fetched = await query_warning_members(
+                source_message,
+                warning_channel,
+                player,
+            )
+            owners = owners_of_registration_id([*candidates, *fetched])
+        if len(owners) == 1:
+            return next(iter(owners.items()))
+
     def rank(pool: list[object], nickname: str) -> list[tuple[float, int, object]]:
         ranked: list[tuple[float, int, object]] = []
         seen: set[int] = set()
@@ -3735,18 +4258,20 @@ async def resolve_warning_identity(
                 (nickname_similarity(nickname, name) for name in names),
                 default=0.0,
             )
-            if registration_id > 0 and any(
-                re.search(rf"(?:^|\D){registration_id}(?:\D|$)", name)
-                for name in names
-                if name
-            ):
-                score = max(score, 1.0)
             ranked.append((score, member_id, member))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return ranked
 
-    fetched: Optional[list[object]] = None
     for nickname in player_identity_names(player) or [""]:
+        if len(owners) > 1:
+            # Several members show this `#ID` (a stale nickname): the card
+            # nickname decides between them only.
+            ranked = rank(list(owners.values()), nickname)
+            if ranked and ranked[0][0] >= 0.90 and (
+                len(ranked) == 1 or ranked[1][0] < ranked[0][0] - 0.04
+            ):
+                return ranked[0][1], ranked[0][2]
+            continue
         ranked = rank(candidates, nickname)
         if not ranked or ranked[0][0] < 0.90:
             # Large servers do not always cache every member. Query Discord
@@ -4844,6 +5369,7 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 BOT_VERSION,
             )
             modal_text: Optional[str] = None
+            raw_images: list[bytes] = []
 
             async def discard_live_tab_card(audit: dict) -> bool:
                 """Reject a live TAB card: log it, copy it to logs, delete it."""
@@ -5191,6 +5717,36 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 )
                 return
 
+            # The screenshot stays the source of truth: a card player who is
+            # printed on the final scoreboard must never be registered as
+            # 0/0/13. Every row that is still zeroed is read one more time.
+            zeroed_players = zeroed_result_players(result)
+            if zeroed_players and raw_images:
+                recovered_rows = await recover_zeroed_rows(
+                    raw_images,
+                    zeroed_players,
+                )
+                recovered_now = apply_recovered_rows(result, recovered_rows)
+                if recovered_now:
+                    result["notes"] = (
+                        str(result.get("notes", ""))
+                        + " Повторное чтение табло вернуло строки 0/0/13: "
+                        + "; ".join(recovered_now) + "."
+                    ).strip()
+                    log.info(
+                        "Матч #%s: статистика восстановлена со скриншота — %s",
+                        result.get("match_id"),
+                        "; ".join(recovered_now),
+                    )
+                else:
+                    log.warning(
+                        "Матч #%s: строки #%s остались 0/0/13 — на табло их "
+                        "нет или повторное чтение не нашло их.",
+                        result.get("match_id"),
+                        ", #".join(
+                            str(player.get("id")) for player in zeroed_players
+                        ),
+                    )
             newly_marked_warnings = mark_zero_stat_warning_reasons(result)
             if newly_marked_warnings:
                 log.info(
@@ -5575,6 +6131,12 @@ async def on_raw_reaction_add(payload) -> None:
 @client.event
 async def on_ready() -> None:
     log.info("Селф-бот успешно авторизован: %s | версия %s", client.user, BOT_VERSION)
+    if GEMINI_RESERVE_KEYS_IGNORED:
+        log.warning(
+            "В GEMINI_RESERVE_API_KEYS больше %s ключей — лишние %s не используются.",
+            GEMINI_RESERVE_KEYS_LIMIT,
+            GEMINI_RESERVE_KEYS_IGNORED,
+        )
 
 
 @client.event
@@ -5692,7 +6254,7 @@ async def on_message(message: discord.Message) -> None:
             "pro_exemptions": len(PRO_LEAGUE_USER_IDS),
             "api_style": AI_API_STYLE,
             "models": ", ".join(GEMINI_MODELS),
-            "key_count": len(GEMINI_API_KEYS),
+            "key_count": ai_keys_summary(),
             "concurrency": PROCESS_CONCURRENCY,
             "confidence": f"{MIN_CONFIDENCE:.2f}",
             "channels": channel_names,
@@ -5712,7 +6274,7 @@ async def on_message(message: discord.Message) -> None:
             f"MY_ACCOUNT_ID: `{MY_ACCOUNT_ID or 'не указан'}` → **{configured_name}**\n"
             f"Авторег: **{active_text}** · обрабатывается игр: **{len(processing_match_ids)}**\n"
             f"Регистраций: всего **{counts['total']}**, сегодня **{counts['today']}**\n"
-            f"Моделей: **{len(GEMINI_MODELS)}** · API-ключей: **{len(GEMINI_API_KEYS)}**\n"
+            f"Моделей: **{len(GEMINI_MODELS)}** · API-ключи: {ai_keys_summary()}\n"
             f"Автоварны: **{'включены' if WARN_CHANNEL_ID else 'не настроены'}** · "
             f"Pro League ID: **{len(PRO_LEAGUE_USER_IDS)}**\n"
             "Команды доступны **всем пользователям**. Подробный HTML-отчёт прикреплён.",
