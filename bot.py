@@ -2490,7 +2490,7 @@ def result_from_card_and_visual_audit(
         side_a = str(audit.get("side_right") or "").upper()
 
     if (
-        chosen_count < 2
+        chosen_count < 4
         or min(alignment_a[1], alignment_b[1]) < 1
         or min(alignment_a[3], alignment_b[3]) < 0.72
         or (
@@ -5667,6 +5667,46 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     result = result_from_card_and_visual_audit(context, audit)
                     if result is None:
                         result = await try_players_helper_fallback(audit)
+                    if result is None and card_rosters is not None:
+                        # Fallback: card already has all 10 IDs and stats.
+                        # The visual audit failed (e.g. AI didn't recognize
+                        # final result, or too few players visible on tab).
+                        # Use the card data directly with card K/A/D values.
+                        # This handles cases where 1-2 players are cut off
+                        # on the scoreboard screenshot.
+                        ct_team = explicit_ct_team_from_card(context)
+                        card_slots = parse_card_roster_slots(context)
+                        if (
+                            ct_team in ("A", "B")
+                            and card_slots is not None
+                            and len(card_slots.get("team_a", [])) == 5
+                            and len(card_slots.get("team_b", [])) == 5
+                            and reserved_match_id is not None
+                        ):
+                            # Check that card has real stats (not all 0/0/13)
+                            all_players = card_slots["team_a"] + card_slots["team_b"]
+                            has_real_stats = any(
+                                (int(p.get("kills", 0)), int(p.get("assists", 0)), int(p.get("deaths", 0))) != (0, 0, 13)
+                                for p in all_players
+                            )
+                            if has_real_stats:
+                                log.info(
+                                    "Матч #%s: визуальная проверка не прошла, но карточка "
+                                    "содержит полный состав 10 игроков с K/A/D — "
+                                    "регистрирую по данным карточки.",
+                                    reserved_match_id,
+                                )
+                                result = {
+                                    "is_match_result": True,
+                                    "match_id": reserved_match_id,
+                                    "score_a": score_hint[0] if score_hint else int(audit.get("score_left", 0) or 0),
+                                    "score_b": score_hint[1] if score_hint else int(audit.get("score_right", 0) or 0),
+                                    "ct_team": ct_team,
+                                    "team_a": card_slots["team_a"],
+                                    "team_b": card_slots["team_b"],
+                                    "overall_confidence": 0.95,
+                                    "notes": "Визуальная проверка не прошла; данные взяты из карточки Discord.",
+                                }
                     if result is None:
                         diagnostics = (
                             full_match_diagnostics(context)
@@ -5770,9 +5810,8 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 *result.get("team_b", []),
             ]
             returned_ids = [player.get("id") for player in returned_players]
-            # If the card has 10 IDs, we trust the card roster and allow missing players
-            if len(expected_ids) == 10:
-                if not set(returned_ids).issubset(set(expected_ids)):
+            if len(expected_ids) == 10 and len(returned_ids) == 10:
+                if set(returned_ids) != set(expected_ids):
                     diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                     log.error(
                         "Матч #%s пропущен: ID модели %s не совпали с карточкой %s\n%s",
