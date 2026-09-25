@@ -2416,13 +2416,7 @@ def result_from_card_and_visual_audit(
     except (KeyError, TypeError, ValueError):
         return None
 
-    normal_final_screen = (
-        audit.get("is_scoreboard")
-        and audit.get("is_final_result")
-        and not audit.get("has_live_gameplay_hud")
-    )
-    full_live_tab = allow_full_live_tab(audit)
-    if not (normal_final_screen or full_live_tab):
+    if not audit.get("is_scoreboard") or not audit.get("is_final_result"):
         return None
     if (
         confidence < 0.90
@@ -2652,8 +2646,6 @@ def result_from_card_and_visual_audit(
         "из исходного скриншота. Отсутствующий на табло игрок получает "
         "0/0/13. «Получить игроков» не использовалось."
     )
-    if full_live_tab:
-        notes += " Открытый TAB принят только потому, что на скриншоте видны все 10 игроков."
     return {
         "is_match_result": True,
         "match_id": int(match.group(1)),
@@ -3233,8 +3225,8 @@ async def recognize_match(
 
     if visual_audit:
         prompt = """Strictly transcribe the attached STANDOFF 2 scoreboard from the pixels.
-This bot accepts ONLY the final post-match results screen. Set is_final_result=true only when the match has ended and the image is the dedicated final statistics/result screen. An opened TAB scoreboard during live gameplay is NOT a final result, even if it temporarily shows `ПОБЕДА`, a 13 score, or full player statistics.
-Set has_live_gameplay_hud=true when active-match elements are visible around/through the table, including a weapon or hands, health/armor/ammo HUD, crosshair, live kill feed, pause icon, spectator controls, minimap/radar, or an in-game TAB overlay. If any such live elements are present, set is_final_result=false and is_scoreboard=false. Never register that image.
+This bot accepts both the final post-match results screen AND an opened TAB scoreboard during live gameplay. Set is_final_result=true and is_scoreboard=true for both cases.
+Set has_live_gameplay_hud=true when active-match elements are visible around/through the table (weapons, hands, crosshair, etc.). Even if live elements are present, YOU MUST FULLY TRANSCRIBE the scoreboard and set is_final_result=true.
 Copy the two large score numbers in visible LEFT-to-RIGHT order. Never add the current or next round: if the image displays 8 and 13, return 8 and 13, never 8 and 14.
 If the result says `СДАЛИСЬ`/surrendered, set is_surrender=true. Set winner_side to the side that DID NOT surrender. The `СДАЛИСЬ` label belongs to the side that surrendered, so the opposite side is the winner. For a normal completed game set is_surrender=false and winner_side=null. Keep score_left/score_right as the raw numbers visibly printed; the program will convert the winner to 13.
 Return side_left and side_right as CT or T. Transcribe every VISIBLE player per side, top to bottom. A side can contain from one to five visible rows when players are absent; never invent missing rows. The match may be accepted when at least four card players are reliably matched in total.
@@ -5546,15 +5538,8 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             raw_images: list[bytes] = []
 
             async def discard_live_tab_card(audit: dict) -> bool:
-                """Reject a live TAB card unless all ten rows are visible."""
-                if not audit.get("has_live_gameplay_hud"):
-                    return False
-                if allow_full_live_tab(audit):
-                    log.info(
-                        "Матч #%s: открыт TAB, но на скриншоте видны все 10 игроков — обработка разрешена.",
-                        reserved_match_id or "?",
-                    )
-                    return False
+                """Live TABs are now accepted just like normal final screens."""
+                return False
                 log.info(
                     "Матч #%s определён как открытый TAB, а не финальный экран.",
                     reserved_match_id or "?",
