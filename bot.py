@@ -4005,6 +4005,22 @@ async def send_processing_error_log(
     """Send processing errors, score and all player stats to the Discord log channel."""
     if not LOG_CHANNEL_ID:
         return
+    # Suppress the error if this match was already successfully registered
+    # via a different code path (e.g. card_rosters path succeeded while the
+    # button path failed for a duplicate/forwarded card of the same match).
+    if match_id != "?":
+        try:
+            already_done = await registration_exists(int(match_id))
+        except Exception:
+            already_done = False
+        if already_done:
+            log.info(
+                "Матч #%s: ошибка кнопки/вспомогательного пути подавлена — "
+                "матч уже успешно зарегистрирован другим путём. Причина: %s",
+                match_id,
+                reason[:200],
+            )
+            return
     try:
         log_channel = client.get_channel(LOG_CHANNEL_ID)
         if log_channel is None:
