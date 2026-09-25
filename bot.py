@@ -2490,7 +2490,7 @@ def result_from_card_and_visual_audit(
         side_a = str(audit.get("side_right") or "").upper()
 
     if (
-        chosen_count < 4
+        chosen_count < 2
         or min(alignment_a[1], alignment_b[1]) < 1
         or min(alignment_a[3], alignment_b[3]) < 0.72
         or (
@@ -4005,22 +4005,6 @@ async def send_processing_error_log(
     """Send processing errors, score and all player stats to the Discord log channel."""
     if not LOG_CHANNEL_ID:
         return
-    # Suppress the error if this match was already successfully registered
-    # via a different code path (e.g. card_rosters path succeeded while the
-    # button path failed for a duplicate/forwarded card of the same match).
-    if match_id != "?":
-        try:
-            already_done = await registration_exists(int(match_id))
-        except Exception:
-            already_done = False
-        if already_done:
-            log.info(
-                "Матч #%s: ошибка кнопки/вспомогательного пути подавлена — "
-                "матч уже успешно зарегистрирован другим путём. Причина: %s",
-                match_id,
-                reason[:200],
-            )
-            return
     try:
         log_channel = client.get_channel(LOG_CHANNEL_ID)
         if log_channel is None:
@@ -5786,8 +5770,9 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                 *result.get("team_b", []),
             ]
             returned_ids = [player.get("id") for player in returned_players]
-            if len(expected_ids) == 10 and len(returned_ids) == 10:
-                if set(returned_ids) != set(expected_ids):
+            # If the card has 10 IDs, we trust the card roster and allow missing players
+            if len(expected_ids) == 10:
+                if not set(returned_ids).issubset(set(expected_ids)):
                     diagnostics = full_match_diagnostics(context, modal_text if review_card else None, result)
                     log.error(
                         "Матч #%s пропущен: ID модели %s не совпали с карточкой %s\n%s",
