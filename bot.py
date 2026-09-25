@@ -814,11 +814,129 @@ def ai_keys_summary() -> str:
 
 
 async def check_ai_key_status() -> list[dict]:
-    """Query AI STAR / OpenAI-compatible API for each key's balance and quota."""
+    """Query AI STAR / OpenAI-compatible API for each key's token balance."""
     results: list[dict] = []
     all_slots = AI_MAIN_KEY_SLOTS + AI_RESERVE_KEY_SLOTS
     if not all_slots:
         return results
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for slot in all_slots:
+            key = slot["key"]
+            masked = key[:8] + "..." + key[-4:] if len(key) > 16 else key[:4] + "..."
+            info: dict = {
+                "label": slot["label"],
+                "masked_key": masked,
+                "reserve": slot["reserve"],
+                "resting": ai_key_resting(slot),
+                "status": "unknown",
+                "limit": None,
+                "used": None,
+                "remaining": None,
+                "details": "",
+            }
+
+            rest_until = ai_key_rest_until.get(key, 0.0)
+            if rest_until > time.monotonic():
+                remaining_rest = int(rest_until - time.monotonic())
+                info["rest_minutes"] = remaining_rest // 60
+                info["rest_seconds"] = remaining_rest % 60
+
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            }
+
+            base_v1 = GEMINI_BASE_URL.rstrip("/")
+            if not base_v1.endswith("/v1"):
+                base_v1 += "/v1"
+            base_root = base_v1[:-3] if base_v1.endswith("/v1") else base_v1
+
+            balance_found = False
+            # Enhanced endpoint list for common OpenAI proxies
+            endpoints = [
+                base_root + "/api/user/info",
+                base_root + "/api/v1/user/info",
+                base_v1 + "/key",
+                base_v1 + "/dashboard/billing/subscription",
+                base_v1 + "/dashboard/billing/usage",
+                base_v1 + "/balance",
+                base_v1 + "/me",
+            ]
+            
+            for url in endpoints:
+                try:
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            d = data.get("data") if isinstance(data.get("data"), dict) else data
+                            
+                            # Quota in some systems is represented as a large integer (total tokens)
+                            # In One API, 1 unit = 0.002$ or similar, but often mapped to tokens
+                            rem = d.get("remaining_tokens") or d.get("limit_remaining") or d.get("balance") or d.get("remaining") or d.get("left") or d.get("quota")
+                            lim = d.get("total_tokens") or d.get("limit") or d.get("total") or d.get("hard_limit_usd")
+                            usd = d.get("used_tokens") or d.get("usage") or d.get("used")
+                            
+                            if rem is not None:
+                                info["remaining"] = rem
+                                info["limit"] = lim
+                                info["used"] = usd
+                                info["status"] = "active"
+                                balance_found = True
+                                break
+                        elif resp.status in (401, 403):
+                            info["status"] = "invalid_key"
+                            info["details"] = "Ключ не принят API"
+                            break
+                except Exception:
+                    continue
+
+            if not balance_found and info["status"] not in ("invalid_key", "forbidden"):
+                try:
+                    test_url = base_v1 + "/chat/completions"
+                    test_payload = {
+                        "model": GEMINI_MODELS[0] if GEMINI_MODELS else "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                    }
+                    async with session.post(test_url, json=test_payload, headers=headers) as resp:
+                        status_code = resp.status
+                        body = await resp.text()
+                        if status_code == 200:
+                            info["status"] = "active"
+                            info["details"] = "Ключ работает (баланс через API недоступен)"
+                            for h in ["x-ratelimit-remaining-tokens", "x-ratelimit-remaining", "x-ratelimit-limit-tokens"]:
+                                val = resp.headers.get(h)
+                                if val:
+                                    if "remaining" in h:
+                                        info["remaining"] = val
+                                    else:
+                                        info["limit"] = val
+                        elif status_code in (401, 403):
+                            info["status"] = "invalid_key"
+                            info["details"] = "Ключ не принят API"
+                        elif status_code == 402:
+                            info["status"] = "exhausted"
+                            info["details"] = "Баланс исчерпан"
+                            info["remaining"] = 0
+                        elif status_code == 429:
+                            info["status"] = "rate_limited"
+                            info["details"] = "Превышен лимит запросов (ключ рабочий)"
+                        else:
+                            if is_ai_key_exhausted(status_code, body):
+                                info["status"] = "exhausted"
+                                info["details"] = short_ai_error(body)
+                                info["remaining"] = 0
+                            else:
+                                info["status"] = "error"
+                                info["details"] = f"HTTP {status_code}"
+                except Exception as exc:
+                    info["status"] = "error"
+                    info["details"] = str(exc)[:100]
+
+            results.append(info)
+    return results
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -941,7 +1059,7 @@ def format_ai_status_message(results: list[dict]) -> str:
         line += f" — {status_text.get(info['status'], info['status'])}"
         parts: list[str] = []
         if info.get("remaining") is not None:
-            parts.append(f"осталось: **{info['remaining']}**")
+            parts.append(f"осталось: **{info['remaining']} токенов**")
         if info.get("used") is not None:
             parts.append(f"использовано: **{info['used']}**")
         if info.get("limit") is not None:
