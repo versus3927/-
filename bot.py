@@ -118,6 +118,11 @@ def normalize_nickname(value: object) -> str:
         text,
         flags=re.I,
     )
+    # One player is known on the league as the unique nickname `!`, while the
+    # scoreboard may render it as a short variant like `!m`. Treat `!` and
+    # `!<one letter/digit>` as the same canonical nickname.
+    if re.fullmatch(r"\s*![A-Za-zА-Яа-яЁё0-9]?\s*", text):
+        return "bangnick"
     text = unicodedata.normalize("NFKD", text).casefold()
     text = text.translate(_CYRILLIC_TO_LATIN)
     return "".join(character for character in text if character.isalnum())
@@ -201,6 +206,18 @@ def nickname_similarity(first: object, second: object) -> float:
 
 def nicknames_match(first: object, second: object) -> bool:
     return nickname_similarity(first, second) >= 0.72
+
+
+def allow_full_live_tab(audit: dict) -> bool:
+    """An opened TAB is acceptable only when all ten rows are visible."""
+    if not audit.get("has_live_gameplay_hud"):
+        return False
+    try:
+        left_players = list(audit.get("left_players") or [])
+        right_players = list(audit.get("right_players") or [])
+    except TypeError:
+        return False
+    return len(left_players) == 5 and len(right_players) == 5
 
 
 NORMAL_CHANNEL_IDS = parse_channel_ids("NORMAL_CHANNEL_IDS")
@@ -2387,13 +2404,7 @@ def result_from_card_and_visual_audit(
     """Build a result from card IDs/nicks and the original scoreboard only."""
     rosters = parse_card_roster_identities(message_text)
     match = re.search(r"(?:матч|матча)\s*#\s*(\d+)", message_text, re.I)
-    if (
-        rosters is None
-        or match is None
-        or not audit.get("is_scoreboard")
-        or not audit.get("is_final_result")
-        or audit.get("has_live_gameplay_hud")
-    ):
+    if rosters is None or match is None:
         return None
 
     try:
@@ -2403,6 +2414,15 @@ def result_from_card_and_visual_audit(
         left_players = list(audit["left_players"])
         right_players = list(audit["right_players"])
     except (KeyError, TypeError, ValueError):
+        return None
+
+    normal_final_screen = (
+        audit.get("is_scoreboard")
+        and audit.get("is_final_result")
+        and not audit.get("has_live_gameplay_hud")
+    )
+    full_live_tab = allow_full_live_tab(audit)
+    if not (normal_final_screen or full_live_tab):
         return None
     if (
         confidence < 0.90
@@ -2627,6 +2647,13 @@ def result_from_card_and_visual_audit(
             merged.append(merged_player)
         return merged
 
+    notes = (
+        "ID и ники взяты из карточки; счёт, стороны и K/A/D — только "
+        "из исходного скриншота. Отсутствующий на табло игрок получает "
+        "0/0/13. «Получить игроков» не использовалось."
+    )
+    if full_live_tab:
+        notes += " Открытый TAB принят только потому, что на скриншоте видны все 10 игроков."
     return {
         "is_match_result": True,
         "match_id": int(match.group(1)),
@@ -2636,11 +2663,7 @@ def result_from_card_and_visual_audit(
         "team_a": merge_team(card_a, visual_a, alignment_a[0]),
         "team_b": merge_team(card_b, visual_b, alignment_b[0]),
         "overall_confidence": confidence,
-        "notes": (
-            "ID и ники взяты из карточки; счёт, стороны и K/A/D — только "
-            "из исходного скриншота. Отсутствующий на табло игрок получает "
-            "0/0/13. «Получить игроков» не использовалось."
-        ),
+        "notes": notes,
     }
 
 
@@ -5523,8 +5546,14 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
             raw_images: list[bytes] = []
 
             async def discard_live_tab_card(audit: dict) -> bool:
-                """Reject a live TAB card: log it, copy it to logs, delete it."""
+                """Reject a live TAB card unless all ten rows are visible."""
                 if not audit.get("has_live_gameplay_hud"):
+                    return False
+                if allow_full_live_tab(audit):
+                    log.info(
+                        "Матч #%s: открыт TAB, но на скриншоте видны все 10 игроков — обработка разрешена.",
+                        reserved_match_id or "?",
+                    )
                     return False
                 log.info(
                     "Матч #%s определён как открытый TAB, а не финальный экран.",
@@ -5667,46 +5696,6 @@ async def process_upload(message: discord.Message, test_only: bool = False) -> N
                     result = result_from_card_and_visual_audit(context, audit)
                     if result is None:
                         result = await try_players_helper_fallback(audit)
-                    if result is None and card_rosters is not None:
-                        # Fallback: card already has all 10 IDs and stats.
-                        # The visual audit failed (e.g. AI didn't recognize
-                        # final result, or too few players visible on tab).
-                        # Use the card data directly with card K/A/D values.
-                        # This handles cases where 1-2 players are cut off
-                        # on the scoreboard screenshot.
-                        ct_team = explicit_ct_team_from_card(context)
-                        card_slots = parse_card_roster_slots(context)
-                        if (
-                            ct_team in ("A", "B")
-                            and card_slots is not None
-                            and len(card_slots.get("team_a", [])) == 5
-                            and len(card_slots.get("team_b", [])) == 5
-                            and reserved_match_id is not None
-                        ):
-                            # Check that card has real stats (not all 0/0/13)
-                            all_players = card_slots["team_a"] + card_slots["team_b"]
-                            has_real_stats = any(
-                                (int(p.get("kills", 0)), int(p.get("assists", 0)), int(p.get("deaths", 0))) != (0, 0, 13)
-                                for p in all_players
-                            )
-                            if has_real_stats:
-                                log.info(
-                                    "Матч #%s: визуальная проверка не прошла, но карточка "
-                                    "содержит полный состав 10 игроков с K/A/D — "
-                                    "регистрирую по данным карточки.",
-                                    reserved_match_id,
-                                )
-                                result = {
-                                    "is_match_result": True,
-                                    "match_id": reserved_match_id,
-                                    "score_a": score_hint[0] if score_hint else int(audit.get("score_left", 0) or 0),
-                                    "score_b": score_hint[1] if score_hint else int(audit.get("score_right", 0) or 0),
-                                    "ct_team": ct_team,
-                                    "team_a": card_slots["team_a"],
-                                    "team_b": card_slots["team_b"],
-                                    "overall_confidence": 0.95,
-                                    "notes": "Визуальная проверка не прошла; данные взяты из карточки Discord.",
-                                }
                     if result is None:
                         diagnostics = (
                             full_match_diagnostics(context)
