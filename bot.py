@@ -819,22 +819,15 @@ async def check_ai_key_status() -> list[dict]:
                 "remaining": None,
                 "details": "",
             }
-
             rest_until = ai_key_rest_until.get(key, 0.0)
             if rest_until > time.monotonic():
                 remaining_rest = int(rest_until - time.monotonic())
                 info["rest_minutes"] = remaining_rest // 60
                 info["rest_seconds"] = remaining_rest % 60
-
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            }
-
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             base = GEMINI_BASE_URL.rstrip("/")
             if base.endswith("/v1"):
                 base = base[:-3]
-
             balance_found = False
             for endpoint in ["/v1/key", "/v1/balance", "/v1/me", "/v1/account"]:
                 try:
@@ -866,32 +859,25 @@ async def check_ai_key_status() -> list[dict]:
                                 break
                         elif resp.status == 401:
                             info["status"] = "invalid_key"
-                            info["details"] = "\u041a\u043b\u044e\u0447 \u043d\u0435 \u043f\u0440\u0438\u043d\u044f\u0442 API"
+                            info["details"] = "Ключ не принят API"
                         elif resp.status == 403:
                             info["status"] = "forbidden"
-                            info["details"] = "\u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435\u0449\u0451\u043d"
+                            info["details"] = "Доступ запрещён"
                 except Exception:
                     pass
-
             if not balance_found and info["status"] not in ("invalid_key", "forbidden"):
                 try:
                     test_url = GEMINI_BASE_URL.rstrip("/")
                     if not test_url.endswith("/v1"):
                         test_url += "/v1"
                     test_url += "/chat/completions"
-                    test_payload = {
-                        "model": GEMINI_MODELS[0] if GEMINI_MODELS else "test",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 1,
-                    }
-                    async with session.post(
-                        test_url, json=test_payload, headers=headers
-                    ) as resp:
+                    test_payload = {"model": GEMINI_MODELS[0] if GEMINI_MODELS else "test", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+                    async with session.post(test_url, json=test_payload, headers=headers) as resp:
                         status_code = resp.status
                         body = await resp.text()
                         if status_code == 200:
                             info["status"] = "active"
-                            info["details"] = "\u041a\u043b\u044e\u0447 \u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 (\u0431\u0430\u043b\u0430\u043d\u0441 \u0447\u0435\u0440\u0435\u0437 API \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d)"
+                            info["details"] = "Ключ работает (баланс через API недоступен)"
                             for h in ["x-ratelimit-remaining", "x-ratelimit-limit"]:
                                 val = resp.headers.get(h)
                                 if val:
@@ -901,14 +887,14 @@ async def check_ai_key_status() -> list[dict]:
                                         info["limit"] = val
                         elif status_code in (401, 403):
                             info["status"] = "invalid_key"
-                            info["details"] = "\u041a\u043b\u044e\u0447 \u043d\u0435 \u043f\u0440\u0438\u043d\u044f\u0442 API"
+                            info["details"] = "Ключ не принят API"
                         elif status_code == 402:
                             info["status"] = "exhausted"
-                            info["details"] = "\u0411\u0430\u043b\u0430\u043d\u0441 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d"
+                            info["details"] = "Баланс исчерпан"
                             info["remaining"] = 0
                         elif status_code == 429:
                             info["status"] = "rate_limited"
-                            info["details"] = "\u041f\u0440\u0435\u0432\u044b\u0448\u0435\u043d \u043b\u0438\u043c\u0438\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432 (\u043a\u043b\u044e\u0447 \u0440\u0430\u0431\u043e\u0447\u0438\u0439)"
+                            info["details"] = "Превышен лимит запросов (ключ рабочий)"
                         else:
                             if is_ai_key_exhausted(status_code, body):
                                 info["status"] = "exhausted"
@@ -920,7 +906,6 @@ async def check_ai_key_status() -> list[dict]:
                 except Exception as exc:
                     info["status"] = "error"
                     info["details"] = str(exc)[:100]
-
             results.append(info)
     return results
 
@@ -928,65 +913,36 @@ async def check_ai_key_status() -> list[dict]:
 def format_ai_status_message(results: list[dict]) -> str:
     """Format the API key status results for Discord."""
     if not results:
-        return "\u274c \u041d\u0435\u0442 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d\u043d\u044b\u0445 API-\u043a\u043b\u044e\u0447\u0435\u0439."
-
-    lines: list[str] = ["\U0001f4ca **\u0421\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435 API-\u043a\u043b\u044e\u0447\u0435\u0439**\n"]
-
-    status_emoji = {
-        "active": "\U0001f7e2",
-        "exhausted": "\U0001f534",
-        "invalid_key": "\u26d4",
-        "forbidden": "\u26d4",
-        "rate_limited": "\U0001f7e1",
-        "error": "\U0001f7e0",
-        "unknown": "\u26aa",
-    }
-
+        return "❌ Нет настроенных API-ключей."
+    lines: list[str] = ["📊 **Состояние API-ключей**\n"]
+    status_emoji = {"active": "🟢", "exhausted": "🔴", "invalid_key": "⛔", "forbidden": "⛔", "rate_limited": "🟡", "error": "🟠", "unknown": "⚪"}
     for info in results:
-        emoji = status_emoji.get(info["status"], "\u26aa")
+        emoji = status_emoji.get(info["status"], "⚪")
         label = info["label"].capitalize()
         line = f"{emoji} **{label}** (`{info['masked_key']}`)"
-
-        status_text = {
-            "active": "\u0430\u043a\u0442\u0438\u0432\u0435\u043d",
-            "exhausted": "\u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d",
-            "invalid_key": "\u043d\u0435\u0432\u0430\u043b\u0438\u0434\u043d\u044b\u0439",
-            "forbidden": "\u0437\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d",
-            "rate_limited": "\u043b\u0438\u043c\u0438\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432",
-            "error": "\u043e\u0448\u0438\u0431\u043a\u0430",
-            "unknown": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e",
-        }
-        line += f" \u2014 {status_text.get(info['status'], info['status'])}"
-
+        status_text = {"active": "активен", "exhausted": "исчерпан", "invalid_key": "невалидный", "forbidden": "заблокирован", "rate_limited": "лимит запросов", "error": "ошибка", "unknown": "неизвестно"}
+        line += f" — {status_text.get(info['status'], info['status'])}"
         parts: list[str] = []
         if info.get("remaining") is not None:
-            parts.append(f"\u043e\u0441\u0442\u0430\u043b\u043e\u0441\u044c: **{info['remaining']}**")
+            parts.append(f"осталось: **{info['remaining']}**")
         if info.get("used") is not None:
-            parts.append(f"\u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u043e: **{info['used']}**")
+            parts.append(f"использовано: **{info['used']}**")
         if info.get("limit") is not None:
-            parts.append(f"\u043b\u0438\u043c\u0438\u0442: **{info['limit']}**")
+            parts.append(f"лимит: **{info['limit']}**")
         if parts:
-            line += "\n  " + " \u00b7 ".join(parts)
-
+            line += "\n  " + " · ".join(parts)
         if info.get("resting"):
             rm = info.get("rest_minutes", 0)
             rs = info.get("rest_seconds", 0)
-            line += f"\n  \u23f8\ufe0f \u041e\u0442\u0434\u044b\u0445\u0430\u0435\u0442: \u0435\u0449\u0451 {rm} \u043c\u0438\u043d {rs} \u0441\u0435\u043a"
-
+            line += f"\n  ⏸️ Отдыхает: ещё {rm} мин {rs} сек"
         if info.get("details") and info["status"] not in ("active",):
-            line += f"\n  \u2139\ufe0f {info['details']}"
-
+            line += f"\n  ℹ️ {info['details']}"
         lines.append(line)
-
     total = len(results)
     active = sum(1 for r in results if r["status"] == "active")
     exhausted = sum(1 for r in results if r["status"] == "exhausted")
     resting = sum(1 for r in results if r.get("resting"))
-    lines.append(
-        f"\n**\u0418\u0442\u043e\u0433\u043e:** {total} \u043a\u043b\u044e\u0447\u0435\u0439 \u00b7 {active} \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u00b7 "
-        f"{exhausted} \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u043d\u044b\u0445 \u00b7 {resting} \u043d\u0430 \u043e\u0442\u0434\u044b\u0445\u0435"
-    )
-
+    lines.append(f"\n**Итого:** {total} ключей · {active} активных · {exhausted} исчерпанных · {resting} на отдыхе")
     return "\n".join(lines)
 
 
@@ -6561,7 +6517,7 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(f"❌ Ошибка проверки: {exc}")
         return
 
-        stats_command = re.fullmatch(
+    stats_command = re.fullmatch(
         r"(?:стата|статистика|stats)(?:\s+(дни|часы|days|hours))?",
         command,
     )
