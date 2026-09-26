@@ -4043,14 +4043,20 @@ def format_registration(result: dict) -> str:
         "CT",
     ]
     for player in ct_players:
-        lines.append(
-            f"{player['id']} {player['kills']} {player['assists']} {player['deaths']}"
-        )
+        k = int(player.get("kills", 0) or 0)
+        a = int(player.get("assists", 0) or 0)
+        d = int(player.get("deaths", 0) or 0)
+        if k == 0 and a == 0 and d == 0:
+            d = 13
+        lines.append(f"{player['id']} {k} {a} {d}")
     lines.extend(["", "T"])
     for player in t_players:
-        lines.append(
-            f"{player['id']} {player['kills']} {player['assists']} {player['deaths']}"
-        )
+        k = int(player.get("kills", 0) or 0)
+        a = int(player.get("assists", 0) or 0)
+        d = int(player.get("deaths", 0) or 0)
+        if k == 0 and a == 0 and d == 0:
+            d = 13
+        lines.append(f"{player['id']} {k} {a} {d}")
     return "\n".join(lines)
 
 
